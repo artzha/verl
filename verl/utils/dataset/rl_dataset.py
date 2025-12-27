@@ -306,7 +306,7 @@ class RLHFDataset(Dataset):
             images = None
             row_dict_images = row_dict.pop(self.image_key, None)
             if row_dict_images:
-                images = [process_image(image, image_patch_size=self.image_patch_size) for image in row_dict_images]
+                images = [process_image({self.image_key: image}, image_patch_size=self.image_patch_size) for image in row_dict_images]
 
                 # due to the image key is "image" instead of "images" in vllm, we need to use "image" here
                 # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205
@@ -450,6 +450,7 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+        # import pickle; pickle.dump(row_dict, open("row_dict.pkl", "wb"))
         return row_dict
 
     def __getstate__(self):
@@ -461,3 +462,17 @@ class RLHFDataset(Dataset):
             return state
 
         return self.__dict__.copy()
+
+if __name__ == "__main__":
+    from transformers import AutoTokenizer, AutoProcessor
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-VL-2B-Instruct", trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
+
+    from omegaconf import OmegaConf
+    config_path = "external/verl/verl/trainer/config/data/critic_yt.yaml"
+    config = OmegaConf.load(config_path)
+    OmegaConf.resolve(config)
+
+    
+    dataset = RLHFDataset(data_files=config.train_files, tokenizer=tokenizer, processor=processor, config=config)
+    print(dataset[0])

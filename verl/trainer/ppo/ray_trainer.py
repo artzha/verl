@@ -761,6 +761,8 @@ class RayPPOTrainer:
 
         # create actor and rollout
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+
+        # Potential issue here, need to ensure that new motion planner is initialized
         if self.hybrid_engine:
             resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
             actor_rollout_cls = RayClassWithInitArgs(
@@ -769,6 +771,16 @@ class RayPPOTrainer:
                 role=str(actor_role),
             )
             self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
+
+            # --- Motion generation (inference-only) colocated worker ---
+            if OmegaConf.select(self.config, "motion") is not None:
+                from cotnav.verl_adapters.workers.motion_worker import MotionGenVLLMWorker
+                MotionGenVLLMWorkerRemote = ray.remote(MotionGenVLLMWorker)
+                self.resource_pool_to_cls[resource_pool]["motion"] = RayClassWithInitArgs(
+                    cls=MotionGenVLLMWorkerRemote,
+                    config=self.config.motion,      # wherever you store motion cfg
+                    role="motion",
+                )
         else:
             raise NotImplementedError
 
@@ -913,6 +925,13 @@ class RayPPOTrainer:
 
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
+            
+        # Initialize motion model
+        if "motion" in all_wg:
+            self.motion_wg = all_wg["motion"]
+            self.motion_wg.init_model()   # important: actually loads vLLM inside the worker
+        else:
+            self.motion_wg = None
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -1304,7 +1323,6 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
-
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
@@ -1327,9 +1345,60 @@ class RayPPOTrainer:
                 )
 
                 gen_batch = self._get_gen_batch(batch)
-
-                # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                
+                # Generate motion tokens BEFORE repeating, so motion plan is identical for all n rollouts
+                if self.motion_wg is not None:
+                    with marked_timer("motion_gen", timing_raw, color="orange"):
+                        # gen_batch.batch contains tokenized data (prompts/input_ids, attention_mask, etc.)
+                        # gen_batch.non_tensor_batch contains raw prompts, images, and other metadata
+                        # Motion worker expects "prompts" key with tokenized input_ids
+            
+                        # Prepare motion generation batch - motion worker expects "prompts" key
+                        prompt_tokens = gen_batch.batch["input_ids"]
+
+                        # Set motion generation parameters
+                        gen_batch.meta_info.update({
+                            "do_sample": self.config.actor_rollout_ref.rollout.get("motion_do_sample", False),
+                            "temperature": self.config.actor_rollout_ref.rollout.get("motion_temperature", 0.0),
+                            "response_length": self.config.actor_rollout_ref.rollout.get("motion_response_length", 128),
+                        })
+
+                        motion_batch_output = self.motion_wg.generate_sequences(gen_batch)
+                        timing_raw.update(motion_batch_output.meta_info.get("timing", {}))
+                        import pdb; pdb.set_trace()
+                        # Concatenate motion tokens with prompts
+                        # motion_batch_output.batch["responses"] contains wrapped motion tokens [B, L_motion]
+                        motion_responses = motion_batch_output.batch["responses"]  # [B, L_motion] - wrapped with MOTION_START_TOKEN and MOTION_END_TOKEN
+                        original_prompts = prompt_tokens  # [B, L_prompt]
+                        
+                        # Get pad token id for padding
+                        pad_token_id = self.tokenizer.pad_token_id
+                        if pad_token_id is None:
+                            pad_token_id = self.tokenizer.eos_token_id
+                        import pdb; pdb.set_trace()
+                        # Concatenate prompts + motion tokens: [B, L_prompt + L_motion]
+                        combined_prompts = torch.cat([original_prompts, motion_responses], dim=1)
+                        
+                        # Update attention mask for prompts + motion
+                        combined_attn_mask = (combined_prompts != pad_token_id).long()  # [B, L_prompt + L_motion]
+                        
+                        # Update position ids based on attention mask
+                        combined_pos_ids = (combined_attn_mask.cumsum(-1) - 1).clamp(min=0)
+                        combined_pos_ids = combined_pos_ids * combined_attn_mask
+                        import pdb; pdb.set_trace()
+                        # Update gen_batch with motion tokens concatenated to prompts
+                        # Keep all existing batch keys and non_tensor_batch data
+                        gen_batch.batch["prompts"] = combined_prompts
+                        gen_batch.batch["input_ids"] = combined_prompts
+                        gen_batch.batch["attention_mask"] = combined_attn_mask
+                        gen_batch.batch["position_ids"] = combined_pos_ids
+                        
+                        # Store motion tokens separately for potential use (raw motion without wrappers)
+                        if "motion" in motion_batch_output.batch:
+                            gen_batch.batch["motion"] = motion_batch_output.batch["motion"]
+                
+                # Now repeat the batch (with motion tokens already in prompts) n times
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
@@ -1338,6 +1407,7 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        # Generate actor responses
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
