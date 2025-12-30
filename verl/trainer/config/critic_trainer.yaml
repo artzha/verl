@@ -23,15 +23,6 @@ defaults:
   # Model config.
   - model@actor_rollout_ref.model: hf_model
 
-  # # MotionPlanner model config.
-  # - model@actor_rollout_ref.motion.model: hf_model
-
-  # # MotionPlanner actor config.
-  # - actor@actor_rollout_ref.motion.actor: dp_actor
-
-  # # MotionPlanner rollout config.
-  # - rollout@actor_rollout_ref.motion_rollout: rollout
-
   # Critic model config.
   - critic@critic: dp_critic
 
@@ -84,6 +75,9 @@ actor_rollout_ref:
       freeze_vision_projection: True
       freeze_language_model: True
 
+  rollout:
+    mode: async
+
 motion:
   worker_cls: cotnav.verl_adapters.workers.motion_worker.MotionGenVLLMWorker
   model_name_or_path: Qwen/Qwen3-VL-2B-Instruct
@@ -94,13 +88,16 @@ motion:
   gpu_memory_utilization: 0.7
 
   # generation defaults (can still be overridden by batch.meta_info)
-  max_tokens: 256
+  max_tokens: 1024
   temperature: 0.0
   top_p: 1.0
   top_k: 0
 
   # make sure this can fit prompt(128)+new(256)+wrappers; pick >=512 to be safe
-  max_model_len: 4096
+  max_model_len: 8192
+  max_prompt_length: 4096
+
+  post_prompt_path: 'cotnav/models/prompts/reflect/critic_prompt_dspy.txt'
 
 # motion_rollout:
 #   name: vllm

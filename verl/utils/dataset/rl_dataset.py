@@ -269,6 +269,8 @@ class RLHFDataset(Dataset):
     def _build_messages(self, example: dict):
         messages: list = example.pop(self.prompt_key)
 
+        num_images = 0
+        num_videos = 0
         if self.image_key in example or self.video_key in example:
             for message in messages:
                 content = message["content"]
@@ -277,9 +279,11 @@ class RLHFDataset(Dataset):
                 segments = [item for item in segments if item != ""]
                 for segment in segments:
                     if segment == "<image>":
-                        content_list.append({"type": "image"})
+                        content_list.append({"type": "image", "image": example['image'][num_images]})
+                        num_images+=1
                     elif segment == "<video>":
-                        content_list.append({"type": "video"})
+                        content_list.append({"type": "video", "video": example['video'][num_videos]})
+                        num_videos+=1
                     else:
                         content_list.append({"type": "text", "text": segment})
 
@@ -294,6 +298,8 @@ class RLHFDataset(Dataset):
         row_dict: dict = self.dataframe[item]
         messages = self._build_messages(row_dict)
         model_inputs = {}
+        if messages[-1]['role'].strip().lower() == 'assistant':
+            messages.pop() # Don't return gt trajectory response in prompts.
 
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
@@ -450,6 +456,7 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+
         # import pickle; pickle.dump(row_dict, open("row_dict.pkl", "wb"))
         return row_dict
 

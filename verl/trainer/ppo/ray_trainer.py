@@ -65,6 +65,7 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
+from cotnav.core.format import text_to_llava
 
 @dataclass
 class ResourcePoolManager:
@@ -603,6 +604,38 @@ class RayPPOTrainer:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _generate_motion(self, batch: DataProto, prev: Optional[DataProto]=None) -> DataProto:
+        if self.motion_wg is None:
+            return batch
+        
+        # TODO: Check if we need to copy over newly modified multimopdal inputs here as well
+        # Ensure required keys are present
+        non_tensor_keys = [ "full_prompts", "multi_modal_data", "raw_prompt" ]
+        for key in non_tensor_keys:
+            if key in batch.non_tensor_batch:
+                continue
+            if prev is not None and key in prev.non_tensor_batch:
+                batch.non_tensor_batch[key] = prev.non_tensor_batch[key]
+
+        # Update full_prompts and raw_prompt if previous batch is provided
+        if prev is not None:
+            batch_response = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            batch.non_tensor_batch["raw_prompt"] = [
+               p + [text_to_llava(r, role="assistant")] 
+               for p, r in zip(prev.non_tensor_batch["raw_prompt"], batch_response)
+            ]
+        divisor = getattr(self.motion_wg, "world_size", None) or 1
+        padded, pad_size = pad_dataproto_to_divisor(batch, divisor)
+
+        out = self.motion_wg.generate_sequences(padded)
+
+        # ONE_TO_ONE usually returns per-worker shards
+        if isinstance(out, list):
+            out = DataProto.concat(out)  # or whatever VeRL provides for concatenation in your version
+
+        return unpad_dataproto(out, pad_size=pad_size)
+
 
     def _validate(self):
         data_source_lst = []
@@ -1346,58 +1379,20 @@ class RayPPOTrainer:
 
                 gen_batch = self._get_gen_batch(batch)
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                
-                # Generate motion tokens BEFORE repeating, so motion plan is identical for all n rollouts
+
+                # PATCH: Generate motion tokens
                 if self.motion_wg is not None:
                     with marked_timer("motion_gen", timing_raw, color="orange"):
-                        # gen_batch.batch contains tokenized data (prompts/input_ids, attention_mask, etc.)
-                        # gen_batch.non_tensor_batch contains raw prompts, images, and other metadata
-                        # Motion worker expects "prompts" key with tokenized input_ids
-            
-                        # Prepare motion generation batch - motion worker expects "prompts" key
-                        prompt_tokens = gen_batch.batch["input_ids"]
-
                         # Set motion generation parameters
                         gen_batch.meta_info.update({
-                            "do_sample": self.config.actor_rollout_ref.rollout.get("motion_do_sample", False),
-                            "temperature": self.config.actor_rollout_ref.rollout.get("motion_temperature", 0.0),
-                            "response_length": self.config.actor_rollout_ref.rollout.get("motion_response_length", 128),
+                            "max_tokens": self.config.motion.get("max_tokens", False),
+                            "temperature": self.config.motion.get("temperature", 0.0),
+                            "max_model_len": self.config.motion.get("max_model_len", 128),
                         })
+ 
+                        gen_batch = self._generate_motion(gen_batch)
+                        timing_raw.update(gen_batch.meta_info.get("timing", {}))
 
-                        motion_batch_output = self.motion_wg.generate_sequences(gen_batch)
-                        timing_raw.update(motion_batch_output.meta_info.get("timing", {}))
-                        import pdb; pdb.set_trace()
-                        # Concatenate motion tokens with prompts
-                        # motion_batch_output.batch["responses"] contains wrapped motion tokens [B, L_motion]
-                        motion_responses = motion_batch_output.batch["responses"]  # [B, L_motion] - wrapped with MOTION_START_TOKEN and MOTION_END_TOKEN
-                        original_prompts = prompt_tokens  # [B, L_prompt]
-                        
-                        # Get pad token id for padding
-                        pad_token_id = self.tokenizer.pad_token_id
-                        if pad_token_id is None:
-                            pad_token_id = self.tokenizer.eos_token_id
-                        import pdb; pdb.set_trace()
-                        # Concatenate prompts + motion tokens: [B, L_prompt + L_motion]
-                        combined_prompts = torch.cat([original_prompts, motion_responses], dim=1)
-                        
-                        # Update attention mask for prompts + motion
-                        combined_attn_mask = (combined_prompts != pad_token_id).long()  # [B, L_prompt + L_motion]
-                        
-                        # Update position ids based on attention mask
-                        combined_pos_ids = (combined_attn_mask.cumsum(-1) - 1).clamp(min=0)
-                        combined_pos_ids = combined_pos_ids * combined_attn_mask
-                        import pdb; pdb.set_trace()
-                        # Update gen_batch with motion tokens concatenated to prompts
-                        # Keep all existing batch keys and non_tensor_batch data
-                        gen_batch.batch["prompts"] = combined_prompts
-                        gen_batch.batch["input_ids"] = combined_prompts
-                        gen_batch.batch["attention_mask"] = combined_attn_mask
-                        gen_batch.batch["position_ids"] = combined_pos_ids
-                        
-                        # Store motion tokens separately for potential use (raw motion without wrappers)
-                        if "motion" in motion_batch_output.batch:
-                            gen_batch.batch["motion"] = motion_batch_output.batch["motion"]
-                
                 # Now repeat the batch (with motion tokens already in prompts) n times
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
@@ -1451,10 +1446,20 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
+
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    # PATCH: Generate final motion tokens
+                    if self.motion_wg is not None:
+                        with marked_timer("motion_gen", timing_raw, color="orange"):
+                            import pdb; pdb.set_trace()
+                            # Update non-tensor batch with latest response
+                            batch = self._generate_motion(batch, prev=gen_batch)
+                            import pdb; pdb.set_trace()
+                            timing_raw.update(gen_batch.meta_info.get("timing", {}))
+                    breakpoint()
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.

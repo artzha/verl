@@ -11,9 +11,9 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation ov
  
 
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0 # for vllm0.11.0 with TP
+export TORCH_CUDA_ARCH_LIST="9.0"
 
-
-HF_MODEL_PATH=${HF_MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-VL-8B-Instruct"}
+HF_MODEL_PATH="Qwen/Qwen3-VL-8B-Instruct"
 
 GEN_TP=${GEN_TP:-4}
 CP=${CP:-2}
