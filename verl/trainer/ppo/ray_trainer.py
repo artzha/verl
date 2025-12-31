@@ -605,29 +605,44 @@ class RayPPOTrainer:
 
         return gen_batch
 
-    def _generate_motion(self, batch: DataProto, prev: Optional[DataProto]=None) -> DataProto:
+    def _generate_motion(
+        self, 
+        batch: DataProto, 
+        prev: Optional[DataProto]=None, 
+        prefill: Optional[str]=None,
+        postfill: Optional[str]=None
+    ) -> DataProto:
         if self.motion_wg is None:
             return batch
         
-        # TODO: Check if we need to copy over newly modified multimopdal inputs here as well
         # Ensure required keys are present
-        non_tensor_keys = [ "full_prompts", "multi_modal_data", "raw_prompt" ]
+        non_tensor_keys = [ "full_prompts", "multi_modal_data", "raw_prompt", "motion_responses" ]
         for key in non_tensor_keys:
             if key in batch.non_tensor_batch:
                 continue
             if prev is not None and key in prev.non_tensor_batch:
-                batch.non_tensor_batch[key] = prev.non_tensor_batch[key]
-
+                batch.non_tensor_batch[key] = np.array(prev.non_tensor_batch[key])
+                
         # Update full_prompts and raw_prompt if previous batch is provided
         if prev is not None:
             batch_response = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-            batch.non_tensor_batch["raw_prompt"] = [
+            batch.non_tensor_batch["raw_prompt"] = np.array([
                p + [text_to_llava(r, role="assistant")] 
-               for p, r in zip(prev.non_tensor_batch["raw_prompt"], batch_response)
-            ]
+               for p, r in zip(prev.non_tensor_batch["raw_prompt"].tolist(), batch_response)
+            ])
+            # np.array(self.processor.apply_chat_template(batch.non_tensor_batch["raw_prompt"].tolist(), tokenize=False, add_generation_prompt=True))
+            batch.non_tensor_batch["full_prompts"] = np.array(self.processor.apply_chat_template(
+                batch.non_tensor_batch["raw_prompt"].tolist(),
+                tokenize=False,
+                add_generation_prompt=True
+            ))
+
+        batch.meta_info["prefill"] = prefill
+        batch.meta_info["postfill"] = postfill
+
         divisor = getattr(self.motion_wg, "world_size", None) or 1
         padded, pad_size = pad_dataproto_to_divisor(batch, divisor)
-
+        
         out = self.motion_wg.generate_sequences(padded)
 
         # ONE_TO_ONE usually returns per-worker shards
@@ -1390,11 +1405,11 @@ class RayPPOTrainer:
                             "max_model_len": self.config.motion.get("max_model_len", 128),
                         })
  
-                        gen_batch = self._generate_motion(gen_batch)
+                        gen_batch = self._generate_motion(gen_batch, postfill="critic")
                         timing_raw.update(gen_batch.meta_info.get("timing", {}))
 
                 # Now repeat the batch (with motion tokens already in prompts) n times
-                gen_batch_output = gen_batch.repeat(
+                gen_batch_input = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
 
@@ -1404,9 +1419,9 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         # Generate actor responses
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_input)
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_input)
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
@@ -1454,12 +1469,12 @@ class RayPPOTrainer:
                     # PATCH: Generate final motion tokens
                     if self.motion_wg is not None:
                         with marked_timer("motion_gen", timing_raw, color="orange"):
-                            import pdb; pdb.set_trace()
                             # Update non-tensor batch with latest response
-                            batch = self._generate_motion(batch, prev=gen_batch)
-                            import pdb; pdb.set_trace()
-                            timing_raw.update(gen_batch.meta_info.get("timing", {}))
-                    breakpoint()
+                            motion_batch = self._generate_motion(batch, prev=gen_batch_input, prefill="motion")
+                            batch.meta_info['reward_extra_keys'] = batch.meta_info.get('reward_extra_keys', []).append('motion_responses')
+                            batch.non_tensor_batch['motion_responses'] = motion_batch.non_tensor_batch['motion_responses']
+                            timing_raw.update(batch.meta_info.get("timing", {}))
+                    
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1471,7 +1486,7 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
+                    # breakpoint()
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():

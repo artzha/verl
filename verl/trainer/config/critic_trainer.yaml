@@ -97,7 +97,9 @@ motion:
   max_model_len: 8192
   max_prompt_length: 4096
 
-  post_prompt_path: 'cotnav/models/prompts/reflect/critic_prompt_dspy.txt'
+  prompt_paths: 
+    critic: 'cotnav/models/prompts/reflect/critic_prompt_dspy.txt'
+    motion: 'cotnav/models/prompts/reflect/motion_refine_prompt.txt'
 
 # motion_rollout:
 #   name: vllm
