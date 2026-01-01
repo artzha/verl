@@ -1344,13 +1344,14 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
+        #TODO: Uncomment this                                  
+        # if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        #     val_metrics = self._validate()
+        #     assert val_metrics, f"{val_metrics=}"
+        #     pprint(f"Initial validation metrics: {val_metrics}")
+        #     logger.log(data=val_metrics, step=self.global_steps)
+        #     if self.config.trainer.get("val_only", False):
+        #         return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
@@ -1417,6 +1418,8 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        # PATCH: Defer reward computation until after revised motion generation
+                        gen_batch_input.non_tensor_batch["__defer_reward__"] = np.array([True] * len(gen_batch_input), dtype=object)
                         # Generate actor responses
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_input)
@@ -1471,9 +1474,40 @@ class RayPPOTrainer:
                         with marked_timer("motion_gen", timing_raw, color="orange"):
                             # Update non-tensor batch with latest response
                             motion_batch = self._generate_motion(batch, prev=gen_batch_input, prefill="motion")
-                            batch.meta_info['reward_extra_keys'] = batch.meta_info.get('reward_extra_keys', []).append('motion_responses')
-                            batch.non_tensor_batch['motion_responses'] = motion_batch.non_tensor_batch['motion_responses']
-                            timing_raw.update(batch.meta_info.get("timing", {}))
+
+                            motion_responses = motion_batch.non_tensor_batch.get("motion_responses")
+                            if motion_responses is not None:
+                                # Expose motion responses directly for downstream logging
+                                batch.non_tensor_batch["motion_responses"] = motion_responses
+                                for info, motion in zip(batch.non_tensor_batch['extra_info'], motion_responses.tolist()):
+                                    info['motion_response'] = motion
+                                
+                                # Keep reward_extra_info consistent with reward logging utilities
+                            #     reward_extra_info = batch.non_tensor_batch.get("reward_extra_info")
+                            #     if reward_extra_info is None:
+                            #         reward_extra_info_list = [{} for _ in range(len(motion_responses))]
+                            #     else:
+                            #         reward_extra_info_list = (
+                            #             reward_extra_info.tolist()
+                            #             if isinstance(reward_extra_info, np.ndarray)
+                            #             else list(reward_extra_info)
+                            #         )
+                            #         reward_extra_info_list = [
+                            #             info if info is not None else {} for info in reward_extra_info_list
+                            #         ]
+
+                            #     for info, resp in zip(reward_extra_info_list, motion_responses.tolist(), strict=True):
+                            #         info["motion_responses"] = resp
+
+                            #     batch.non_tensor_batch["reward_extra_info"] = np.array(
+                            #         reward_extra_info_list, dtype=object
+                            #     )
+
+                            #     reward_extra_keys = batch.meta_info.setdefault("reward_extra_keys", [])
+                            #     if "motion_responses" not in reward_extra_keys:
+                            #         reward_extra_keys.append("motion_responses")
+
+                            # timing_raw.update(batch.meta_info.get("timing", {}))
                     
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1486,7 +1520,7 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    # breakpoint()
+                    
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1502,7 +1536,7 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(
                                 data=batch, config=self.config, tokenizer=self.tokenizer
                             )
-                        else:
+                        else: 
                             reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
                                 batch, reward_fn=self.reward_fn, return_dict=False
                             )

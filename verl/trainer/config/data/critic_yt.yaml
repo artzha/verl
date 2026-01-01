@@ -26,7 +26,7 @@ val_max_samples: -1
 prompt_key: prompt
 
 # The field used to select the reward function (if using different ones per example).
-reward_fn_key: null
+reward_fn_key: 'data_source'
 
 # Maximum prompt length. All prompts will be left-padded to this length.
 # An error will be reported if the length is too long.
