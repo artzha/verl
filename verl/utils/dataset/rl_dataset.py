@@ -313,7 +313,7 @@ class RLHFDataset(Dataset):
             row_dict_images = row_dict.pop(self.image_key, None)
             if row_dict_images:
                 images = [process_image({self.image_key: image}, image_patch_size=self.image_patch_size) for image in row_dict_images]
-
+                # Note, we have about 2 pixel error here due to patch size
                 # due to the image key is "image" instead of "images" in vllm, we need to use "image" here
                 # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205
                 multi_modal_data["image"] = images

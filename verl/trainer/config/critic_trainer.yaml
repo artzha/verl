@@ -44,6 +44,7 @@ actor_rollout_ref:
   hybrid_engine: true
 
   actor:
+    strategy: fsdp2
     fsdp_config:
       model_dtype: bf16
   model:
@@ -85,20 +86,22 @@ motion:
 
   dtype: bfloat16
   tensor_parallel_size: 1
-  gpu_memory_utilization: 0.7
+  gpu_memory_utilization: 0.5
 
   # generation defaults (can still be overridden by batch.meta_info)
-  max_tokens: 1024
-  temperature: 0.0
-  top_p: 1.0
+  max_tokens: 2048
+  temperature: 1.1
+  top_p: 0.95
   top_k: 0
 
   # make sure this can fit prompt(128)+new(256)+wrappers; pick >=512 to be safe
-  max_model_len: 8192
-  max_prompt_length: 4096
+  # max_model_len: 130712
+  # max_prompt_length: 65356
+  max_model_len: 65356
+  max_prompt_length: 32678
 
   prompt_paths: 
-    critic: 'cotnav/models/prompts/reflect/critic_prompt_dspy.txt'
+    critic: 'cotnav/models/prompts/reflect/critic_prompt_vlm.txt'
     motion: 'cotnav/models/prompts/reflect/motion_refine_prompt.txt'
 
 reward_model:
@@ -190,7 +193,7 @@ trainer:
   # Number of nodes used in the training
   nnodes: 1
   # Number of GPUs per node
-  n_gpus_per_node: 8
+  n_gpus_per_node: 4
   # Save frequency (by iteration) for model checkpoints
   save_freq: -1
   # ESI refers to the elastic server instance used during training, similar to the training plan. For example,
@@ -337,7 +340,8 @@ ray_kwargs:
 
   # configs related to ray initialization
   ray_init:
-    num_cpus: null # Number of CPUs for Ray. Use a fixed number instead of null when using SLURM.
+    num_cpus: 32 # Number of CPUs for Ray. Use a fixed number instead of null when using SLURM.
+    # object_store_memory: 21474836480 # 20 * 1024^3
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null

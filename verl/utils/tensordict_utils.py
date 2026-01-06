@@ -464,3 +464,51 @@ def unpad(data: TensorDict, pad_size):
     if pad_size != 0:
         data = data[:-pad_size]
     return data
+
+def drop_dupe_keys(
+    a: Any,
+    b: Any,
+    *,
+    attrs: tuple[str, ...] = ("batch", "non_tensor_batch", "meta_info"),
+):
+    """
+    For each attr in attrs, compute duplicate keys between a.<attr> and b.<attr>,
+    then DROP those keys from b.<attr> (no value comparison).
+
+    Works whether each attribute is a plain dict or a TensorDict.
+    Returns: report[attr] = sorted list of keys dropped from b.
+    """
+    report: Dict[str, List[str]] = {}
+
+    for attr in attrs:
+        a_obj = getattr(a, attr, None)
+        b_obj = getattr(b, attr, None)
+        if a_obj is None or b_obj is None:
+            continue
+        if not hasattr(a_obj, "keys") or not hasattr(b_obj, "keys"):
+            continue
+
+        dupes = sorted(set(a_obj.keys()) & set(b_obj.keys()))
+        if not dupes:
+            continue
+
+        report[attr] = dupes
+
+        # Drop from b_obj in-place
+        if isinstance(b_obj, TensorDict):
+            tu.pop_keys(b_obj, dupes)
+        elif isinstance(b_obj, dict):
+            for k in dupes:
+                b_obj.pop(k, None)
+        else:
+            # best-effort for other dict-like objects
+            for k in dupes:
+                try:
+                    b_obj.pop(k, None)
+                except TypeError:
+                    try:
+                        b_obj.pop(k)
+                    except Exception:
+                        pass
+
+    return report

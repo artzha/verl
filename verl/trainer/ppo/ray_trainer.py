@@ -479,6 +479,7 @@ class RayPPOTrainer:
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
@@ -616,7 +617,7 @@ class RayPPOTrainer:
             return batch
         
         # Ensure required keys are present
-        non_tensor_keys = [ "full_prompts", "multi_modal_data", "raw_prompt", "motion_responses" ]
+        non_tensor_keys = [ "full_prompts", "multi_modal_data", "raw_prompt"] #, "motion_responses" ]
         for key in non_tensor_keys:
             if key in batch.non_tensor_batch:
                 continue
@@ -672,6 +673,9 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
 
+            # TODO: generate motion
+            test_batch = self._generate_motion(test_batch, postfill="critic")
+
             # repeat test batch
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
@@ -711,6 +715,8 @@ class RayPPOTrainer:
                 else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            # PATCH: defer reward computation until after motion generation
+            test_gen_batch_padded.non_tensor_batch["__defer_reward__"] = np.array([True] * len(test_gen_batch_padded), dtype=bool)
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
@@ -719,16 +725,33 @@ class RayPPOTrainer:
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
+            # TODO: Generate final motion tokens for reward computation, add motion_responses
+            motion_batch = self._generate_motion(test_output_gen_batch, prev=test_gen_batch, prefill="motion")
+            motion_responses = motion_batch.non_tensor_batch.get("motion_responses")
+            if motion_responses is not None:
+                # Create extra_info entry in test_output_gen_batch if it doesn't exist
+                if 'extra_info' not in test_output_gen_batch.non_tensor_batch:
+                    test_output_gen_batch.non_tensor_batch['extra_info'] = np.array([{} for _ in range(len(test_output_gen_batch))], dtype=object)
+
+                for i in range(len(test_batch)):
+                    test_output_gen_batch.non_tensor_batch['extra_info'][i]['motion_response'] = motion_responses[i]
+
+                dup_report = tu.drop_dupe_keys(
+                    test_batch,
+                    test_output_gen_batch,
+                    attrs=["batch", "non_tensor_batch", "meta_info"]
+                )
             print("validation generation end")
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
-
+            # bad = {k: type(v) for k, v in test_output_gen_batch.non_tensor_batch.items() if not isinstance(v, np.ndarray)}
+            # print("non_tensor_batch non-ndarray values:", bad)
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
-
+        
             # evaluate using reward_function
             result = self._compute_or_extract_reward(test_batch, reward_fn=self.val_reward_fn, return_dict=True)
             reward_tensor = result["reward_tensor"]
@@ -1343,8 +1366,7 @@ class RayPPOTrainer:
         current_epoch = self.global_steps // len(self.train_dataloader)
 
         # perform validation before training
-        # currently, we only support validation using the reward_function.
-        #TODO: Uncomment this                                  
+        # currently, we only support validation using the reward_function.                               
         # if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
         #     val_metrics = self._validate()
         #     assert val_metrics, f"{val_metrics=}"
@@ -1478,37 +1500,9 @@ class RayPPOTrainer:
                             motion_responses = motion_batch.non_tensor_batch.get("motion_responses")
                             if motion_responses is not None:
                                 # Expose motion responses directly for downstream logging
-                                batch.non_tensor_batch["motion_responses"] = motion_responses
                                 for info, motion in zip(batch.non_tensor_batch['extra_info'], motion_responses.tolist()):
                                     info['motion_response'] = motion
-                                
-                                # Keep reward_extra_info consistent with reward logging utilities
-                            #     reward_extra_info = batch.non_tensor_batch.get("reward_extra_info")
-                            #     if reward_extra_info is None:
-                            #         reward_extra_info_list = [{} for _ in range(len(motion_responses))]
-                            #     else:
-                            #         reward_extra_info_list = (
-                            #             reward_extra_info.tolist()
-                            #             if isinstance(reward_extra_info, np.ndarray)
-                            #             else list(reward_extra_info)
-                            #         )
-                            #         reward_extra_info_list = [
-                            #             info if info is not None else {} for info in reward_extra_info_list
-                            #         ]
 
-                            #     for info, resp in zip(reward_extra_info_list, motion_responses.tolist(), strict=True):
-                            #         info["motion_responses"] = resp
-
-                            #     batch.non_tensor_batch["reward_extra_info"] = np.array(
-                            #         reward_extra_info_list, dtype=object
-                            #     )
-
-                            #     reward_extra_keys = batch.meta_info.setdefault("reward_extra_keys", [])
-                            #     if "motion_responses" not in reward_extra_keys:
-                            #         reward_extra_keys.append("motion_responses")
-
-                            # timing_raw.update(batch.meta_info.get("timing", {}))
-                    
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.

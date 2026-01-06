@@ -139,8 +139,13 @@ def _array_equal(array1: np.ndarray, array2: np.ndarray, visited: set[int]) -> b
         return False
 
     # For non-object dtypes, use NumPy's implementation with equal_nan=True.
-    if array1.dtype != "object":
-        return np.array_equal(array1, array2, equal_nan=True)
+    try:
+        if isinstance(array1, np.ndarray) and array1.dtype.kind in ("f", "c"):
+            return np.array_equal(array1, array2, equal_nan=True)
+        return np.array_equal(array1, array2)
+    except TypeError:
+        # Fallback for weird dtypes (object arrays with dicts, etc.)
+        return np.array_equal(array1, array2)
 
     # For object-dtype arrays, we must recursively compare each element.
     # We delegate to _deep_equal to handle elements, as they could be any
