@@ -617,7 +617,7 @@ class RayPPOTrainer:
             return batch
         
         # Ensure required keys are present
-        non_tensor_keys = [ "full_prompts", "multi_modal_data", "raw_prompt"] #, "motion_responses" ]
+        non_tensor_keys = [ "full_prompts", "multi_modal_data", "raw_prompt", "motion_responses" ]
         for key in non_tensor_keys:
             if key in batch.non_tensor_batch:
                 continue
@@ -1340,6 +1340,22 @@ class RayPPOTrainer:
             critic_output = self.critic_wg.update_critic(batch)
         return critic_output
 
+    def _assert_finite(self, name: str, t: torch.Tensor, *, throw=True):
+        if t is None:
+            return
+        if not torch.is_tensor(t):
+            return
+        bad = ~torch.isfinite(t)
+        if bad.any():
+            msg = (f"[NaN/Inf DETECTED] {name}: "
+                f"shape={tuple(t.shape)} dtype={t.dtype} device={t.device} "
+                f"min={t[torch.isfinite(t)].min().item() if torch.isfinite(t).any() else 'NA'} "
+                f"max={t[torch.isfinite(t)].max().item() if torch.isfinite(t).any() else 'NA'} "
+                f"bad_count={bad.sum().item()}")
+            print(msg)
+            if throw:
+                raise FloatingPointError(msg)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1496,7 +1512,7 @@ class RayPPOTrainer:
                         with marked_timer("motion_gen", timing_raw, color="orange"):
                             # Update non-tensor batch with latest response
                             motion_batch = self._generate_motion(batch, prev=gen_batch_input, prefill="motion")
-
+                            # self.tokenizer.decode(motion_batch.batch['input_ids'][0], skip_special_tokens=True)
                             motion_responses = motion_batch.non_tensor_batch.get("motion_responses")
                             if motion_responses is not None:
                                 # Expose motion responses directly for downstream logging
@@ -1514,7 +1530,7 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    
+                    self.tokenizer.decode(batch.batch['input_ids'][0], skip_special_tokens=True)
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1636,6 +1652,22 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        # breakpoint()
+                        # import pdb; pdb.set_trace()
+                        self._assert_finite("token_level_scores", batch.batch.get("token_level_scores"))
+                        self._assert_finite("token_level_rewards", batch.batch.get("token_level_rewards"))
+                        self._assert_finite("advantages", batch.batch.get("advantages"))
+                        self._assert_finite("returns", batch.batch.get("returns"))
+                        self._assert_finite("old_log_probs", batch.batch.get("old_log_probs"))
+                        if "ref_log_prob" in batch.batch:
+                            self._assert_finite("ref_log_prob", batch.batch.get("ref_log_prob"))
+                        if "values" in batch.batch:
+                            self._assert_finite("values", batch.batch.get("values"))
+
+                        # also verify masks aren't empty / degenerate
+                        rm = batch.batch["response_mask"]
+                        if rm.sum().item() == 0:
+                            raise ValueError("response_mask has zero valid tokens for the entire batch.")
 
                     # update critic
                     if self.use_critic:

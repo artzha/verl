@@ -438,6 +438,19 @@ class AgentLoopWorkerBase:
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
         self.tokenizer.padding_side = "left"
+        assert len(output.prompt_ids) <= self.config.actor_rollout_ref.rollout.prompt_length, (
+            f"Prompt length {len(output.prompt_ids)} exceeds max prompt length "
+            f"{self.config.actor_rollout_ref.rollout.prompt_length}"
+        )
+        assert len(output.response_ids) <= self.config.actor_rollout_ref.rollout.response_length, (
+            f"Response length {len(output.response_ids)} exceeds max response length "
+            f"{self.config.actor_rollout_ref.rollout.response_length}"
+        )
+        assert len(output.response_mask) <= self.config.actor_rollout_ref.rollout.response_length, (
+            f"Response mask length {len(output.response_mask)} exceeds max response length "
+            f"{self.config.actor_rollout_ref.rollout.response_length}"
+        )
+
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
             padding="max_length",

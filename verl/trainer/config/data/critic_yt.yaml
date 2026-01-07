@@ -31,11 +31,11 @@ reward_fn_key: 'data_source'
 # Maximum prompt length. All prompts will be left-padded to this length.
 # An error will be reported if the length is too long.
 # oc.select: default val for rollout.prompt_length
-max_prompt_length: 4096
+max_prompt_length: 1024
 
 # Maximum response length. Rollout in RL algorithms (e.g. PPO) generates up to this length.
 # oc.select: default val for rollout.response_length
-max_response_length: 512
+max_response_length: 1024
 
 # Batch size sampled for one training iteration of different RL algorithms.
 train_batch_size: 1024

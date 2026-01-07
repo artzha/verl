@@ -78,6 +78,11 @@ actor_rollout_ref:
 
   rollout:
     mode: async
+    temperature: 1.1
+    top_p: 0.95
+    prompt_length: 2048
+    response_length: 1024
+
 
 motion:
   worker_cls: cotnav.verl_adapters.workers.motion_worker.MotionGenVLLMWorker
@@ -86,22 +91,23 @@ motion:
 
   dtype: bfloat16
   tensor_parallel_size: 1
-  gpu_memory_utilization: 0.5
+  gpu_memory_utilization: 0.4
+
+  image_patch_size: 16
+  truncation: error # Safeguard for training stability
 
   # generation defaults (can still be overridden by batch.meta_info)
-  max_tokens: 2048
+  max_tokens: 256 # Keep small to prevent unbounded generations
   temperature: 1.1
   top_p: 0.95
   top_k: 0
 
-  # make sure this can fit prompt(128)+new(256)+wrappers; pick >=512 to be safe
-  # max_model_len: 130712
-  # max_prompt_length: 65356
-  max_model_len: 65356
-  max_prompt_length: 32678
+  # make sure this can fit prompt(1024 (mp) + 256 (mr) + 512 (cp) + 1024 (cr) + 256 (mrp) + 256 (mr)
+  max_model_length: 4096
+  max_prompt_length: 3072
 
   prompt_paths: 
-    critic: 'cotnav/models/prompts/reflect/critic_prompt_vlm.txt'
+    critic: 'cotnav/models/prompts/reflect/vgoal/critic_prompt_vlm.txt'
     motion: 'cotnav/models/prompts/reflect/motion_refine_prompt.txt'
 
 reward_model:

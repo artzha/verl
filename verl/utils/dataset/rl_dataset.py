@@ -456,7 +456,7 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
-
+       
         # import pickle; pickle.dump(row_dict, open("row_dict.pkl", "wb"))
         return row_dict
 
