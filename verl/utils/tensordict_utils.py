@@ -538,7 +538,7 @@ def make_iterator(tensordict: TensorDict, mini_batch_size, epochs, seed=None, da
     train_dataloader = DataLoader(
         dataset=idx_lst, batch_size=mini_batch_size, collate_fn=lambda x: x, generator=generator, **dataloader_kwargs
     )
-
+    
     def get_data():
         for _ in range(epochs):
             for idx in train_dataloader:

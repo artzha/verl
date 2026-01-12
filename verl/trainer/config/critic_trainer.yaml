@@ -108,7 +108,7 @@ motion:
 
   prompt_paths: 
     critic: 'cotnav/models/prompts/reflect/vgoal/critic_prompt_vlm.txt'
-    motion: 'cotnav/models/prompts/reflect/motion_refine_prompt.txt'
+    motion: 'cotnav/models/prompts/reflect/vgoal/motion_refine_prompt.txt'
 
 reward_model:
   use_reward_loop: false

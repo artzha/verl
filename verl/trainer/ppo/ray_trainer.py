@@ -590,6 +590,7 @@ class RayPPOTrainer:
             raise ValueError("reward_fn must be provided when rm_scores is not available.")
 
         if return_dict:
+            breakpoint()
             result = reward_fn(batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
             if sum_reward:
@@ -721,7 +722,7 @@ class RayPPOTrainer:
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             # PATCH: defer reward computation until after motion generation
-            test_gen_batch_padded.non_tensor_batch["__defer_reward__"] = np.array([True] * len(test_gen_batch_padded), dtype=bool)
+            # test_gen_batch_padded.non_tensor_batch["__defer_reward__"] = np.array([False] * len(test_gen_batch_padded), dtype=bool)
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
@@ -1372,6 +1373,19 @@ class RayPPOTrainer:
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
+    def _debug_nested(self, td, tag: str):
+        bad = []
+        # iterating items with nested keys
+        for k, v in td.items(True, True):
+            if torch.is_tensor(v) and getattr(v, "is_nested", False):
+                bad.append((k, v))
+
+        if bad:
+            print(f"[{tag}] FOUND NestedTensor(s):")
+            for k, v in bad:
+                # NestedTensor prints are noisy; keep it simple
+                print(f"  key={k}  nested_dim={v._nested_tensor_size().tolist() if hasattr(v,'_nested_tensor_size') else '??'}  dtype={v.dtype} device={v.device}")
+
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
@@ -1380,7 +1394,9 @@ class RayPPOTrainer:
         # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
+        
             # step 2: convert from padding to no-padding
+            # self._debug_nested(batch_td, "after_to_tensordict")
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
@@ -1388,6 +1404,7 @@ class RayPPOTrainer:
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
             seed = self.config.actor_rollout_ref.actor.data_loader_seed
             shuffle = self.config.actor_rollout_ref.actor.shuffle
+
             tu.assign_non_tensor(
                 batch_td,
                 calculate_entropy=calculate_entropy,
@@ -1397,8 +1414,11 @@ class RayPPOTrainer:
                 seed=seed,
                 dataloader_kwargs={"shuffle": shuffle},
             )
-
+            # self._debug_nested(batch_td, "after_no_padding")
+            # breakpoint()
+            # import pdb; pdb.set_trace()
             actor_output = self.actor_rollout_wg.update_actor(batch_td)
+            # breakpoint()
             actor_output = tu.get(actor_output, "metrics")
             actor_output = rename_dict(actor_output, "actor/")
             # modify key name
@@ -1535,13 +1555,14 @@ class RayPPOTrainer:
                 # PATCH: Generate motion tokens
                 if self.motion_wg is not None:
                     with marked_timer("motion_gen", timing_raw, color="orange"):
+
                         # Set motion generation parameters
                         gen_batch.meta_info.update({
                             "max_tokens": self.config.motion.get("max_tokens", False),
                             "temperature": self.config.motion.get("temperature", 0.0),
                             "max_model_len": self.config.motion.get("max_model_len", 128),
                         })
- 
+
                         gen_batch = self._generate_motion(gen_batch, postfill="critic")
                         timing_raw.update(gen_batch.meta_info.get("timing", {}))
 
@@ -1555,7 +1576,7 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         # PATCH: Defer reward computation until after revised motion generation
-                        gen_batch_input.non_tensor_batch["__defer_reward__"] = np.array([True] * len(gen_batch_input), dtype=object)
+                        # gen_batch_input.non_tensor_batch["__defer_reward__"] = np.array([] * len(gen_batch_input), dtype=object)
                         # Generate actor responses
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_input)
@@ -1635,7 +1656,7 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
-                    
+
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1655,7 +1676,7 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
                                 batch, reward_fn=self.reward_fn, return_dict=False
                             )
-
+                    
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)

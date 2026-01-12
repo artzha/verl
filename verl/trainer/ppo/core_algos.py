@@ -305,7 +305,7 @@ def compute_grpo_outcome_advantage(
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
-
+    
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):

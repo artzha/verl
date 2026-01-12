@@ -46,11 +46,15 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
     position_ids = data["position_ids"]  # (bs, seq_len) or # (bs, 4, seq_len)
 
     max_seq_len, max_response_len = input_ids.shape[1], response_mask.shape[1]
+
     tu.assign_non_tensor_data(data, "max_seq_len", max_seq_len)
     tu.assign_non_tensor_data(data, "max_response_len", max_response_len)
 
     input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
     tu.assign_non_tensor_data(data, "indices", indices)
+    actual_seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    assert not torch.gt(actual_seq_lens[1:] - actual_seq_lens[:-1], max_seq_len).any(), "(left_right_2_no_padding): Some sequences exceed max_seq_len"
+    assert not torch.gt(response_mask.sum(dim=1), max_response_len).any(), "(left_right_2_no_padding): Some responses exceed max_response_len"
 
     input_ids_nested = torch.nested.nested_tensor_from_jagged(input_ids_rmpad.squeeze(-1), offsets=cu_seqlens)
 

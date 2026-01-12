@@ -614,7 +614,7 @@ class AgentLoopWorker:
                 )
 
             routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
-
+        # breakpoint()
         multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
         await self._compute_score(
@@ -709,6 +709,7 @@ class AgentLoopWorker:
             self.reward_router_address is not None and self.config.reward_model.enable_resource_pool
         ) or not self.config.reward_model.enable
         defer_reward = bool(kwargs.get("__defer_reward__", False))
+        
         if output.reward_score is None and enable_async_reward and self.use_reward_loop and not defer_reward:
             batch = TensorDict(
                 {
