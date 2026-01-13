@@ -320,6 +320,9 @@ class RLHFDataset(Dataset):
                         if "bytes" in image:
                             image["image"] = Image.open(BytesIO(image["bytes"]))
                         content_list.append({"type": "image", **image})
+                    elif isinstance(image, str):
+                        image_pil = Image.open(image).convert("RGB")
+                        content_list.append({"type": "image", "image": image_pil})
                     else:
                         raise TypeError(f"image must be dict or PIL.Image, unsupported image type: {type(image)}")
                     image_offset += 1

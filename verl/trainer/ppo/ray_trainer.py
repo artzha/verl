@@ -590,7 +590,6 @@ class RayPPOTrainer:
             raise ValueError("reward_fn must be provided when rm_scores is not available.")
 
         if return_dict:
-            breakpoint()
             result = reward_fn(batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
             if sum_reward:
@@ -686,7 +685,6 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
 
-            # TODO: generate motion
             test_batch = self._generate_motion(test_batch, postfill="critic")
 
             # repeat test batch
@@ -730,31 +728,31 @@ class RayPPOTrainer:
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-
+            
             # TODO: Generate final motion tokens for reward computation, add motion_responses
             motion_batch = self._generate_motion(test_output_gen_batch, prev=test_gen_batch, prefill="motion")
             motion_responses = motion_batch.non_tensor_batch.get("motion_responses")
             if motion_responses is not None:
-                # Create extra_info entry in test_output_gen_batch if it doesn't exist
-                if 'extra_info' not in test_output_gen_batch.non_tensor_batch:
-                    test_output_gen_batch.non_tensor_batch['extra_info'] = np.array([{} for _ in range(len(test_output_gen_batch))], dtype=object)
+                # # Create extra_info entry in test_output_gen_batch if it doesn't exist
+                # if 'extra_info' not in test_output_gen_batch.non_tensor_batch:
+                #     test_output_gen_batch.non_tensor_batch['extra_info'] = np.array([{} for _ in range(len(test_output_gen_batch))], dtype=object)
 
-                for i in range(len(test_batch)):
-                    test_output_gen_batch.non_tensor_batch['extra_info'][i]['motion_response'] = motion_responses[i]
+                for info, motion in zip(test_batch.non_tensor_batch['extra_info'], motion_responses.tolist()):
+                    info['motion_response'] = motion
 
                 dup_report = tu.drop_dupe_keys(
                     test_batch,
                     test_output_gen_batch,
                     attrs=["batch", "non_tensor_batch", "meta_info"]
                 )
+
             print("validation generation end")
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
-            # bad = {k: type(v) for k, v in test_output_gen_batch.non_tensor_batch.items() if not isinstance(v, np.ndarray)}
-            # print("non_tensor_batch non-ndarray values:", bad)
+
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
@@ -1420,11 +1418,8 @@ class RayPPOTrainer:
                 seed=seed,
                 dataloader_kwargs={"shuffle": shuffle},
             )
-            # self._debug_nested(batch_td, "after_no_padding")
-            # breakpoint()
-            # import pdb; pdb.set_trace()
             actor_output = self.actor_rollout_wg.update_actor(batch_td)
-            # breakpoint()
+ 
             actor_output = tu.get(actor_output, "metrics")
             actor_output = rename_dict(actor_output, "actor/")
             # modify key name
@@ -1507,13 +1502,13 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.                               
-        # if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-        #     val_metrics = self._validate()
-        #     assert val_metrics, f"{val_metrics=}"
-        #     pprint(f"Initial validation metrics: {val_metrics}")
-        #     logger.log(data=val_metrics, step=self.global_steps)
-        #     if self.config.trainer.get("val_only", False):
-        #         return
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            val_metrics = self._validate()
+            assert val_metrics, f"{val_metrics=}"
+            pprint(f"Initial validation metrics: {val_metrics}")
+            logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
