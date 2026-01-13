@@ -65,7 +65,7 @@ actor_rollout_ref:
     lora:
       type: lora
 
-      rank: 64
+      rank: 0
       alpha: 64
 
       dropout: 0.0
@@ -75,7 +75,7 @@ actor_rollout_ref:
         - linear_fc1
         - linear_fc2
 
-      exclude_modules: '.*visual.*'
+      exclude_modules: []
       dropout_position: pre
       lora_A_init_method: xavier
       lora_B_init_method: zero
@@ -94,6 +94,10 @@ actor_rollout_ref:
     prompt_length: 2048
     response_length: 1024
 
+    quantization: null
+    layer_name_map:
+      qkv_layer_name: qkv
+      gate_proj_layer_name: gate_up
 
 motion:
   worker_cls: cotnav.verl_adapters.workers.motion_worker.MotionGenVLLMWorker
