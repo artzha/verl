@@ -1634,10 +1634,13 @@ class RayPPOTrainer:
                             motion_batch = self._generate_motion(batch, prev=gen_batch_input, prefill="motion")
                             # self.tokenizer.decode(motion_batch.batch['input_ids'][0], skip_special_tokens=True)
                             motion_responses = motion_batch.non_tensor_batch.get("motion_responses")
+                            critic_responses = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             if motion_responses is not None:
                                 # Expose motion responses directly for downstream logging
-                                for info, motion in zip(batch.non_tensor_batch['extra_info'], motion_responses.tolist()):
+                                for info, motion, critique in zip(batch.non_tensor_batch['extra_info'], motion_responses.tolist(), critic_responses):
                                     info['motion_response'] = motion
+                                    info['critic_response'] = critique
+
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1740,7 +1743,7 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
+                            
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(

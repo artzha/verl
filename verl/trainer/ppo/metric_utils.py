@@ -77,6 +77,68 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
         response_length=response_length,
     )
 
+def draw_annotated_images(batch: DataProto, max_images=32) -> None:
+    """
+    Draw annotated images for motion paths in the batch.
+
+    This function iterates over the batch and calls the draw_path method
+    of the motion worker to visualize motion paths on images.
+
+    Args:
+        batch: A DataProto object containing batch data with multi-modal information.
+    """
+    from cotnav.utils.draw_utils import draw_polyline
+    from cotnav.models.vlms.interface import parse_and_unify, OutputFormat
+    from cotnav.eval.reflect_llava import make_query_panel
+
+    indices = np.random.randint(0, len(batch.non_tensor_batch['multi_modal_data']), max_images)
+
+    mm = batch.non_tensor_batch["multi_modal_data"]
+    extra = batch.non_tensor_batch["extra_info"]
+
+    log_images = []
+    for idx in indices:
+        # base image (PIL -> np array)
+        img = mm[idx]["image"][0]
+        img = np.asarray(img)
+
+        # queries
+        traces_raw = extra[idx].get("motion_response", [])
+        critique_raw = extra[idx].get("critic_response", "")
+
+        traces = []
+        critiques = []
+        for (tr, cr) in zip(traces_raw):
+            try:
+                trace = parse_and_unify(tr, OutputFormat.TRAJECTORY_V1)
+            except (ValueError, TypeError):
+                trace = None
+            traces.append(trace)
+        
+        try:
+            critique = parse_and_unify(critique_raw, OutputFormat.VERDICT_V1)
+        except (ValueError, TypeError):
+            critique = None
+        critiques.append(critique)
+        critiques.append(None)
+
+        q_images = [
+            draw_polyline(tr.unified["trajectory"], img.copy()) if (tr is not None and "trajectory" in tr.unified) else img.copy()
+            for tr in traces
+        ]
+        # breakpoint()
+        # import pdb; pdb.set_trace()
+        # q_reasons = [
+        #     c.unified['reason'] if c is not None and 'reason' in c.unified else "invalid critique"
+        #     for c in critiques
+        # ] + [""] # add empty reason for last image
+        # breakpoint()
+        # import pdb; pdb.set_trace()
+        # q_hds = extra['hdistances'] if 'hdistances' in extra else []
+
+        # panel_img = make_query_panel(idx, "", q_images, q_reasons, q_hausdorffs=q_hds)
+        # breakpoint()
+        # import pdb; pdb.set_trace()
 
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
@@ -208,6 +270,26 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+
+    # motion critic specific metrics
+    if 'critic_fmt_score' in batch.non_tensor_batch:
+        fmt_scores = batch.non_tensor_batch['critic_fmt_score']
+        metrics['critic/critic_fmt_score/mean'] = float(np.mean(fmt_scores))
+        metrics['critic/critic_fmt_score/max'] = float(np.max(fmt_scores))
+        metrics['critic/critic_fmt_score/min'] = float(np.min(fmt_scores))
+        metrics['critic/critic_fmt_score/std'] = float(np.std(fmt_scores))
+
+    if 'vgoal_score' in batch.non_tensor_batch:
+        vgoal_scores = batch.non_tensor_batch['vgoal_score']
+        metrics['critic/vgoal_score/mean'] = float(np.mean(vgoal_scores))
+        metrics['critic/vgoal_score/max'] = float(np.max(vgoal_scores))
+        metrics['critic/vgoal_score/min'] = float(np.min(vgoal_scores))
+        metrics['critic/vgoal_score/std'] = float(np.std(vgoal_scores))
+
+    # Log annotated images
+    # draw_annotated_images(batch, max_images=32)
+    # breakpoint()
+    # import pdb; pdb.set_trace()
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:

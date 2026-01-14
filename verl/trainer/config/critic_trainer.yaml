@@ -37,10 +37,6 @@ defaults:
   - _self_
 
 actor_rollout_ref:
-  # external_worker:
-  #   path: pkg://cotnav.verl_adapters.workers.hybrid_motion_actor
-  #   name: HybridMotionActorRolloutRefWorker
-
   hybrid_engine: true
 
   actor:
@@ -51,7 +47,7 @@ actor_rollout_ref:
     override_config:
       model_config: {}
       moe_config:
-        freeze_moe_router: False
+        freeze_moe_router: True
 
     # Whether to use custom fused kernels (PostProcessing, for memory efficiency)
     use_fused_kernels: False
@@ -69,11 +65,11 @@ actor_rollout_ref:
       alpha: 64
 
       dropout: 0.0
-      target_modules:
-        - linear_qkv
-        - linear_proj
-        - linear_fc1
-        - linear_fc2
+      target_modules: 'all-linear'
+        # - linear_qkv
+        # - linear_proj
+        # - linear_fc1
+        # - linear_fc2
 
       exclude_modules: '.*visual.*'
       dropout_position: pre
@@ -94,6 +90,8 @@ actor_rollout_ref:
     prompt_length: 2048
     response_length: 1024
 
+    # Required: Allows vllm to load base model
+    load_format: safetensors
 
 motion:
   worker_cls: cotnav.verl_adapters.workers.motion_worker.MotionGenVLLMWorker
@@ -102,7 +100,7 @@ motion:
 
   dtype: bfloat16
   tensor_parallel_size: 1
-  gpu_memory_utilization: 0.4
+  gpu_memory_utilization: 0.4 # 0.4 for 4 80GB 
 
   image_patch_size: 16
   truncation: error # Safeguard for training stability
