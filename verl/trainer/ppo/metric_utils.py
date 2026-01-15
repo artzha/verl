@@ -77,7 +77,7 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
         response_length=response_length,
     )
 
-def draw_annotated_images(batch: DataProto, max_images=32) -> None:
+def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
     """
     Draw annotated images for motion paths in the batch.
 
@@ -91,12 +91,25 @@ def draw_annotated_images(batch: DataProto, max_images=32) -> None:
     from cotnav.models.vlms.interface import parse_and_unify, OutputFormat
     from cotnav.eval.reflect_llava import make_query_panel
 
+    def fig_to_uint8_rgb(fig) -> np.ndarray:
+        """
+        Convert a Matplotlib figure to a uint8 RGB image (HxWx3).
+        Works on modern Matplotlib where tostring_rgb() may not exist.
+        """
+        # Ensure the renderer has drawn the figure
+        fig.canvas.draw()
+        # RGBA buffer (H, W, 4) as uint8
+        rgba = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        # Drop alpha -> RGB
+        rgb = rgba[..., :3].copy()
+        return rgb
+
     indices = np.random.randint(0, len(batch.non_tensor_batch['multi_modal_data']), max_images)
 
     mm = batch.non_tensor_batch["multi_modal_data"]
     extra = batch.non_tensor_batch["extra_info"]
 
-    log_images = []
+    panel_row_list = []
     for idx in indices:
         # base image (PIL -> np array)
         img = mm[idx]["image"][0]
@@ -106,9 +119,10 @@ def draw_annotated_images(batch: DataProto, max_images=32) -> None:
         traces_raw = extra[idx].get("motion_response", [])
         critique_raw = extra[idx].get("critic_response", "")
 
+        gt_trace = extra[idx].get("trace_pts", [])
         traces = []
         critiques = []
-        for (tr, cr) in zip(traces_raw):
+        for (tr, cr) in zip(traces_raw, critique_raw):
             try:
                 trace = parse_and_unify(tr, OutputFormat.TRAJECTORY_V1)
             except (ValueError, TypeError):
@@ -120,25 +134,33 @@ def draw_annotated_images(batch: DataProto, max_images=32) -> None:
         except (ValueError, TypeError):
             critique = None
         critiques.append(critique)
-        critiques.append(None)
 
+        # Draw predicted paths
         q_images = [
-            draw_polyline(tr.unified["trajectory"], img.copy()) if (tr is not None and "trajectory" in tr.unified) else img.copy()
+            draw_polyline(tr.unified["trajectory"], img.copy(), color=(255, 255, 51)) if (tr is not None and "trajectory" in tr.unified) else img.copy()
             for tr in traces
         ]
-        # breakpoint()
-        # import pdb; pdb.set_trace()
-        # q_reasons = [
-        #     c.unified['reason'] if c is not None and 'reason' in c.unified else "invalid critique"
-        #     for c in critiques
-        # ] + [""] # add empty reason for last image
-        # breakpoint()
-        # import pdb; pdb.set_trace()
-        # q_hds = extra['hdistances'] if 'hdistances' in extra else []
+        if len(gt_trace) > 0:
+            q_images = [
+                draw_polyline(gt_trace, q_img, color=(51, 255, 255))
+                for q_img in q_images
+            ]
 
-        # panel_img = make_query_panel(idx, "", q_images, q_reasons, q_hausdorffs=q_hds)
-        # breakpoint()
-        # import pdb; pdb.set_trace()
+        q_reasons = [
+            c.unified['reason'] if c is not None and 'reason' in c.unified else "invalid critique"
+            for c in critiques
+        ] + ["no critique"] # add empty reason for last image
+        q_hds = batch.non_tensor_batch['hdistances'][idx].tolist()
+
+        assert len(q_images) == len(q_reasons) == len(q_hds), "Length mismatch in images, reasons, and distances"
+
+        ride_name = f"{extra[idx]['ride']}_{extra[idx]['seq']}"
+        semantic_goal = extra[idx].get('semantic_goal', 'No goal provided')
+
+        panel_fig = make_query_panel(ride_name, semantic_goal, q_images, q_reasons, q_hausdorffs=q_hds)
+        panel_row_list.append( (ride_name, semantic_goal, fig_to_uint8_rgb(panel_fig)) )
+        
+    return panel_row_list    
 
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
@@ -286,10 +308,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics['critic/vgoal_score/min'] = float(np.min(vgoal_scores))
         metrics['critic/vgoal_score/std'] = float(np.std(vgoal_scores))
 
-    # Log annotated images
-    # draw_annotated_images(batch, max_images=32)
-    # breakpoint()
-    # import pdb; pdb.set_trace()
+        # Log annotated images
+        panel_items = _compute_rollout_panels(batch, max_images=32)
+
+        import wandb
+        table = wandb.Table(columns=["ride_name", "semantic_goal", "panel"])
+        for (ride_name, semantic_goal, panel_img) in panel_items:  # you can return tuples instead
+            table.add_data(ride_name, semantic_goal, wandb.Image(panel_img))
+        metrics["critic/rollout_panels"] = table
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:
