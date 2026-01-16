@@ -159,6 +159,8 @@ def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
 
         panel_fig = make_query_panel(ride_name, semantic_goal, q_images, q_reasons, q_hausdorffs=q_hds)
         panel_row_list.append( (ride_name, semantic_goal, fig_to_uint8_rgb(panel_fig)) )
+        # close the figure to free memory
+        panel_fig.clf()
         
     return panel_row_list    
 

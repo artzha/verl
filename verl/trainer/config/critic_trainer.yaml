@@ -49,6 +49,10 @@ actor_rollout_ref:
       moe_config:
         freeze_moe_router: True
 
+    # Preloads model weights to /dev/shm to improve model loading speed
+    # Do not use is RAM is limited (causes OOM)
+    # use_shm: True
+
     # Whether to use custom fused kernels (PostProcessing, for memory efficiency)
     use_fused_kernels: False
 
@@ -65,13 +69,13 @@ actor_rollout_ref:
       alpha: 64
 
       dropout: 0.0
-      target_modules: 'all-linear'
-        # - linear_qkv
-        # - linear_proj
-        # - linear_fc1
-        # - linear_fc2
+      target_modules:
+        - linear_qkv
+        - linear_proj
+        - linear_fc1
+        - linear_fc2
 
-      exclude_modules: '.*visual.*'
+      # exclude_modules: '.*visual.*'
       dropout_position: pre
       lora_A_init_method: xavier
       lora_B_init_method: zero
@@ -79,8 +83,8 @@ actor_rollout_ref:
       dtype: null
       adapter_path: null
 
-      freeze_vision_model: True
-      freeze_vision_projection: True
+      freeze_vision_model: False
+      freeze_vision_projection: False
       freeze_language_model: True
 
   rollout:
@@ -93,14 +97,17 @@ actor_rollout_ref:
     # Required: Allows vllm to load base model
     load_format: safetensors
 
+    # Reduces peak GPU memory usage
+    layered_summon: True
+
 motion:
   worker_cls: cotnav.verl_adapters.workers.motion_worker.MotionGenVLLMWorker
-  model_name_or_path: Qwen/Qwen3-VL-2B-Instruct
+  model_name_or_path: Qwen/Qwen3-VL-2B-Instruct # Set by script
   trust_remote_code: true
 
   dtype: bfloat16
   tensor_parallel_size: 1
-  gpu_memory_utilization: 0.4 # 0.4 for 4 80GB 
+  gpu_memory_utilization: 0.4 # 0.4 for 4 80GB Set by script
 
   image_patch_size: 16
   truncation: error # Safeguard for training stability
