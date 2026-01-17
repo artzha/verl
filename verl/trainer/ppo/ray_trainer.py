@@ -92,7 +92,7 @@ class ResourcePoolManager:
             # For Megatron backend, we recommend using max_colocate_count>1
             # that can utilize different WorkerGroup for differnt models
             resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=3, name_prefix=resource_pool_name
+                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=2, name_prefix=resource_pool_name
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
@@ -116,6 +116,7 @@ class ResourcePoolManager:
 
         # check total required gpus can be satisfied
         total_available_gpus = sum(node_available_gpus.values())
+
         total_required_gpus = sum(
             [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
         )
@@ -348,6 +349,7 @@ class RayPPOTrainer:
         self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
+        self.motion_actor = None
         self.validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -626,7 +628,7 @@ class RayPPOTrainer:
         prefill: Optional[str]=None,
         postfill: Optional[str]=None
     ) -> DataProto:
-        if self.motion_wg is None:
+        if self.motion_wg is None and self.motion_actor is None:
             return batch
         
         # Ensure required keys are present
@@ -654,10 +656,13 @@ class RayPPOTrainer:
         batch.meta_info["prefill"] = prefill
         batch.meta_info["postfill"] = postfill
 
-        divisor = getattr(self.motion_wg, "world_size", None) or 1
+        divisor = getattr(self.motion_wg, "world_size", None) or 1 if self.motion_wg is not None else 1
         padded, pad_size = pad_dataproto_to_divisor(batch, divisor)
         
-        out = self.motion_wg.generate_sequences(padded)
+        if self.motion_actor is not None:
+            out = ray.get(self.motion_actor.generate_sequences.remote(padded))
+        else:
+            out = self.motion_wg.generate_sequences(padded)
 
         # ONE_TO_ONE usually returns per-worker shards
         if isinstance(out, list):
@@ -747,7 +752,7 @@ class RayPPOTrainer:
                 )
 
             print("validation generation end")
-
+            breakpoint()
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
@@ -889,16 +894,32 @@ class RayPPOTrainer:
             self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
 
             # --- Motion generation (inference-only) colocated worker ---
-            if OmegaConf.select(self.config, "motion") is not None:
-                from cotnav.verl_adapters.workers.motion_worker import MotionGenVLLMWorker
-                MotionGenVLLMWorkerRemote = ray.remote(MotionGenVLLMWorker)
-                self.resource_pool_to_cls[resource_pool]["motion"] = RayClassWithInitArgs(
-                    cls=MotionGenVLLMWorkerRemote,
-                    config=self.config.motion,      # wherever you store motion cfg
-                    role="motion",
-                )
+            # if OmegaConf.select(self.config, "motion") is not None:
+            #     from cotnav.verl_adapters.workers.motion_worker import MotionGenVLLMWorker
+            #     MotionGenVLLMWorkerRemote = ray.remote(MotionGenVLLMWorker)
+            #     self.resource_pool_to_cls[resource_pool]["motion"] = RayClassWithInitArgs(
+            #         cls=MotionGenVLLMWorkerRemote,
+            #         config=self.config.motion,
+            #         role="motion",
+            #     )
         else:
             raise NotImplementedError
+
+        # external/verl/verl/trainer/ppo/ray_trainer.py
+        if Role.Motion in self.role_worker_mapping:
+            bypass_wg = OmegaConf.select(self.config, "motion.bypass_worker_group")
+            bypass_wg = True if bypass_wg is None else bool(bypass_wg)
+            MotionCls = self.role_worker_mapping[Role.Motion]
+            if bypass_wg:
+                tp = int(self.config.motion.get("tensor_parallel_size", 1))
+                self.motion_actor = MotionCls.options(num_gpus=tp, num_cpus=16).remote(
+                    self.config.motion, role="motion"
+                )
+            else:
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Motion)
+                self.resource_pool_to_cls[resource_pool]["motion"] = RayClassWithInitArgs(
+                    cls=MotionCls, config=self.config.motion, role="motion"
+                )
 
         # create critic
         if self.use_critic:
@@ -1042,7 +1063,10 @@ class RayPPOTrainer:
             self.ref_policy_wg = self.actor_rollout_wg
             
         # Initialize motion model
-        if "motion" in all_wg:
+        if self.motion_actor is not None:
+            ray.get(self.motion_actor.init_model.remote())
+            self.motion_wg = None
+        elif "motion" in all_wg:
             self.motion_wg = all_wg["motion"]
             self.motion_wg.init_model()   # important: actually loads vLLM inside the worker
         else:
@@ -1633,6 +1657,7 @@ class RayPPOTrainer:
                             # Update non-tensor batch with latest response
                             motion_batch = self._generate_motion(batch, prev=gen_batch_input, prefill="motion")
                             # self.tokenizer.decode(motion_batch.batch['input_ids'][0], skip_special_tokens=True)
+                            
                             motion_responses = motion_batch.non_tensor_batch.get("motion_responses")
                             critic_responses = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             if motion_responses is not None:
