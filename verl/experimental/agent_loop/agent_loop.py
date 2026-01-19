@@ -586,7 +586,7 @@ class AgentLoopWorker:
             new_non_tensor["motion_responses"] = np.array(
                 [prev + [resp] for prev, resp in zip(old, responses)], dtype=str
             )
-        breakpoint()
+
         return DataProto(batch=batch.batch, non_tensor_batch=new_non_tensor, meta_info=batch.meta_info)
 
     async def _run_agent_loop(

@@ -738,7 +738,7 @@ class RayPPOTrainer:
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-            
+
             # TODO: Generate final motion tokens for reward computation, add motion_responses
             motion_batch = self._generate_motion(test_output_gen_batch, prev=test_gen_batch, prefill="motion")
             motion_responses = motion_batch.non_tensor_batch.get("motion_responses")
