@@ -20,6 +20,8 @@ defaults:
   # Rollout model config.
   - rollout@actor_rollout_ref.rollout: rollout
 
+  - rollout@actor_rollout_ref.motion_rollout: rollout
+
   # Model config.
   - model@actor_rollout_ref.model: hf_model
 
@@ -39,19 +41,24 @@ defaults:
 actor_rollout_ref:
   hybrid_engine: true
 
+  external_worker:
+    path: cotnav/verl_adapters/workers/hybrid_motion_actor.py
+    name: HybridMotionActorRolloutRefWorker
+
   actor:
     strategy: fsdp2
     fsdp_config:
       model_dtype: bf16
+
   model:
-    override_config:
-      model_config: {}
-      moe_config:
-        freeze_moe_router: True
+    # override_config:
+      # model_config: {}
+      # moe_config:
+      #   freeze_moe_router: True
 
     # Preloads model weights to /dev/shm to improve model loading speed
     # Do not use is RAM is limited (causes OOM)
-    # use_shm: True
+    use_shm: False
 
     # Whether to use custom fused kernels (PostProcessing, for memory efficiency)
     use_fused_kernels: False
@@ -88,11 +95,18 @@ actor_rollout_ref:
       freeze_language_model: True
 
   rollout:
+    name: vllm
     mode: async
     temperature: 1.1
     top_p: 0.95
     prompt_length: 2048
     response_length: 1024
+
+    engine_kwargs:
+      vllm:
+        max_model_len: 4096
+        max_num_seqs: 64
+        max_num_batched_tokens: 4096
 
     # Required: Allows vllm to load base model
     load_format: safetensors
@@ -100,35 +114,65 @@ actor_rollout_ref:
     # Reduces peak GPU memory usage
     layered_summon: True
 
-motion:
-  worker_cls: cotnav.verl_adapters.workers.motion_worker.MotionGenVLLMWorker
-  model_name_or_path: Qwen/Qwen3-VL-2B-Instruct # Set by script
-  trust_remote_code: true
+  motion:
+    model:
+      path: Qwen/Qwen3-VL-32B-Instruct
+      trust_remote_code: true
 
-  nnodes: 1
-  n_gpus_per_node: 4
-  enable_sleep_mode: true
+  motion_rollout:
+    name: vllm
+    mode: async
 
-  dtype: bfloat16
-  tensor_parallel_size: 1
-  gpu_memory_utilization: 0.4 # 0.4 for 4 80GB Set by script
+    # worker_cls: cotnav.verl_adapters.workers.hybrid_motion_actor.MotionGenVLLMWorker
+    # model_name_or_path: Qwen/Qwen3-VL-2B-Instruct # Set by script
+    # trust_remote_code: true
 
-  image_patch_size: 16
-  truncation: error # Safeguard for training stability
+    temperature: 1.1
+    top_p: 0.95
+    prompt_length: 2048
+    response_length: 1024
 
-  # generation defaults (can still be overridden by batch.meta_info)
-  max_tokens: 256 # Keep small to prevent unbounded generations
-  temperature: 1.1
-  top_p: 0.95
-  top_k: 0
+    # dtype: bfloat16
+    # gpu_memory_utilization: 0.7
+    # tensor_model_parallel_size: 4
 
-  # make sure this can fit prompt(1024 (mp) + 256 (mr) + 512 (cp) + 1024 (cr) + 256 (mrp) + 256 (mr)
-  max_model_length: 4096
-  max_prompt_length: 3072
+    # max_model_len: 4096
+    # max_num_seqs: 128
+    enable_chunked_prefill: false
+    enable_prefix_caching: false
 
-  prompt_paths: 
-    critic: 'cotnav/models/prompts/reflect/vgoal/critic_prompt_vlm.txt'
-    motion: 'cotnav/models/prompts/reflect/vgoal/motion_refine_prompt.txt'
+    engine_kwargs:
+      vllm:
+        max_model_len: 4096
+        max_num_seqs: 64
+        gpu_memory_utilization: 0.7
+        dtype: bfloat16
+        max_num_batched_tokens: 4096
+        
+        swap_space: 0
+
+    # prompt_paths: 
+    #   critic: 'cotnav/models/prompts/reflect/vgoal/critic_prompt_vlm.txt'
+    #   motion: 'cotnav/models/prompts/reflect/vgoal/motion_refine_prompt.txt'
+
+    # max_prompt_length: 3072
+
+
+    # # Required: Allows vllm to load base model
+    # load_format: safetensors
+
+    # image_patch_size: 16
+    # truncation: error # Safeguard for training stability
+
+    # # generation defaults (can still be overridden by batch.meta_info)
+    # max_tokens: 256 # Keep small to prevent unbounded generations
+    # temperature: 1.1
+    # top_p: 0.95
+    # top_k: 0
+
+    # # make sure this can fit prompt(1024 (mp) + 256 (mr) + 512 (cp) + 1024 (cr) + 256 (mrp) + 256 (mr)
+    # max_model_length: 4096
+    # max_prompt_length: 3072
 
 reward_model:
   use_reward_loop: false

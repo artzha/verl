@@ -349,7 +349,7 @@ class RayPPOTrainer:
         self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
-        self.motion_actor = None
+        self.use_hybrid_motion = False
         self.validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -628,7 +628,7 @@ class RayPPOTrainer:
         prefill: Optional[str]=None,
         postfill: Optional[str]=None
     ) -> DataProto:
-        if self.motion_wg is None and self.motion_actor is None:
+        if not self.use_hybrid_motion:
             return batch
         
         # Ensure required keys are present
@@ -656,13 +656,18 @@ class RayPPOTrainer:
         batch.meta_info["prefill"] = prefill
         batch.meta_info["postfill"] = postfill
 
-        divisor = getattr(self.motion_wg, "world_size", None) or 1 if self.motion_wg is not None else 1
-        padded, pad_size = pad_dataproto_to_divisor(batch, divisor)
-        
-        if self.motion_actor is not None:
-            out = ray.get(self.motion_actor.generate_sequences.remote(padded))
+        if self.async_rollout_mode:
+            divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
         else:
-            out = self.motion_wg.generate_sequences(padded)
+            divisor = getattr(self.actor_rollout_wg, "world_size", None) or 1
+        padded, pad_size = pad_dataproto_to_divisor(batch, divisor)
+
+        if self.async_rollout_mode:
+            out = self.async_rollout_manager.generate_motion_sequences(padded)
+        else:
+            # TODO: Not implemented yet for sync mode
+            raise NotImplementedError("Synchronous motion generation not implemented yet.")
+            out = self.actor_rollout_wg.generate_motion_sequences(padded)
 
         # ONE_TO_ONE usually returns per-worker shards
         if isinstance(out, list):
@@ -689,7 +694,7 @@ class RayPPOTrainer:
                 test_batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
-
+            
             test_batch = self._generate_motion(test_batch, postfill="critic")
 
             # repeat test batch
@@ -752,7 +757,7 @@ class RayPPOTrainer:
                 )
 
             print("validation generation end")
-            breakpoint()
+
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
@@ -893,33 +898,8 @@ class RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
 
-            # --- Motion generation (inference-only) colocated worker ---
-            # if OmegaConf.select(self.config, "motion") is not None:
-            #     from cotnav.verl_adapters.workers.motion_worker import MotionGenVLLMWorker
-            #     MotionGenVLLMWorkerRemote = ray.remote(MotionGenVLLMWorker)
-            #     self.resource_pool_to_cls[resource_pool]["motion"] = RayClassWithInitArgs(
-            #         cls=MotionGenVLLMWorkerRemote,
-            #         config=self.config.motion,
-            #         role="motion",
-            #     )
         else:
             raise NotImplementedError
-
-        # external/verl/verl/trainer/ppo/ray_trainer.py
-        if Role.Motion in self.role_worker_mapping:
-            bypass_wg = OmegaConf.select(self.config, "motion.bypass_worker_group")
-            bypass_wg = True if bypass_wg is None else bool(bypass_wg)
-            MotionCls = self.role_worker_mapping[Role.Motion]
-            if bypass_wg:
-                tp = int(self.config.motion.get("tensor_parallel_size", 1))
-                self.motion_actor = MotionCls.options(num_gpus=tp, num_cpus=16).remote(
-                    self.config.motion, role="motion"
-                )
-            else:
-                resource_pool = self.resource_pool_manager.get_resource_pool(Role.Motion)
-                self.resource_pool_to_cls[resource_pool]["motion"] = RayClassWithInitArgs(
-                    cls=MotionCls, config=self.config.motion, role="motion"
-                )
 
         # create critic
         if self.use_critic:
@@ -1062,15 +1042,11 @@ class RayPPOTrainer:
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
             
-        # Initialize motion model
-        if self.motion_actor is not None:
-            ray.get(self.motion_actor.init_model.remote())
-            self.motion_wg = None
-        elif "motion" in all_wg:
-            self.motion_wg = all_wg["motion"]
-            self.motion_wg.init_model()   # important: actually loads vLLM inside the worker
-        else:
-            self.motion_wg = None
+        # Motion rollout is handled inside the actor rollout worker (hybrid motion).
+        self.use_hybrid_motion = bool(
+            OmegaConf.select(self.config.actor_rollout_ref, "motion") is not None
+            and OmegaConf.select(self.config.actor_rollout_ref, "motion_rollout") is not None
+        )
 
         # create async rollout manager and request scheduler
         # Note: mode is always "async" since sync mode is deprecated
@@ -1088,10 +1064,17 @@ class RayPPOTrainer:
         else:
             rm_resource_pool = None
 
+        rollout_resource_pool = None
+        try:
+            rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+        except Exception:
+            rollout_resource_pool = None
+
         self.async_rollout_manager = AgentLoopManager(
             config=self.config,
             worker_group=self.actor_rollout_wg,
             rm_resource_pool=rm_resource_pool,
+            rollout_resource_pool=rollout_resource_pool,
         )
 
     def _save_checkpoint(self):
@@ -1578,16 +1561,8 @@ class RayPPOTrainer:
                 gen_batch.meta_info["global_steps"] = self.global_steps
 
                 # PATCH: Generate motion tokens
-                if self.motion_wg is not None:
+                if self.use_hybrid_motion:
                     with marked_timer("motion_gen", timing_raw, color="orange"):
-
-                        # Set motion generation parameters
-                        gen_batch.meta_info.update({
-                            "max_tokens": self.config.motion.get("max_tokens", False),
-                            "temperature": self.config.motion.get("temperature", 0.0),
-                            "max_model_len": self.config.motion.get("max_model_len", 128),
-                        })
-
                         gen_batch = self._generate_motion(gen_batch, postfill="critic")
                         timing_raw.update(gen_batch.meta_info.get("timing", {}))
 
@@ -1652,7 +1627,7 @@ class RayPPOTrainer:
                     batch = batch.union(gen_batch_output)
 
                     # PATCH: Generate final motion tokens
-                    if self.motion_wg is not None:
+                    if self.use_hybrid_motion:
                         with marked_timer("motion_gen", timing_raw, color="orange"):
                             # Update non-tensor batch with latest response
                             motion_batch = self._generate_motion(batch, prev=gen_batch_input, prefill="motion")

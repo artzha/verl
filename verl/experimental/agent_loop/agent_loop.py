@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import heapq
+import time
 import logging
 import os
 import random
@@ -30,6 +31,7 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
+from qwen_vl_utils import process_vision_info
 
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.agent_loop.utils import resolve_config_path
@@ -349,6 +351,7 @@ class AgentLoopWorker:
         config: DictConfig,
         server_handles: list[ray.actor.ActorHandle],
         reward_router_address: str = None,
+        motion_server_handles: Optional[list[ray.actor.ActorHandle]] = None,
     ):
         """Initialize agent loop manager.
         Args:
@@ -364,12 +367,28 @@ class AgentLoopWorker:
 
         self.dataset_cls = get_dataset_class(config.data)
         self.reward_router_address = reward_router_address
+        self.motion_server_manager = None
+        self.motion_tokenizer = None
+        self.motion_processor = None
 
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
         self.processor = hf_processor(local_path, trust_remote_code=True)
+
+        if motion_server_handles:
+            self.motion_server_manager = AsyncLLMServerManager(config, motion_server_handles)
+            motion_model_cfg = self.config.actor_rollout_ref.motion.model
+            motion_local_path = copy_to_local(motion_model_cfg.path)
+            motion_trust = getattr(motion_model_cfg, "trust_remote_code", True)
+            self.motion_tokenizer = hf_tokenizer(motion_local_path, trust_remote_code=motion_trust)
+            self.motion_processor = hf_processor(motion_local_path, trust_remote_code=motion_trust)
+            motion_template = motion_model_cfg.get("custom_chat_template", None)
+            if motion_template is not None:
+                if self.motion_processor is not None:
+                    self.motion_processor.chat_template = motion_template
+                self.motion_tokenizer.chat_template = motion_template
 
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
         if agent_loop_config_path:
@@ -480,6 +499,95 @@ class AgentLoopWorker:
         output = self._postprocess(outputs)
 
         return output
+
+    @tqbridge()
+    async def generate_motion_sequences(self, batch: DataProto) -> DataProto:
+        """Generate motion sequences via the motion async rollout servers."""
+        if self.motion_server_manager is None:
+            raise RuntimeError("motion_server_manager is not initialized; check config.actor_rollout_ref.motion_rollout")
+        if self.motion_tokenizer is None:
+            raise RuntimeError("motion_tokenizer is not initialized; check motion model config")
+
+        def prepare_inputs_for_vllm(messages: list[dict]) -> dict[str, Any]:
+            if self.motion_processor is None:
+                raise RuntimeError("motion_processor is required to build prompts from raw_prompt")
+            text = self.motion_processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            image_inputs, video_inputs, _video_kwargs = process_vision_info(
+                messages,
+                image_patch_size=self.motion_processor.image_processor.patch_size,
+                return_video_kwargs=True,
+                return_video_metadata=True,
+            )
+            mm_data = {}
+            if image_inputs is not None:
+                mm_data["image"] = image_inputs
+            if video_inputs is not None:
+                mm_data["video"] = video_inputs
+            return {"prompt": text, "multi_modal_data": mm_data}
+
+        motion_cfg = self.config.actor_rollout_ref.motion_rollout
+        sampling_params = {
+            "temperature": motion_cfg.temperature,
+            "top_p": motion_cfg.top_p,
+            "repetition_penalty": getattr(motion_cfg, "repetition_penalty", 1.0),
+        }
+        if getattr(motion_cfg, "response_length", None) is not None:
+            sampling_params["max_tokens"] = motion_cfg.response_length
+        if getattr(motion_cfg, "calculate_log_probs", False):
+            sampling_params["logprobs"] = True
+
+        full_prompts = batch.non_tensor_batch.get("full_prompts")
+        raw_prompt = batch.non_tensor_batch.get("raw_prompt")
+        vllm_prompts = None
+        if raw_prompt is not None:
+            raw_prompt_list = raw_prompt.tolist() if hasattr(raw_prompt, "tolist") else raw_prompt
+            vllm_prompts = [prepare_inputs_for_vllm(messages) for messages in raw_prompt_list]
+            full_prompts = np.array([p["prompt"] for p in vllm_prompts], dtype=object)
+        elif full_prompts is None:
+            raise RuntimeError("motion generation requires full_prompts or raw_prompt in non_tensor_batch")
+
+        multi_modal_data = batch.non_tensor_batch.get("multi_modal_data")
+        if multi_modal_data is None and vllm_prompts is not None:
+            multi_modal_data = [p["multi_modal_data"] for p in vllm_prompts]
+        uid = batch.non_tensor_batch.get("uid")
+        tasks = []
+        for i in range(len(batch)):
+            prompt_text = full_prompts[i]
+            prompt_ids = self.motion_tokenizer.encode(prompt_text, add_special_tokens=False)
+            image_data = None
+            if multi_modal_data is not None:
+                item = multi_modal_data[i]
+                if isinstance(item, dict):
+                    image_data = item.get("image")
+            request_id = uid[i] if uid is not None else uuid4().hex
+            tasks.append(
+                asyncio.create_task(
+                    self.motion_server_manager.generate(
+                        request_id=request_id,
+                        prompt_ids=prompt_ids,
+                        sampling_params=dict(sampling_params),
+                        image_data=image_data,
+                    )
+                )
+            )
+
+        outputs = await asyncio.gather(*tasks)
+        responses = [self.motion_tokenizer.decode(out.token_ids, skip_special_tokens=True) for out in outputs]
+
+        new_non_tensor = dict(batch.non_tensor_batch)
+        if new_non_tensor.get("motion_responses", None) is None:
+            new_non_tensor["motion_responses"] = np.array([[r] for r in responses], dtype=StopAsyncIteration)
+        else:
+            old = new_non_tensor["motion_responses"].tolist()
+            new_non_tensor["motion_responses"] = np.array(
+                [prev + [resp] for prev, resp in zip(old, responses)], dtype=str
+            )
+        breakpoint()
+        return DataProto(batch=batch.batch, non_tensor_batch=new_non_tensor, meta_info=batch.meta_info)
 
     async def _run_agent_loop(
         self,
@@ -849,7 +957,11 @@ class AgentLoopManager:
     """Agent loop manager that manages a group of agent loop workers."""
 
     def __init__(
-        self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_resource_pool: RayResourcePool = None
+        self,
+        config: DictConfig,
+        worker_group: RayWorkerGroup = None,
+        rm_resource_pool: RayResourcePool = None,
+        rollout_resource_pool: RayResourcePool = None,
     ):
         """Initialize agent loop manager.
 
@@ -860,6 +972,7 @@ class AgentLoopManager:
         """
         self.config = config
         self.worker_group = worker_group
+        self.rollout_resource_pool = rollout_resource_pool
         self.reward_model_manager = None
         self.reward_router_address = None
         if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
@@ -875,11 +988,23 @@ class AgentLoopManager:
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
 
         self._initialize_llm_servers()
+        self.motion_rollout_replicas = []
+        self.motion_server_handles = []
+        self.motion_server_addresses = []
+
+        # Release actor rollout weights before initializing motion servers.
+        if self.config.actor_rollout_ref.rollout.free_cache_engine:
+            self.sleep()
+        if (
+            OmegaConf.select(self.config.actor_rollout_ref, "motion_rollout") is not None
+            and OmegaConf.select(self.config.actor_rollout_ref, "motion.model") is not None
+        ):
+            self._initialize_motion_llm_servers()
         self._init_agent_loop_workers()
 
         # Initially we're in sleep mode.
-        if self.config.actor_rollout_ref.rollout.free_cache_engine:
-            self.sleep()
+        if self.motion_rollout_replicas and self.config.actor_rollout_ref.motion_rollout.free_cache_engine:
+            self.motion_sleep()
 
     def _initialize_llm_servers(self):
         rollout_world_size = (
@@ -892,6 +1017,11 @@ class AgentLoopManager:
             if self.worker_group
             else self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
         )
+        if world_size % rollout_world_size != 0:
+            raise ValueError(
+                "rollout world_size mismatch: "
+                f"world_size={world_size} is not divisible by rollout_world_size={rollout_world_size}"
+            )
         num_replicas = world_size // rollout_world_size
 
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -905,6 +1035,7 @@ class AgentLoopManager:
             )
             for replica_rank in range(num_replicas)
         ]
+
         if self.worker_group:
             self._run_all([server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
         else:
@@ -913,12 +1044,72 @@ class AgentLoopManager:
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
 
         print(f"AgentLoopManager: {self.server_addresses}")
+        if self.worker_group:
+            try:
+                ready_flags = ray.get(self.worker_group.execute_all("rollout_engine_ready"))
+                if not all(ready_flags):
+                    not_ready = [idx for idx, ready in enumerate(ready_flags) if not ready]
+                    logger.warning(f"rollout_engine_ready is False for ranks: {not_ready}")
+            except Exception as exc:
+                logger.warning(f"rollout_engine_ready check failed: {exc}")
 
         # Update Prometheus configuration with server addresses
         if rollout_config.prometheus.enable:
             if rollout_config.disable_log_stats:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
             update_prometheus_config(rollout_config.prometheus, self.server_addresses, rollout_config.name)
+
+    def _initialize_motion_llm_servers(self):
+        motion_rollout_cfg = self.config.actor_rollout_ref.motion_rollout
+        motion_model_cfg = self.config.actor_rollout_ref.motion.model
+        motion_rollout_world_size = (
+            motion_rollout_cfg.tensor_model_parallel_size
+            * motion_rollout_cfg.data_parallel_size
+            * motion_rollout_cfg.pipeline_model_parallel_size
+        )
+        world_size = (
+            self.worker_group.world_size
+            if self.worker_group
+            else self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+        )
+        if world_size % motion_rollout_world_size != 0:
+            raise ValueError(
+                "motion rollout world_size mismatch: "
+                f"world_size={world_size} is not divisible by motion_rollout_world_size={motion_rollout_world_size}"
+            )
+        num_replicas = world_size // motion_rollout_world_size
+
+        motion_replica_class = get_rollout_replica_class(motion_rollout_cfg.name)
+        self.motion_rollout_replicas = [
+            motion_replica_class(
+                replica_rank=replica_rank,
+                config=motion_rollout_cfg,
+                model_config=motion_model_cfg,
+                gpus_per_node=self.config.trainer.n_gpus_per_node,
+            )
+            for replica_rank in range(num_replicas)
+        ]
+
+        if self.worker_group:
+            if self.rollout_resource_pool is None:
+                raise ValueError(
+                    "Motion rollout is configured for colocated mode, but rollout_resource_pool is missing."
+                )
+            logger.info("AgentLoopManager: initializing motion rollout in colocated mode.")
+            self._run_all([server.init_colocated(self.rollout_resource_pool) for server in self.motion_rollout_replicas])
+        else:
+            self._run_all([server.init_standalone() for server in self.motion_rollout_replicas])
+
+        self.motion_server_handles = [server._server_handle for server in self.motion_rollout_replicas]
+        self.motion_server_addresses = [server._server_address for server in self.motion_rollout_replicas]
+        print(f"AgentLoopManager (motion): {self.motion_server_addresses}")
+
+        if motion_rollout_cfg.prometheus.enable:
+            if motion_rollout_cfg.disable_log_stats:
+                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+            update_prometheus_config(
+                motion_rollout_cfg.prometheus, self.motion_server_addresses, f"{motion_rollout_cfg.name}_motion"
+            )
 
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
@@ -934,7 +1125,7 @@ class AgentLoopManager:
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
                     ),
-                ).remote(self.config, self.server_handles, self.reward_router_address)
+                ).remote(self.config, self.server_handles, self.reward_router_address, self.motion_server_handles)
             )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -948,7 +1139,7 @@ class AgentLoopManager:
         """
 
         # Fix for Issue #4147: Always call wake_up() to ensure weight sync
-        # The wake_up()/sleep() methods internally check free_cache_engine
+        # The wake_up()/sleep() methods internally check fzree_cache_engine
         self.wake_up()
         if self.reward_model_manager:
             self.reward_model_manager.wake_up()
@@ -972,6 +1163,25 @@ class AgentLoopManager:
         timing = self._performance_metrics(metrics, output)
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        return output
+
+    def generate_motion_sequences(self, prompts: DataProto) -> DataProto:
+        """Generate motion sequences through motion async rollout servers."""
+        if not self.motion_rollout_replicas:
+            raise RuntimeError("motion rollout servers are not initialized; check config.actor_rollout_ref.motion_rollout")
+
+        self.motion_wake_up()
+
+        chunks = prompts.chunk(len(self.agent_loop_workers))
+        outputs = ray.get(
+            [
+                worker.generate_motion_sequences.remote(chunk)
+                for worker, chunk in zip(self.agent_loop_workers, chunks, strict=True)
+            ]
+        )
+        output = DataProto.concat(outputs)
+
+        self.motion_sleep()
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
@@ -1003,6 +1213,18 @@ class AgentLoopManager:
     def sleep(self):
         """Sleep all rollout replica instances."""
         self._run_all([replica.sleep() for replica in self.rollout_replicas])
+
+    def motion_wake_up(self):
+        """Wake up all motion rollout replica instances."""
+        if not self.motion_rollout_replicas:
+            return
+        self._run_all([replica.wake_up() for replica in self.motion_rollout_replicas])
+
+    def motion_sleep(self):
+        """Sleep all motion rollout replica instances."""
+        if not self.motion_rollout_replicas:
+            return
+        self._run_all([replica.sleep() for replica in self.motion_rollout_replicas])
 
     def clear_kv_cache(self):
         """Clear all rollout kv cache, but don`t sleep."""

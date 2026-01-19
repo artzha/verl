@@ -149,7 +149,8 @@ class vLLMAsyncRollout(BaseRollout):
             self.socket = context.socket(zmq.REP)
             if socket_type == "ipc":
                 pid = os.getpid()
-                address = f"ipc:///tmp/verl_vllm_zmq_{pid}_{getpass.getuser()}.ipc"
+                uniq = f"{pid}_{getpass.getuser()}_{id(self)}"
+                address = f"ipc:///tmp/verl_vllm_zmq_{uniq}.ipc"
             else:
                 ip = ray.util.get_node_ip_address().strip("[]")
                 port, sock = get_free_port(ip)
@@ -186,7 +187,7 @@ class vLLMAsyncRollout(BaseRollout):
             for k in VLLM_ASCEND_REQUIRED_ENV_VARS:
                 if k not in os.environ:
                     os.environ[k] = VLLM_ASCEND_REQUIRED_ENV_VARS[k]
-
+        
         if not torch.distributed.is_initialized():
             initialize_global_process_group_ray()
         all_kwargs[0]["rank"] = int(os.environ["RANK"])
