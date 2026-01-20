@@ -90,8 +90,8 @@ actor_rollout_ref:
       dtype: null
       adapter_path: null
 
-      freeze_vision_model: False
-      freeze_vision_projection: False
+      freeze_vision_model: True
+      freeze_vision_projection: True
       freeze_language_model: True
 
   rollout:
@@ -100,7 +100,7 @@ actor_rollout_ref:
     temperature: 1.1
     top_p: 0.95
     prompt_length: 2048
-    response_length: 1024
+    response_length: 512
 
     engine_kwargs:
       vllm:
@@ -112,48 +112,43 @@ actor_rollout_ref:
     load_format: safetensors
 
     # Reduces peak GPU memory usage
-    layered_summon: True
+    # layered_summon: True
 
   motion:
     model:
       path: Qwen/Qwen3-VL-32B-Instruct
       trust_remote_code: true
+    prompt_paths: 
+      critic: 'cotnav/models/prompts/reflect/vgoal/critic_prompt_vlm.txt'
+      motion: 'cotnav/models/prompts/reflect/vgoal/motion_refine_prompt.txt'
 
   motion_rollout:
     name: vllm
     mode: async
 
-    # worker_cls: cotnav.verl_adapters.workers.hybrid_motion_actor.MotionGenVLLMWorker
-    # model_name_or_path: Qwen/Qwen3-VL-2B-Instruct # Set by script
-    # trust_remote_code: true
-
+    # Sampling parameters
     temperature: 1.1
     top_p: 0.95
     prompt_length: 2048
-    response_length: 1024
+    response_length: 512
 
     # dtype: bfloat16
     # gpu_memory_utilization: 0.7
-    # tensor_model_parallel_size: 4
+    tensor_model_parallel_size: 4
 
-    # max_model_len: 4096
-    # max_num_seqs: 128
-    enable_chunked_prefill: false
-    enable_prefix_caching: false
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
 
+    # VLLM async engine parameters
     engine_kwargs:
       vllm:
         max_model_len: 4096
         max_num_seqs: 64
-        gpu_memory_utilization: 0.7
+        gpu_memory_utilization: 0.9
         dtype: bfloat16
         max_num_batched_tokens: 4096
         
         swap_space: 0
-
-    # prompt_paths: 
-    #   critic: 'cotnav/models/prompts/reflect/vgoal/critic_prompt_vlm.txt'
-    #   motion: 'cotnav/models/prompts/reflect/vgoal/motion_refine_prompt.txt'
 
     # max_prompt_length: 3072
 

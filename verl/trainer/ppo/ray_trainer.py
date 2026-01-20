@@ -68,6 +68,19 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 
 from cotnav.core.format import text_to_llava
 
+
+def find_raw_prompt_3d(batch: DataProto) -> list[int]:
+    raw_prompt = batch.non_tensor_batch.get("raw_prompt") if batch.non_tensor_batch else None
+    if raw_prompt is None:
+        return []
+    raw_prompt_list = raw_prompt.tolist() if hasattr(raw_prompt, "tolist") else raw_prompt
+    bad_indices = []
+    for i, msgs in enumerate(raw_prompt_list):
+        if isinstance(msgs, np.ndarray) or isinstance(msgs, list):
+            if isinstance(msgs[0], np.ndarray) or isinstance(msgs[0], list):
+                bad_indices.append(i)
+    return bad_indices
+
 @dataclass
 class ResourcePoolManager:
     """
@@ -637,15 +650,18 @@ class RayPPOTrainer:
             if key in batch.non_tensor_batch:
                 continue
             if prev is not None and key in prev.non_tensor_batch:
-                batch.non_tensor_batch[key] = np.array(prev.non_tensor_batch[key])
-                
+                batch.non_tensor_batch[key] = np.array(prev.non_tensor_batch[key], dtype=object)
+
         # Update full_prompts and raw_prompt if previous batch is provided
         if prev is not None:
             batch_response = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-            batch.non_tensor_batch["raw_prompt"] = np.array([
-               p + [text_to_llava(r, role="assistant")] 
-               for p, r in zip(prev.non_tensor_batch["raw_prompt"].tolist(), batch_response)
-            ])
+            batch.non_tensor_batch["raw_prompt"] = np.array(
+                [
+                    p + [text_to_llava(r, role="assistant")]
+                    for p, r in zip(prev.non_tensor_batch["raw_prompt"].tolist(), batch_response)
+                ],
+                dtype=object,
+            )
             # np.array(self.processor.apply_chat_template(batch.non_tensor_batch["raw_prompt"].tolist(), tokenize=False, add_generation_prompt=True))
             batch.non_tensor_batch["full_prompts"] = np.array(self.processor.apply_chat_template(
                 batch.non_tensor_batch["raw_prompt"].tolist(),
@@ -1509,13 +1525,13 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.                               
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
+        # if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        #     val_metrics = self._validate()
+        #     assert val_metrics, f"{val_metrics=}"
+        #     pprint(f"Initial validation metrics: {val_metrics}")
+        #     logger.log(data=val_metrics, step=self.global_steps)
+        #     if self.config.trainer.get("val_only", False):
+        #         return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
@@ -1575,8 +1591,6 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        # PATCH: Defer reward computation until after revised motion generation
-                        # gen_batch_input.non_tensor_batch["__defer_reward__"] = np.array([] * len(gen_batch_input), dtype=object)
                         # Generate actor responses
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_input)
@@ -1641,7 +1655,6 @@ class RayPPOTrainer:
                                     info['motion_response'] = motion
                                     info['critic_response'] = critique
 
-
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1680,7 +1693,7 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
                                 batch, reward_fn=self.reward_fn, return_dict=False
                             )
-                    
+
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1733,6 +1746,10 @@ class RayPPOTrainer:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
                             batch = batch.union(values)
+                    for idx, rp in enumerate(batch.non_tensor_batch["raw_prompt"]):
+                        if len(rp) != 4:
+                            breakpoint()
+                            import pdb; pdb.set_trace()
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
@@ -1867,7 +1884,7 @@ class RayPPOTrainer:
 
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
-
+        
                 # training metrics
                 metrics.update(
                     {
@@ -1875,6 +1892,11 @@ class RayPPOTrainer:
                         "training/epoch": epoch,
                     }
                 )
+                # for idx, rp in enumerate(batch.non_tensor_batch["raw_prompt"]):
+                #     if len(rp) != 4:
+                #         breakpoint()
+                #         import pdb; pdb.set_trace()
+
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))

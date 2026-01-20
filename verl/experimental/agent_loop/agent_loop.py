@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import heapq
 import time
 import logging
@@ -51,6 +52,9 @@ from verl.utils.rollout_trace import (
 )
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
+from cotnav.core.format import text_to_llava
+from cotnav.models.vlms.interface import OutputFormat, parse_and_unify
+from cotnav.utils.draw_utils import draw_polyline
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -370,6 +374,7 @@ class AgentLoopWorker:
         self.motion_server_manager = None
         self.motion_tokenizer = None
         self.motion_processor = None
+        self.motion_prompts = {}
 
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
@@ -389,6 +394,10 @@ class AgentLoopWorker:
                 if self.motion_processor is not None:
                     self.motion_processor.chat_template = motion_template
                 self.motion_tokenizer.chat_template = motion_template
+            prompt_paths = getattr(self.config.actor_rollout_ref.motion, "prompt_paths", {}) or {}
+            for key, path in prompt_paths.items():
+                with open(path, "r") as handle:
+                    self.motion_prompts[key] = text_to_llava(handle.read(), role="user")
 
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
         if agent_loop_config_path:
@@ -419,6 +428,82 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
         )
+
+    def draw_path(self, new_non_tensor: dict, cur_idx: int = 0) -> dict:
+        """Parse motion response strings and draw polylines on the source image."""
+        assert "motion_responses" in new_non_tensor, "Expected motion_responses in non_tensor_batch."
+        motion_responses = new_non_tensor["motion_responses"]
+        images = []
+        traces = []
+        for i, trace_list in enumerate(motion_responses):
+            trace_str = trace_list[0] if isinstance(trace_list, (list, tuple, np.ndarray)) else trace_list
+            try:
+                payload = parse_and_unify(trace_str, OutputFormat.TRAJECTORY_V1)
+            except (ValueError, TypeError):
+                payload = None
+
+            if hasattr(payload, "unified") and "trajectory" in payload.unified:
+                trace = payload.unified["trajectory"]
+            else:
+                trace = None
+
+            traces.append(trace)
+            if trace is None:
+                images.append(None)
+                continue
+
+            cur_img = new_non_tensor["multi_modal_data"][i]["image"][cur_idx]
+            ann_img = draw_polyline(trace, np.array(cur_img), line_thickness=2)
+            images.append(Image.fromarray(ann_img))
+
+        return {"trace": traces, "image": images}
+
+    def update_prompt(
+        self,
+        non_tensor_dict: dict,
+        i: int,
+        response_text: str,
+        ann=None,
+        prefill=None,
+        postfill=None,
+    ):
+        """Update raw_prompt/full_prompts/multi_modal_data in place with prefill/postfill."""
+        messages = list(non_tensor_dict["raw_prompt"][i])
+        if messages and isinstance(messages[0], list):
+            raise RuntimeError(
+                f"raw_prompt[{i}] is nested (list of lists); expected list of dicts. "
+                "Check upstream raw_prompt construction."
+            )
+
+        if prefill is not None:
+            if prefill not in self.motion_prompts:
+                raise RuntimeError(f"Unknown prefill key {prefill}")
+            prefill_msg = self.motion_prompts[prefill]
+            if not messages or messages[-1] != prefill_msg:
+                messages.append(copy.deepcopy(prefill_msg))
+
+        messages.append(text_to_llava(response_text, role="assistant"))
+
+        if postfill is not None:
+            if postfill not in self.motion_prompts:
+                raise RuntimeError(f"Unknown postfill key {postfill}")
+            post_msg = copy.deepcopy(self.motion_prompts[postfill])
+            if ann is not None:
+                post_msg["content"].insert(0, {"type": "image", "image": ann})
+            messages.append(post_msg)
+
+        if self.motion_processor is None:
+            raise RuntimeError("motion_processor is required to update prompts")
+        new_full_prompt = self.motion_processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        non_tensor_dict["raw_prompt"][i] = messages
+        non_tensor_dict["full_prompts"][i] = new_full_prompt
+        if ann is not None:
+            non_tensor_dict["multi_modal_data"][i]["image"].append(ann)
 
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
@@ -530,6 +615,8 @@ class AgentLoopWorker:
             return {"prompt": text, "multi_modal_data": mm_data}
 
         motion_cfg = self.config.actor_rollout_ref.motion_rollout
+        prefill = batch.meta_info.get("prefill", None)
+        postfill = batch.meta_info.get("postfill", None)
         sampling_params = {
             "temperature": motion_cfg.temperature,
             "top_p": motion_cfg.top_p,
@@ -540,24 +627,45 @@ class AgentLoopWorker:
         if getattr(motion_cfg, "calculate_log_probs", False):
             sampling_params["logprobs"] = True
 
-        full_prompts = batch.non_tensor_batch.get("full_prompts")
-        raw_prompt = batch.non_tensor_batch.get("raw_prompt")
+        new_non_tensor = copy.deepcopy(batch.non_tensor_batch)
+        full_prompts = new_non_tensor.get("full_prompts")
+        raw_prompt = new_non_tensor.get("raw_prompt")
         vllm_prompts = None
+        raw_prompt_list = None
         if raw_prompt is not None:
             raw_prompt_list = raw_prompt.tolist() if hasattr(raw_prompt, "tolist") else raw_prompt
+            for i, msgs in enumerate(raw_prompt_list):
+                if isinstance(msgs, list) and msgs and isinstance(msgs[0], list):
+                    raise RuntimeError(
+                        f"raw_prompt[{i}] is nested (list of lists); expected list of dicts. "
+                        "Check upstream raw_prompt construction."
+                    )
+            if prefill is not None:
+                if prefill not in self.motion_prompts:
+                    raise RuntimeError(f"Unknown prefill key {prefill}")
+                prefill_msg = self.motion_prompts[prefill]
+                raw_prompt_list = [msgs + [prefill_msg] for msgs in raw_prompt_list]
             vllm_prompts = [prepare_inputs_for_vllm(messages) for messages in raw_prompt_list]
             full_prompts = np.array([p["prompt"] for p in vllm_prompts], dtype=object)
+            new_non_tensor["raw_prompt"] = raw_prompt_list
+            new_non_tensor["full_prompts"] = [p["prompt"] for p in vllm_prompts]
+            new_non_tensor["multi_modal_data"] = [p["multi_modal_data"] for p in vllm_prompts]
         elif full_prompts is None:
             raise RuntimeError("motion generation requires full_prompts or raw_prompt in non_tensor_batch")
 
-        multi_modal_data = batch.non_tensor_batch.get("multi_modal_data")
-        if multi_modal_data is None and vllm_prompts is not None:
-            multi_modal_data = [p["multi_modal_data"] for p in vllm_prompts]
-        uid = batch.non_tensor_batch.get("uid")
+        multi_modal_data = new_non_tensor.get("multi_modal_data")
+        uid = new_non_tensor.get("uid")
         tasks = []
+
+        prompt_ids_list = self.motion_tokenizer.batch_encode_plus(
+            full_prompts.tolist(),
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        prompt_ids_batch = prompt_ids_list["input_ids"]
         for i in range(len(batch)):
-            prompt_text = full_prompts[i]
-            prompt_ids = self.motion_tokenizer.encode(prompt_text, add_special_tokens=False)
+            prompt_ids = prompt_ids_batch[i]
             image_data = None
             if multi_modal_data is not None:
                 item = multi_modal_data[i]
@@ -576,16 +684,44 @@ class AgentLoopWorker:
             )
 
         outputs = await asyncio.gather(*tasks)
-        responses = [self.motion_tokenizer.decode(out.token_ids, skip_special_tokens=True) for out in outputs]
+        responses = self.motion_tokenizer.batch_decode(
+            [out.token_ids for out in outputs],
+            skip_special_tokens=True,
+        )
 
-        new_non_tensor = dict(batch.non_tensor_batch)
         if new_non_tensor.get("motion_responses", None) is None:
-            new_non_tensor["motion_responses"] = np.array([[r] for r in responses], dtype=StopAsyncIteration)
+            new_non_tensor["motion_responses"] = np.array([[r] for r in responses], dtype=object)
         else:
             old = new_non_tensor["motion_responses"].tolist()
             new_non_tensor["motion_responses"] = np.array(
-                [prev + [resp] for prev, resp in zip(old, responses)], dtype=str
+                [prev + [resp] for prev, resp in zip(old, responses)], dtype=object
             )
+
+        if raw_prompt_list is None:
+            raise RuntimeError("raw_prompt is required to update prompts after motion generation")
+        if isinstance(new_non_tensor.get("raw_prompt"), np.ndarray):
+            new_non_tensor["raw_prompt"] = new_non_tensor["raw_prompt"].tolist()
+        if isinstance(new_non_tensor.get("full_prompts"), np.ndarray):
+            new_non_tensor["full_prompts"] = new_non_tensor["full_prompts"].tolist()
+        if isinstance(new_non_tensor.get("multi_modal_data"), np.ndarray):
+            new_non_tensor["multi_modal_data"] = new_non_tensor["multi_modal_data"].tolist()
+
+        ann_payload = self.draw_path(new_non_tensor, cur_idx=0)
+        for i in range(len(responses)):
+            ann_img = ann_payload["image"][i]
+            self.update_prompt(
+                new_non_tensor,
+                i,
+                responses[i],
+                ann_img,
+                prefill,
+                postfill,
+            )
+
+        new_non_tensor["full_prompts"] = np.array(new_non_tensor["full_prompts"], dtype=object)
+        new_non_tensor["raw_prompt"] = np.array(new_non_tensor["raw_prompt"], dtype=object)
+        if new_non_tensor.get("multi_modal_data") is not None:
+            new_non_tensor["multi_modal_data"] = np.array(new_non_tensor["multi_modal_data"], dtype=object)
 
         return DataProto(batch=batch.batch, non_tensor_batch=new_non_tensor, meta_info=batch.meta_info)
 

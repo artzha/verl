@@ -77,7 +77,7 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
         response_length=response_length,
     )
 
-def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
+def _compute_rollout_panels(batch: DataProto, max_images=64) -> None:
     """
     Draw annotated images for motion paths in the batch.
 
@@ -104,22 +104,42 @@ def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
         rgb = rgba[..., :3].copy()
         return rgb
 
-    indices = np.random.randint(0, len(batch.non_tensor_batch['multi_modal_data']), max_images)
+    # Sort by the the highest hdistances to visualize worst cases
+    hdistances = batch.non_tensor_batch['hdistances']
+    indices = np.argsort(hdistances[:, 0])[-max_images:]
 
-    mm = batch.non_tensor_batch["multi_modal_data"]
+    def build_ride_name(idx: int) -> str:
+        return f"{batch.non_tensor_batch['extra_info'][idx]['ride']}_{batch.non_tensor_batch['extra_info'][idx]['seq']}"
+
+    # Filter unique indices based on ride names to avoid duplicates
+    ride_names = set(build_ride_name(idx) for idx in indices)
+    unique_indices = []
+    for idx in indices:
+        ride_name = build_ride_name(idx)
+        if ride_name in ride_names:
+            unique_indices.append(idx)
+            ride_names.remove(ride_name)
+
+    # mm = batch.non_tensor_batch["multi_modal_data"]
+    raw_prompt = batch.non_tensor_batch['raw_prompt']
     extra = batch.non_tensor_batch["extra_info"]
+
+    # type checks
+    for idx, rp in enumerate(raw_prompt):
+        assert len(rp) == 4, f"raw_prompt at index {idx} should have 4 elements, got {len(rp)}"
 
     panel_row_list = []
     for idx in indices:
         # base image (PIL -> np array)
-        img = mm[idx]["image"][0]
-        img = np.asarray(img)
+        content = raw_prompt[idx][0]["content"][0]
+        extra_i = extra[idx]
 
-        # queries
-        traces_raw = extra[idx].get("motion_response", [])
-        critique_raw = extra[idx].get("critic_response", "")
+        traces_raw = extra_i.get("motion_response", [])
+        critique_raw = extra_i.get("critic_response", "")
+        gt_trace = extra_i.get("trace_pts", [])
+        img = np.asarray(content['image'])
+        # Add assertions and narrow down why these are becoming 3d lists
 
-        gt_trace = extra[idx].get("trace_pts", [])
         traces = []
         critiques = []
         for (tr, cr) in zip(traces_raw, critique_raw):
@@ -154,8 +174,8 @@ def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
 
         assert len(q_images) == len(q_reasons) == len(q_hds), "Length mismatch in images, reasons, and distances"
 
-        ride_name = f"{extra[idx]['ride']}_{extra[idx]['seq']}"
-        semantic_goal = extra[idx].get('semantic_goal', 'No goal provided')
+        ride_name = build_ride_name(idx)
+        semantic_goal = extra_i.get('semantic_goal', 'No goal provided')
 
         panel_fig = make_query_panel(ride_name, semantic_goal, q_images, q_reasons, q_hausdorffs=q_hds)
         panel_row_list.append( (ride_name, semantic_goal, fig_to_uint8_rgb(panel_fig)) )
