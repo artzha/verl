@@ -97,7 +97,7 @@ actor_rollout_ref:
   rollout:
     name: vllm
     mode: async
-    temperature: 1.1
+    temperature: 1.3
     top_p: 0.95
     prompt_length: 2048
     response_length: 512

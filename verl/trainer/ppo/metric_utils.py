@@ -106,8 +106,7 @@ def _compute_rollout_panels(batch: DataProto, max_images=64) -> None:
 
     # Sort by the the highest hdistances to visualize worst cases
     hdistances = batch.non_tensor_batch['hdistances']
-    indices = np.argsort(hdistances[:, 0])[-max_images:]
-
+    indices = np.argsort(hdistances[:, 0])
     def build_ride_name(idx: int) -> str:
         return f"{batch.non_tensor_batch['extra_info'][idx]['ride']}_{batch.non_tensor_batch['extra_info'][idx]['seq']}"
 
@@ -119,6 +118,7 @@ def _compute_rollout_panels(batch: DataProto, max_images=64) -> None:
         if ride_name in ride_names:
             unique_indices.append(idx)
             ride_names.remove(ride_name)
+    unique_indices = unique_indices[:max_images]
 
     # mm = batch.non_tensor_batch["multi_modal_data"]
     raw_prompt = batch.non_tensor_batch['raw_prompt']
@@ -129,7 +129,7 @@ def _compute_rollout_panels(batch: DataProto, max_images=64) -> None:
         assert len(rp) == 4, f"raw_prompt at index {idx} should have 4 elements, got {len(rp)}"
 
     panel_row_list = []
-    for idx in indices:
+    for idx in unique_indices:
         # base image (PIL -> np array)
         content = raw_prompt[idx][0]["content"][0]
         extra_i = extra[idx]
@@ -138,7 +138,6 @@ def _compute_rollout_panels(batch: DataProto, max_images=64) -> None:
         critique_raw = extra_i.get("critic_response", "")
         gt_trace = extra_i.get("trace_pts", [])
         img = np.asarray(content['image'])
-        # Add assertions and narrow down why these are becoming 3d lists
 
         traces = []
         critiques = []
@@ -176,7 +175,8 @@ def _compute_rollout_panels(batch: DataProto, max_images=64) -> None:
 
         ride_name = build_ride_name(idx)
         semantic_goal = extra_i.get('semantic_goal', 'No goal provided')
-
+        # breakpoint()
+        # import pdb; pdb.set_trace()
         panel_fig = make_query_panel(ride_name, semantic_goal, q_images, q_reasons, q_hausdorffs=q_hds)
         panel_row_list.append( (ride_name, semantic_goal, fig_to_uint8_rgb(panel_fig)) )
         # close the figure to free memory
