@@ -169,6 +169,7 @@ class MultiTurnSFTDataset(Dataset):
         message: dict[str, Any],
         tools: Optional[list[dict[str, Any]]] = None,
         enable_thinking: Optional[bool] = None,
+        n_messages: int = -1
     ) -> tuple[list[int], list[int], list[int]]:
         """
         Process a single message and return its tokenized representation.
@@ -207,8 +208,9 @@ class MultiTurnSFTDataset(Dataset):
         if index != 0 and message["role"] != "system":
             input_ids = input_ids[len(self.system_prompt) :]
             attention_mask = attention_mask[len(self.system_prompt) :]
-
-        if message["role"] == "assistant":
+        
+        # Modification, only apply loss mask to last assistant message
+        if message["role"] == "assistant" and (index+1) >= n_messages:
             loss_mask = torch.ones_like(attention_mask)
             # mask out generation prompt if assistant message
             loss_mask[: len(self.generation_prompt)] = 0
@@ -232,7 +234,7 @@ class MultiTurnSFTDataset(Dataset):
         messages: list = example[self.messages_key]
         images = example[self.image_key] if self.image_key in example else []
         videos = example[self.video_key] if self.video_key in example else []
-
+        
         image_offset, video_offset = 0, 0
         for message in messages:
             if self.image_key not in example and self.video_key not in example:
@@ -265,6 +267,7 @@ class MultiTurnSFTDataset(Dataset):
 
     def __getitem__(self, item):
         row_dict: dict = self.dataframe.iloc[item].to_dict()
+
         messages = self._build_messages(row_dict)
         tools = self.tools[item] if self.tools is not None else None
         enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
@@ -277,6 +280,7 @@ class MultiTurnSFTDataset(Dataset):
                 message=message,
                 tools=tools if i == 0 else None,
                 enable_thinking=enable_thinking,
+                n_messages=len(messages),
             )
             input_ids.append(_input_ids)
             loss_mask.append(_loss_mask)
@@ -417,3 +421,35 @@ class MultiTurnSFTDataset(Dataset):
                 logger.warning_once(error_message)
             else:
                 raise AssertionError(error_message)
+
+if __name__ == "__main__":
+    from transformers import AutoTokenizer, AutoProcessor
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-VL-2B-Instruct", trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
+
+    from omegaconf import OmegaConf
+    config_path = "external/verl/verl/trainer/config/data/critic_sft_yt.yaml"
+    config = OmegaConf.load(config_path)
+    OmegaConf.resolve(config)
+
+    parquet_files = ListConfig([
+        config.train_files,
+        config.val_files
+    ])
+    dataset = MultiTurnSFTDataset(
+        parquet_files=parquet_files,
+        tokenizer=tokenizer,
+        config=config,
+        processor=processor,
+        max_samples=-1,
+    )
+    print(f"dataset len: {len(dataset)}")
+    for i in range(3):
+        sample = dataset[i]
+        print(sample.keys())
+        print(sample["input_ids"].shape)
+        print(sample["loss_mask"].shape)
+        if "multi_modal_inputs" in sample:
+            for k, v in sample["multi_modal_inputs"].items():
+                print(f"multi_modal_inputs[{k}]: {v.shape}")
+        print("="*50)

@@ -135,7 +135,7 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, item):
         tokenizer = self.tokenizer
-
+        import pdb; pdb.set_trace()
         prompt = self.prompts[item]
         response = self.responses[item]
 
@@ -202,3 +202,4 @@ class SFTDataset(Dataset):
             "position_ids": position_ids,
             "loss_mask": loss_mask,
         }
+

@@ -106,7 +106,7 @@ def _compute_rollout_panels(batch: DataProto, max_images=64) -> None:
 
     # Sort by the the highest hdistances to visualize worst cases
     hdistances = batch.non_tensor_batch['hdistances']
-    indices = np.argsort(hdistances[:, 0])
+    indices = np.argsort(hdistances[:, 0])[::-1]
     def build_ride_name(idx: int) -> str:
         return f"{batch.non_tensor_batch['extra_info'][idx]['ride']}_{batch.non_tensor_batch['extra_info'][idx]['seq']}"
 
@@ -331,7 +331,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics['critic/vgoal_score/std'] = float(np.std(vgoal_scores))
 
         # Log annotated images
-        panel_items = _compute_rollout_panels(batch, max_images=32)
+        panel_items = _compute_rollout_panels(batch, max_images=64)
 
         import wandb
         table = wandb.Table(columns=["ride_name", "semantic_goal", "panel"])

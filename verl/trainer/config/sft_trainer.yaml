@@ -42,8 +42,8 @@ model:
   external_lib: null
   enable_gradient_checkpointing: True
   trust_remote_code: False
-  lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
-  lora_alpha: 16  # LoRA scaling factor
+  lora_rank: 64  # Set to positive value to enable LoRA (e.g., 32)
+  lora_alpha: 64  # LoRA scaling factor
   target_modules: all-linear  # Target modules for LoRA adaptation
   use_liger: False
   strategy: fsdp2

@@ -21,6 +21,9 @@ from qwen_vl_utils import fetch_image, fetch_video
 
 
 def process_image(image: dict | Image.Image, image_patch_size: int = 14) -> Image.Image:
+    if isinstance(image, str):
+        image = Image.open(image)
+
     if isinstance(image, Image.Image):
         return image.convert("RGB")
 

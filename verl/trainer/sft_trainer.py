@@ -391,7 +391,7 @@ def run_sft(config):
     destroy_global_process_group()
 
 
-@hydra.main(config_path="config", config_name="sft_trainer_engine", version_base=None)
+@hydra.main(config_path="config", config_name="critic_sft_trainer_engine", version_base=None)
 def main(config):
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)

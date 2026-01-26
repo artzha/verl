@@ -750,8 +750,7 @@ class FSDPSFTTrainer:
             )
 
         # Calculate which epoch we're starting from for sampler.set_epoch()
-        start_epoch = global_step // self.steps_per_epoch
-
+        start_epoch = global_step // self.steps_per_epoch    
         train_time = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
@@ -840,7 +839,7 @@ def run_sft(config):
     destroy_global_process_group()
 
 
-@hydra.main(config_path="config", config_name="sft_trainer", version_base=None)
+@hydra.main(config_path="config", config_name="critic_sft_trainer", version_base=None)
 def main(config):
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
