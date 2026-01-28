@@ -265,7 +265,7 @@ class BaseModelMerger(ABC):
         lora_rank = min(lora_params[lora_key].shape[0], lora_params[lora_key].shape[1])
         peft_dict = {
             "r": lora_rank,
-            "lora_alpha": 0,  # lora_alpha is not set. An error should be raised to inform the user to set it manually.
+            "lora_alpha": 64,  # lora_alpha is not set. An error should be raised to inform the user to set it manually.
             "target_modules": list(target_modules),
         }
         peft_config = peft.LoraConfig(**peft_dict).to_dict()
@@ -302,10 +302,11 @@ class BaseModelMerger(ABC):
         if lora_path:
             print(f"Saving lora adapter to {lora_path}")
 
-        print(f"Saving model to {self.config.target_dir}")
+        merged_dir = os.path.join(self.config.target_dir, "merged")
+        os.makedirs(merged_dir, exist_ok=True)
+
+        print(f"Saving base model to {self.config.target_dir}")
         model.save_pretrained(self.config.target_dir, state_dict=state_dict)
-        del state_dict
-        del model
 
         processor = hf_processor(self.hf_model_config_path, trust_remote_code=self.config.trust_remote_code)
         tokenizer = hf_tokenizer(self.hf_model_config_path, trust_remote_code=self.config.trust_remote_code)
@@ -315,6 +316,43 @@ class BaseModelMerger(ABC):
         if tokenizer is not None:
             print(f"Saving tokenizer to {self.config.target_dir}")
             tokenizer.save_pretrained(self.config.target_dir)
+
+        if not lora_path:
+            print(f"No LoRA adapter found; saving base model to {merged_dir}")
+            model.save_pretrained(merged_dir, state_dict=state_dict)
+            if processor is not None:
+                print(f"Saving processor to {merged_dir}")
+                processor.save_pretrained(merged_dir)
+            if tokenizer is not None:
+                print(f"Saving tokenizer to {merged_dir}")
+                tokenizer.save_pretrained(merged_dir)
+            del state_dict
+            del model
+            return
+
+        del state_dict
+        del model
+
+        if lora_path:
+            from peft import PeftModel
+
+            print("Merging LoRA into base weights with PEFT...")
+            base_model = auto_model_class.from_pretrained(
+                self.config.target_dir, torch_dtype=torch.bfloat16, trust_remote_code=self.config.trust_remote_code
+            )
+            peft_model = PeftModel.from_pretrained(base_model, lora_path)
+            merged_model = peft_model.merge_and_unload()
+            merged_model.save_pretrained(merged_dir)
+            print(f"Saved merged model to {merged_dir}")
+            if processor is not None:
+                print(f"Saving processor to {merged_dir}")
+                processor.save_pretrained(merged_dir)
+            if tokenizer is not None:
+                print(f"Saving tokenizer to {merged_dir}")
+                tokenizer.save_pretrained(merged_dir)
+            del base_model
+            del peft_model
+            del merged_model
 
     def upload_to_huggingface(self):
         import requests
