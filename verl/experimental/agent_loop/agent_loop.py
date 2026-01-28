@@ -52,6 +52,7 @@ from verl.utils.rollout_trace import (
 )
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
+from cotnav.core.constants import MOTION_START_TOKEN, MOTION_END_TOKEN, MOTION_GOAL_TOKEN, LANGUAGE_GOAL_TOKEN
 from cotnav.core.format import text_to_llava
 from cotnav.models.vlms.interface import OutputFormat, parse_and_unify
 from cotnav.utils.draw_utils import draw_polyline
@@ -453,10 +454,46 @@ class AgentLoopWorker:
                 continue
 
             cur_img = new_non_tensor["multi_modal_data"][i]["image"][cur_idx]
-            ann_img = draw_polyline(trace, np.array(cur_img), line_thickness=2)
+            ann_img = draw_polyline(trace, np.array(cur_img), line_thickness=2, color=(255, 255, 51))
             images.append(Image.fromarray(ann_img))
 
         return {"trace": traces, "image": images}
+
+    def format_prompt(
+        self,
+        non_tensor_dict,
+        i: int,
+        prompt_msg,
+        prev_message=None
+    ):
+        """Format prompt with tokens"""
+        extra = non_tensor_dict['extra_info'][i]
+        vgoal = extra.get('vgoal', [])  # (1, 2) normalized coords
+        semantic_goal = extra.get('semantic_goal', '')
+        if len(vgoal) > 0:
+            vgoal_str = f"[{vgoal[0][0]:.3f}, {vgoal[0][1]:.3f}]"
+        else:
+            vgoal_str = "[N/A, N/A]"
+
+        prompt_template = prompt_msg['content'][0]['text']
+        prompt = prompt_template.replace(
+            LANGUAGE_GOAL_TOKEN, semantic_goal
+        ).replace(
+            MOTION_GOAL_TOKEN, vgoal_str
+        )
+
+        if prev_message is not None:
+            try:
+                payload = parse_and_unify(prev_message[0]['text'], OutputFormat.TRAJECTORY_V1)
+                trace_pts = payload.unified["trajectory"]  # (N, 2) normalized coords
+                trace_pts_str = "[" + ", ".join([f"[{pt[0]:.3f}, {pt[1]:.3f}]" for pt in trace_pts]) + "]"
+                prompt = prompt.replace(
+                    f"{MOTION_START_TOKEN}{MOTION_END_TOKEN}", trace_pts_str
+                )
+            except (ValueError, TypeError):
+                pass
+        prompt_msg['content'][0]['text'] = prompt
+        return prompt_msg
 
     def update_prompt(
         self,
@@ -474,11 +511,17 @@ class AgentLoopWorker:
                 f"raw_prompt[{i}] is nested (list of lists); expected list of dicts. "
                 "Check upstream raw_prompt construction."
             )
-
+    
         if prefill is not None:
             if prefill not in self.motion_prompts:
                 raise RuntimeError(f"Unknown prefill key {prefill}")
-            prefill_msg = self.motion_prompts[prefill]
+            prefill_msg = copy.deepcopy(self.motion_prompts[prefill])
+            prefill_msg = self.format_prompt(
+                non_tensor_dict,
+                i,
+                prompt_msg=prefill_msg,
+                prev_message=messages[-1]["content"] if messages else None
+            )
             if not messages or messages[-1] != prefill_msg:
                 messages.append(copy.deepcopy(prefill_msg))
 
@@ -488,6 +531,12 @@ class AgentLoopWorker:
             if postfill not in self.motion_prompts:
                 raise RuntimeError(f"Unknown postfill key {postfill}")
             post_msg = copy.deepcopy(self.motion_prompts[postfill])
+            post_msg = self.format_prompt(
+                non_tensor_dict,
+                i,
+                prompt_msg=post_msg,
+                prev_message=messages[-1]["content"] if messages else None
+            )
             if ann is not None:
                 post_msg["content"].insert(0, {"type": "image", "image": ann})
             messages.append(post_msg)
@@ -644,6 +693,12 @@ class AgentLoopWorker:
                 if prefill not in self.motion_prompts:
                     raise RuntimeError(f"Unknown prefill key {prefill}")
                 prefill_msg = self.motion_prompts[prefill]
+                prefill_msg = self.format_prompt(
+                    new_non_tensor,
+                    i,
+                    prompt_msg=prefill_msg,
+                    prev_message=msgs[-1]["content"] if msgs else None
+                )
                 raw_prompt_list = [msgs + [prefill_msg] for msgs in raw_prompt_list]
             vllm_prompts = [prepare_inputs_for_vllm(messages) for messages in raw_prompt_list]
             full_prompts = np.array([p["prompt"] for p in vllm_prompts], dtype=object)

@@ -754,12 +754,13 @@ class RayPPOTrainer:
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            test_output_gen_batch.non_tensor_batch["extra_info"] = test_batch.non_tensor_batch["extra_info"]
 
             # TODO: Generate final motion tokens for reward computation, add motion_responses
             motion_batch = self._generate_motion(test_output_gen_batch, prev=test_gen_batch, prefill="motion")
             motion_responses = motion_batch.non_tensor_batch.get("motion_responses")
             if motion_responses is not None:
-                # # Create extra_info entry in test_output_gen_batch if it doesn't exist
+                # Create extra_info entry in test_output_gen_batch if it doesn't exist
                 # if 'extra_info' not in test_output_gen_batch.non_tensor_batch:
                 #     test_output_gen_batch.non_tensor_batch['extra_info'] = np.array([{} for _ in range(len(test_output_gen_batch))], dtype=object)
 
@@ -771,7 +772,6 @@ class RayPPOTrainer:
                     test_output_gen_batch,
                     attrs=["batch", "non_tensor_batch", "meta_info"]
                 )
-
             print("validation generation end")
 
             # Store generated outputs
@@ -1525,13 +1525,13 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.                               
-        # if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-        #     val_metrics = self._validate()
-        #     assert val_metrics, f"{val_metrics=}"
-        #     pprint(f"Initial validation metrics: {val_metrics}")
-        #     logger.log(data=val_metrics, step=self.global_steps)
-        #     if self.config.trainer.get("val_only", False):
-        #         return
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            val_metrics = self._validate()
+            assert val_metrics, f"{val_metrics=}"
+            pprint(f"Initial validation metrics: {val_metrics}")
+            logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
@@ -1747,7 +1747,7 @@ class RayPPOTrainer:
                             values = self._compute_values(batch)
                             batch = batch.union(values)
                     for idx, rp in enumerate(batch.non_tensor_batch["raw_prompt"]):
-                        if len(rp) != 4:
+                        if len(rp) != 5:
                             breakpoint()
                             import pdb; pdb.set_trace()
 
@@ -1893,7 +1893,7 @@ class RayPPOTrainer:
                     }
                 )
                 # for idx, rp in enumerate(batch.non_tensor_batch["raw_prompt"]):
-                #     if len(rp) != 4:
+                #     if len(rp) != 5:
                 #         breakpoint()
                 #         import pdb; pdb.set_trace()
 

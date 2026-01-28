@@ -150,8 +150,14 @@ class MultiTurnSFTDataset(Dataset):
             self.tools = self.dataframe[self.tools_key].apply(convert_nested_value_to_list_recursive).tolist()
         else:
             self.tools = None
+
         # Extract enable_thinking list from dataframe
+        thinking_enabled = False
         if self.enable_thinking_key in self.dataframe.columns:
+            # Check if any values in the column are True
+            thinking_enabled = any(self.dataframe[self.enable_thinking_key]) 
+
+        if thinking_enabled:
             self.enable_thinking = self.dataframe[self.enable_thinking_key].tolist()
         else:
             self.enable_thinking = None
@@ -428,13 +434,13 @@ if __name__ == "__main__":
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
 
     from omegaconf import OmegaConf
-    config_path = "external/verl/verl/trainer/config/data/critic_sft_yt.yaml"
+    config_path = "external/verl/verl/trainer/config/critic_sft_trainer_engine.yaml"
     config = OmegaConf.load(config_path)
     OmegaConf.resolve(config)
 
     parquet_files = ListConfig([
-        config.train_files,
-        config.val_files
+        config.data.train_files,
+        config.data.val_files
     ])
     dataset = MultiTurnSFTDataset(
         parquet_files=parquet_files,

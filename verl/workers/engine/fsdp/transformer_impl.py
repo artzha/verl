@@ -250,6 +250,9 @@ class FSDPEngine(BaseEngine):
     def _build_lora_module(self, module):
         module.enable_input_require_grads()
 
+        # if torch.distributed.get_rank() == 0:
+        #     import pdb; pdb.set_trace()
+
         lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
         if lora_adapter_path is not None:
             from peft import PeftModel
@@ -277,6 +280,16 @@ class FSDPEngine(BaseEngine):
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
 
+        # Debug: print trainable module names (rank 0 only)
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            trainable = [
+                name for name, param in module.named_parameters() if param.requires_grad
+            ]
+            print(f"[LoRA] Trainable parameters ({len(trainable)}):")
+            for name in trainable:
+                print(f"  {name}")
+            print(f"[LoRA] # of trainable {len(trainable)} params\n")
+            print(f"# of non-trainable params: {len(trainable)}/{len(list(module.parameters()))}")
         return module
 
     def _build_fsdp_module(self, module):

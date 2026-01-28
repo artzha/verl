@@ -126,12 +126,12 @@ def _compute_rollout_panels(batch: DataProto, max_images=64) -> None:
 
     # type checks
     for idx, rp in enumerate(raw_prompt):
-        assert len(rp) == 4, f"raw_prompt at index {idx} should have 4 elements, got {len(rp)}"
+        assert len(rp) == 5, f"raw_prompt at index {idx} should have 5 elements, got {len(rp)}"
 
     panel_row_list = []
     for idx in unique_indices:
         # base image (PIL -> np array)
-        content = raw_prompt[idx][0]["content"][0]
+        content = raw_prompt[idx][1]["content"][0]
         extra_i = extra[idx]
 
         traces_raw = extra_i.get("motion_response", [])
