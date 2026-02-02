@@ -1400,6 +1400,135 @@ class RayPPOTrainer:
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
+    def _compute_gt_log_prob(self, batch: DataProto) -> Optional[DataProto]:
+        if batch.non_tensor_batch:
+            uids = batch.non_tensor_batch.get("uid", None)
+        else:
+            uids = None
+        inverse = None
+        if uids is not None:
+            _, unique_indices, inverse = np.unique(uids, return_index=True, return_inverse=True)
+            base_batch = batch.select_idxs(unique_indices)
+        else:
+            base_batch = batch
+
+        extra_infos = base_batch.non_tensor_batch.get("extra_info") if base_batch.non_tensor_batch else None
+        if extra_infos is None:
+            return None
+        extra_infos_list = extra_infos.tolist() if hasattr(extra_infos, "tolist") else list(extra_infos)
+
+        gt_texts: list[str] = []
+        has_gt = False
+        for info in extra_infos_list:
+            gt = None
+            if isinstance(info, dict):
+                gt = info.get("gt_critique")
+            if isinstance(gt, (list, tuple)):
+                gt = gt[0] if len(gt) > 0 else None
+            if hasattr(gt, "tolist") and not isinstance(gt, str):
+                gt = gt.tolist()
+            if gt is None:
+                gt_texts.append("")
+                continue
+            has_gt = True
+            if isinstance(gt, str):
+                try:
+                    parsed = json.loads(gt)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, str):
+                    gt_texts.append(parsed)
+                elif isinstance(parsed, (dict, list)):
+                    gt_texts.append(json.dumps(parsed, ensure_ascii=True))
+                elif parsed is not None:
+                    gt_texts.append(str(parsed))
+                else:
+                    gt_texts.append(gt)
+            elif isinstance(gt, (dict, list)):
+                gt_texts.append(json.dumps(gt, ensure_ascii=True))
+            else:
+                gt_texts.append(str(gt))
+
+        if not has_gt:
+            return None
+
+        responses = base_batch.batch["responses"]
+        response_length = responses.shape[-1]
+        prompt_input_ids = base_batch.batch["input_ids"][:, :-response_length]
+        prompt_attention_mask = base_batch.batch["attention_mask"][:, :-response_length]
+        position_ids = base_batch.batch["position_ids"]
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+        eos_token_id = self.tokenizer.eos_token_id
+
+        encoded = self.tokenizer(gt_texts, add_special_tokens=False, padding=False, return_attention_mask=False)
+        gt_ids_list = encoded["input_ids"]
+
+        gt_response_ids = torch.full_like(responses, fill_value=pad_token_id)
+        gt_response_mask = torch.zeros_like(responses, dtype=prompt_attention_mask.dtype)
+        for i, ids in enumerate(gt_ids_list):
+            if eos_token_id is not None and len(ids) < response_length and (len(ids) == 0 or ids[-1] != eos_token_id):
+                ids = ids + [eos_token_id]
+            if len(ids) > response_length:
+                ids = ids[:response_length]
+            if len(ids) == 0:
+                continue
+            gt_response_ids[i, : len(ids)] = torch.tensor(ids, dtype=gt_response_ids.dtype)
+            gt_response_mask[i, : len(ids)] = 1
+
+        gt_input_ids = torch.cat([prompt_input_ids, gt_response_ids], dim=1)
+        gt_attention_mask = torch.cat([prompt_attention_mask, gt_response_mask], dim=1)
+
+        non_tensor_keys = []
+        if "multi_modal_inputs" in base_batch.non_tensor_batch:
+            non_tensor_keys.append("multi_modal_inputs")
+        if "uid" in base_batch.non_tensor_batch:
+            non_tensor_keys.append("uid")
+        non_tensor_batch = {k: base_batch.non_tensor_batch[k] for k in non_tensor_keys}
+
+        gt_batch = DataProto.from_dict(
+            tensors={
+                "input_ids": gt_input_ids,
+                "attention_mask": gt_attention_mask,
+                "position_ids": position_ids,
+                "responses": gt_response_ids,
+                "response_mask": gt_response_mask,
+            },
+            non_tensors=non_tensor_batch,
+            meta_info=base_batch.meta_info,
+        )
+
+        if self.use_legacy_worker_impl == "disable":
+            gt_td = gt_batch.to_tensordict()
+            gt_td = left_right_2_no_padding(gt_td)
+            tu.assign_non_tensor(gt_td, calculate_entropy=False, compute_loss=False)
+            output = self.actor_rollout_wg.compute_log_prob(gt_td)
+            log_probs = tu.get(output, "log_probs")
+            log_probs = no_padding_2_padding(log_probs, gt_td)
+            gt_log_probs = log_probs.float()
+        else:
+            output = self.actor_rollout_wg.compute_log_prob(gt_batch)
+            log_probs = output.batch.get("old_log_probs") if output is not None else None
+            if log_probs is None:
+                return None
+            gt_log_probs = log_probs.float()
+
+        if inverse is not None and len(base_batch) != len(batch):
+            index = torch.from_numpy(inverse).to(gt_log_probs.device)
+            gt_log_probs = gt_log_probs.index_select(0, index)
+            gt_response_mask = gt_response_mask.index_select(0, index)
+
+        gt_log_prob = DataProto.from_single_dict(
+            {
+                "gt_log_probs": gt_log_probs,
+                "gt_response_mask": gt_response_mask,
+            }
+        )
+
+        return gt_log_prob
+
     def _debug_nested(self, td, tag: str):
         bad = []
         # iterating items with nested keys
@@ -1734,6 +1863,11 @@ class RayPPOTrainer:
                                 metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+
+                    with marked_timer("gt_log_prob", timing_raw, color="blue"):
+                        gt_log_prob = self._compute_gt_log_prob(batch)
+                        if gt_log_prob is not None:
+                            batch = batch.union(gt_log_prob)
 
                     if self.use_reference_policy:
                         # compute reference log_prob

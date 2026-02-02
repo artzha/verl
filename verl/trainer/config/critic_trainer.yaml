@@ -100,7 +100,7 @@ actor_rollout_ref:
     temperature: 1.0
     top_p: 0.95
     prompt_length: 2048
-    response_length: 768
+    response_length: 512
 
     engine_kwargs:
       vllm:
@@ -142,11 +142,11 @@ actor_rollout_ref:
     # VLLM async engine parameters
     engine_kwargs:
       vllm:
-        max_model_len: 5120
+        max_model_len: 4096
         max_num_seqs: 64
         gpu_memory_utilization: 0.9
         dtype: bfloat16
-        max_num_batched_tokens: 5120
+        max_num_batched_tokens: 4096
         
         swap_space: 0
 
@@ -407,6 +407,9 @@ ray_kwargs:
   ray_init:
     num_cpus: 32 # Number of CPUs for Ray. Use a fixed number instead of null when using SLURM.
     # object_store_memory: 21474836480 # 20 * 1024^3
+    include_dashboard: True
+    dashboard_host: 127.0.0.1
+    dashboard_port: 8265
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null

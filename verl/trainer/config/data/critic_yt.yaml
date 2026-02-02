@@ -57,6 +57,9 @@ return_raw_chat: True
 # Whether to return the full prompt with chat template.
 return_full_prompt: True
 
+# Whether to return the ground truth response 
+return_gt_response: True
+
 # Whether to shuffle the data in the dataloader.
 shuffle: True
 

@@ -77,7 +77,7 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
         response_length=response_length,
     )
 
-def _compute_rollout_panels(batch: DataProto, max_images=64) -> None:
+def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
     """
     Draw annotated images for motion paths in the batch.
 
@@ -338,6 +338,22 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         for (ride_name, semantic_goal, panel_img) in panel_items:  # you can return tuples instead
             table.add_data(ride_name, semantic_goal, wandb.Image(panel_img))
         metrics["critic/rollout_panels"] = table
+
+    if "gt_log_probs" in batch.batch:
+        gt_response_mask = batch.batch.get("gt_response_mask", None)
+        if gt_response_mask is None:
+            gt_response_mask = response_mask
+        valid_gt = gt_response_mask.sum(dim=-1) > 0
+        if valid_gt.any():
+            pred_logp = verl_F.masked_mean(batch.batch["old_log_probs"], response_mask, axis=-1)[valid_gt]
+            gt_logp = verl_F.masked_mean(batch.batch["gt_log_probs"], gt_response_mask, axis=-1)[valid_gt]
+            log_ratio = pred_logp - gt_logp # log (p_pred / p_gt)
+            metrics["critic/critique_logp_pred/mean"] = pred_logp.mean().detach().item()
+            metrics["critic/critique_logp_gt/mean"] = gt_logp.mean().detach().item()
+            metrics["critic/critique_logp_ratio/mean"] = log_ratio.mean().detach().item()
+            metrics["critic/critique_logp_ratio/max"] = log_ratio.max().detach().item()
+            metrics["critic/critique_logp_ratio/min"] = log_ratio.min().detach().item()
+            metrics["critic/critique_logp_gt/valid_ratio"] = valid_gt.float().mean().detach().item()
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:
