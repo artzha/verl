@@ -20,6 +20,7 @@ from tensordict.tensorclass import NonTensorData
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+# os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import logging
 
@@ -322,7 +323,6 @@ class SFTTrainer:
                     self.training_client.start_profile()
                 # train for on batch
                 output = self.training_client.train_batch(data=data)
-
                 if global_step == self.end_profile_step:
                     self.training_client.stop_profile()
 
@@ -339,7 +339,6 @@ class SFTTrainer:
                     ).item()
                     total_tokens += metrics["train/global_tokens"]
                     metrics["train/total_tokens(B)"] = total_tokens / 1e9
-
                     if self.engine.get_data_parallel_rank() == 0:
                         tracking.log(data=metrics, step=global_step)
 
@@ -393,6 +392,7 @@ def run_sft(config):
 
 @hydra.main(config_path="config", config_name="critic_sft_trainer_engine", version_base=None)
 def main(config):
+    # mp.set_start_method("spawn", force=True)
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
     run_sft(config)

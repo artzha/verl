@@ -31,6 +31,12 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     batch_num_tokens = data["batch_num_tokens"]
 
     log_prob = model_output["log_probs"]
+    loss_weights = tu.get(data, key="loss_weights", default=None)
+    if loss_weights is not None:
+        if not torch.is_tensor(loss_weights):
+            loss_weights = torch.tensor(loss_weights, device=log_prob.device, dtype=log_prob.dtype)
+        else:
+            loss_weights = loss_weights.to(log_prob.device)
 
     if pad_mode == DatasetPadMode.NO_PADDING:
         # log_prob and loss mask are nested tensors of shape [bsz, j1]
@@ -43,12 +49,23 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         # left-shift the loss mask by one token to align with log_prob
         loss_mask_flatten = torch.roll(loss_mask_flatten, shifts=-1, dims=0)
 
+        if loss_weights is not None:
+            if loss_mask.is_nested:
+                seqlens = loss_mask.offsets().diff().to(loss_weights.device)
+                if seqlens.numel() == loss_weights.numel():
+                    weight_flatten = torch.repeat_interleave(loss_weights, seqlens)
+                    loss_mask_flatten = loss_mask_flatten * weight_flatten
+            else:
+                loss_mask_flatten = loss_mask_flatten * loss_weights.view(-1, 1).expand_as(loss_mask_flatten).reshape(-1)
+
         # NOTE: loss is averaged over all tokens in the batch across all data parallel groups,
         # For FSDP backend, the loss is directly used for backward; while for Megatron backend,
         # the loss should be scaled by `num_microbatches` for pp schedule.
         loss = -masked_sum(log_prob_flatten, loss_mask_flatten) / batch_num_tokens * dp_size
     else:
         response_mask = data["response_mask"].to(bool)
+        if loss_weights is not None:
+            response_mask = response_mask * loss_weights.view(-1, 1)
         loss = -masked_sum(log_prob, response_mask) / batch_num_tokens * dp_size
 
     return loss, {}

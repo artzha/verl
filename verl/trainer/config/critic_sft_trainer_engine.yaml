@@ -24,11 +24,13 @@ data:
   val_max_samples: -1  # set to -1 to use full dataset
   # Multi-turn settings
   messages_key: messages  # Key for messages list in multi-turn mode
+  # reward_key: vgoal_scorer
+  reward_key: null
   tools_key: tools  # Key for tools list in multi-turn mode
   enable_thinking_key: enable_thinking  # Whether to enable thinking in multi-turn mode
   pad_mode: no_padding
   # for right padding
-  max_length: 1024
+  max_length: 2048
   truncation: error
   balance_dp_token: False # to be implement
   custom_cls:
@@ -55,9 +57,8 @@ model:
     # - k_proj
 
   # Hack for excluding visual backbone
-  # exclude_modules: ".*visual\\.blocks\\..*|.*visual\\.patch_embed\\..*|.*visual\\.pos_embed$|.*visual\\.rotary_pos_emb$"
+  exclude_modules: ".*visual\\.blocks\\..*|.*visual\\.patch_embed\\..*|.*visual\\.pos_embed$|.*visual\\.rotary_pos_emb$"
     # - '.*language_model\..*'
-  
 
 # Checkpoint configuration
 checkpoint:

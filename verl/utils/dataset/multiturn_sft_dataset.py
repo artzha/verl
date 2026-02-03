@@ -21,6 +21,7 @@ import os
 import re
 from typing import Any, Optional
 
+import math
 import numpy as np
 import pandas as pd
 import torch
@@ -86,6 +87,7 @@ class MultiTurnSFTDataset(Dataset):
         self.messages_key = config.get("messages_key", "messages")
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
+        self.reward_key = config.get("reward_key", None)
         self.image_patch_size = config.get(
             "image_patch_size", processor.image_processor.patch_size if processor else None
         )
@@ -96,6 +98,7 @@ class MultiTurnSFTDataset(Dataset):
         self.seed = config.get("seed")
         self.max_samples = max_samples
         self.ignore_input_ids_mismatch = config.get("ignore_input_ids_mismatch", False)
+        self.return_messages = config.get("return_messages", False)
         assert self.truncation in ["error", "left", "right"]
 
         if not isinstance(parquet_files, list | ListConfig):
@@ -277,6 +280,10 @@ class MultiTurnSFTDataset(Dataset):
         messages = self._build_messages(row_dict)
         tools = self.tools[item] if self.tools is not None else None
         enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
+        loss_weight = None
+        if self.reward_key is not None:
+            assert self.reward_key in row_dict, f"Missing reward key {self.reward_key} in dataset row."
+            loss_weight = math.exp(float(row_dict[self.reward_key]))
 
         # 1. tokenize each message
         input_ids, loss_mask, attention_mask, multi_modal_inputs = [], [], [], {}
@@ -373,6 +380,10 @@ class MultiTurnSFTDataset(Dataset):
                 "position_ids": position_ids,
                 "loss_mask": loss_mask,
             }
+            if loss_weight is not None:
+                res["loss_weights"] = loss_weight
+            if self.return_messages:
+                res["messages"] = messages
             if len(multi_modal_inputs) > 0:
                 res["multi_modal_inputs"] = multi_modal_inputs
             return res
@@ -389,6 +400,10 @@ class MultiTurnSFTDataset(Dataset):
                 "position_ids": position_ids,
                 "loss_mask": loss_mask,
             }
+            if loss_weight is not None:
+                res["loss_weights"] = loss_weight
+            if self.return_messages:
+                res["messages"] = messages
             if len(multi_modal_inputs) > 0:
                 res["multi_modal_inputs"] = multi_modal_inputs
             return res
@@ -445,7 +460,7 @@ if __name__ == "__main__":
     dataset = MultiTurnSFTDataset(
         parquet_files=parquet_files,
         tokenizer=tokenizer,
-        config=config,
+        config=config.data,
         processor=processor,
         max_samples=-1,
     )
@@ -458,4 +473,5 @@ if __name__ == "__main__":
         if "multi_modal_inputs" in sample:
             for k, v in sample["multi_modal_inputs"].items():
                 print(f"multi_modal_inputs[{k}]: {v.shape}")
+        import pdb; pdb.set_trace()
         print("="*50)
