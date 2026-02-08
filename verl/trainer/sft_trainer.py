@@ -262,6 +262,10 @@ class SFTTrainer:
 
         global_step = self.resume_global_step  # Start from resumed step
         last_valid_metric = None
+        early_stop_patience = int(getattr(self.config.trainer, "early_stop_patience", 0) or 0)
+        early_stop_min_delta = float(getattr(self.config.trainer, "early_stop_min_delta", 0.0) or 0.0)
+        best_val_loss = None
+        bad_val_steps = 0
 
         log_with_rank(
             f"Total training steps: {self.total_training_steps},",
@@ -345,6 +349,7 @@ class SFTTrainer:
                 is_last_step = global_step >= self.total_training_steps
                 is_valid_step = global_step % self.test_freq == 0
                 is_save_step = global_step % self.save_freq == 0
+                should_stop = False
 
                 # early exit or validation step
                 if is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step):
@@ -364,12 +369,35 @@ class SFTTrainer:
                         torch.distributed.all_reduce(
                             val_loss, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
                         )
+                        val_loss_value = val_loss.detach().item()
 
                     if is_logging:
-                        metric = {"val/loss": val_loss.detach().item()}
+                        metric = {"val/loss": val_loss_value}
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
+
+                    if self.engine.is_mp_src_rank_with_outputs() and early_stop_patience > 0:
+                        if best_val_loss is None or val_loss_value < best_val_loss - early_stop_min_delta:
+                            best_val_loss = val_loss_value
+                            bad_val_steps = 0
+                        else:
+                            bad_val_steps += 1
+                        should_stop = bad_val_steps >= early_stop_patience
+
+                    if early_stop_patience > 0:
+                        stop_signal = torch.tensor(int(should_stop), device=self.device_name)
+                        torch.distributed.all_reduce(stop_signal, op=torch.distributed.ReduceOp.MAX)
+                        should_stop = stop_signal.item() > 0
+
                     torch.distributed.barrier()
+
+                if should_stop:
+                    if is_logging:
+                        print(
+                            f"Early stopping at step {global_step} "
+                            f"(best val loss: {best_val_loss:.6f})."
+                        )
+                    return
 
                 if is_last_step or (self.save_freq > 0 and is_save_step):
                     self.ckpt_handler.save_checkpoint(step=global_step)

@@ -65,6 +65,10 @@ trainer:
   seed: 1
   save_freq: -1
   test_freq: -1
+  # Number of validation checks with no improvement before stopping.
+  early_stop_patience: 0
+  # Minimum validation loss improvement to reset early stopping patience.
+  early_stop_min_delta: 0.0
   max_ckpt_to_keep: null  # Maximum number of checkpoints to keep, set to null to keep all
 
   # Resume mode: "auto", "disable", or "resume_path"

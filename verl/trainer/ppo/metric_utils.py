@@ -87,7 +87,7 @@ def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
     Args:
         batch: A DataProto object containing batch data with multi-modal information.
     """
-    from cotnav.utils.draw_utils import draw_polyline
+    from cotnav.utils.draw import draw_polyline
     from cotnav.models.vlms.interface import parse_and_unify, OutputFormat
     from cotnav.eval.reflect_llava import make_query_panel
 

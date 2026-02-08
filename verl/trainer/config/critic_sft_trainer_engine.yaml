@@ -18,14 +18,14 @@ data:
   micro_batch_size_per_gpu: 4  # this is also val batch size
   max_token_len_per_gpu: 8192
   use_dynamic_bsz: True
-  train_files: data/qwen_critic_sft_vgoal/parquet/train/train.parquet
-  val_files: data/qwen_critic_sft_vgoal/parquet/val/val.parquet
+  train_files: data/grandtour_qwen_critic_sft_novgoal/parquet/train/train.parquet
+  val_files: data/grandtour_qwen_critic_sft_novgoal/parquet/val/val.parquet
   train_max_samples: -1  # set to -1 to use full dataset
   val_max_samples: -1  # set to -1 to use full dataset
   # Multi-turn settings
   messages_key: messages  # Key for messages list in multi-turn mode
-  # reward_key: vgoal_scorer
-  reward_key: null
+  reward_key: vgoal_score
+  # reward_key: null
   tools_key: tools  # Key for tools list in multi-turn mode
   enable_thinking_key: enable_thinking  # Whether to enable thinking in multi-turn mode
   pad_mode: no_padding
@@ -81,6 +81,10 @@ trainer:
   seed: 1
   save_freq: -1
   test_freq: -1
+  # Number of validation checks with no improvement before stopping.
+  early_stop_patience: 0
+  # Minimum validation loss improvement to reset early stopping patience.
+  early_stop_min_delta: 0.0
   max_ckpt_to_keep: null  # Maximum number of checkpoints to keep, set to null to keep all
 
   # Resume mode: "auto", "disable", or "resume_path"
@@ -97,3 +101,6 @@ trainer:
   n_gpus_per_node: 1
 
   profile_interval: [-1, -1]
+
+optim:
+  lr_scheduler_type: cosine

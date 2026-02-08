@@ -55,7 +55,7 @@ from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 from cotnav.core.constants import MOTION_START_TOKEN, MOTION_END_TOKEN, MOTION_GOAL_TOKEN, LANGUAGE_GOAL_TOKEN
 from cotnav.core.format import text_to_llava
 from cotnav.models.vlms.interface import OutputFormat, parse_and_unify
-from cotnav.utils.draw_utils import draw_polyline
+from cotnav.utils.draw import draw_polyline
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
