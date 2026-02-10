@@ -1880,10 +1880,10 @@ class RayPPOTrainer:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
                             batch = batch.union(values)
-                    for idx, rp in enumerate(batch.non_tensor_batch["raw_prompt"]):
-                        if len(rp) != 5:
-                            breakpoint()
-                            import pdb; pdb.set_trace()
+                    # for idx, rp in enumerate(batch.non_tensor_batch["raw_prompt"]):
+                    #     if len(rp) != 5:
+                    #         breakpoint()
+                    #         import pdb; pdb.set_trace()
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
