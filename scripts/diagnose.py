@@ -175,13 +175,15 @@ def check_environment():
 
 
 def check_pip_package_versions():
-    packages = ["vllm", "sglang", "ray", "torch"]
+    packages = ["vllm", "sglang", "ray", "torch", "transformers", "accelerate"]
     for package in packages:
         try:
             version = importlib.metadata.version(package)
-            print(f"{package}\t     : {version}")
+            dist = importlib.metadata.distribution(package)
+            location = dist.locate_file('')
+            print(f"{package:<12}: {version:<15} (at {location})")
         except importlib.metadata.PackageNotFoundError:
-            print(f"{package}\t     : not found.")
+            print(f"{package:<12}: not found.")
 
 
 def check_cuda_versions():

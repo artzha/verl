@@ -1,13 +1,18 @@
 set -x
 ENGINE=${1:-vllm}
+DATA_DIR=${2:-/scratch/arthurz/public_datasets}
 
-DATA_DIR=/scratch/arthurz/public_datasets
+# shift arguments so that $@ now contains any additional arguments after the first two
+[ $# -gt 0 ] && shift
+[ $# -gt 0 ] && shift
+
+BATCH_SIZE=512
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$DATA_DIR/geo3k/train.parquet \
     data.val_files=$DATA_DIR/geo3k/test.parquet \
-    data.train_batch_size=512 \
+    data.train_batch_size=$BATCH_SIZE \
     data.max_prompt_length=1024 \
     data.max_response_length=2048 \
     data.filter_overlong_prompts=True \
@@ -27,7 +32,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=20 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=True \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
@@ -41,7 +46,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl_grpo_example_geo3k' \
-    trainer.experiment_name='qwen2_5_vl_7b_function_rm' \
+    trainer.experiment_name="qwen2_5_vl_7b_function_rm_b${BATCH_SIZE}" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \

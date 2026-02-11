@@ -27,6 +27,7 @@ When working with Megatron:
 """
 
 import getpass
+import inspect
 import logging
 import os
 from dataclasses import asdict
@@ -110,7 +111,6 @@ def _monkey_patch_compute_logits(model, vocab_size: int):
 
     model.compute_logits = MethodType(compute_logits, model)
 
-
 class vLLMAsyncRollout(BaseRollout):
     """vLLMAsyncRollout is a thin wrapper of WorkerWrapperBase, which is engine in single worker process."""
 
@@ -177,6 +177,19 @@ class vLLMAsyncRollout(BaseRollout):
                 logger.exception(f"vLLMAsyncRollout _loop_forever error: {e}")
                 await self.socket.send(pickle.dumps(e))
                 break
+    
+    def _build_inference_engine(self) -> WorkerWrapperBase:
+        """Create a vLLM worker wrapper across vLLM versions.
+
+        vLLM changed WorkerWrapperBase signature (i.e., removing vllm_config from
+        __init__). We keep a small runtime fallback to support multiple versions.
+
+        https://github.com/vllm-project/vllm/commit/aafd4d23548ae54adeca1d4898cc15a4d2c390ac
+        """
+        try:
+            return WorkerWrapperBase(vllm_config=self.vllm_config)
+        except TypeError:
+            return WorkerWrapperBase()
 
     def _init_worker(self, all_kwargs: list[dict[str, Any]]):
         """Initialize worker engine."""
@@ -213,7 +226,7 @@ class vLLMAsyncRollout(BaseRollout):
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
                 apply_vllm_fp8_patches()
 
-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        self.inference_engine = self._build_inference_engine()
         self.inference_engine.init_worker(all_kwargs)
 
     def _load_model(self, *args, **kwargs):
