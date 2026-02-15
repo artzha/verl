@@ -105,7 +105,7 @@ class ResourcePoolManager:
             # For Megatron backend, we recommend using max_colocate_count>1
             # that can utilize different WorkerGroup for differnt models
             resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=2, name_prefix=resource_pool_name
+                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=3, name_prefix=resource_pool_name
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
@@ -634,62 +634,172 @@ class RayPPOTrainer:
 
         return gen_batch
 
-    def _generate_motion(
-        self, 
-        batch: DataProto, 
-        prev: Optional[DataProto]=None, 
-        prefill: Optional[str]=None,
-        postfill: Optional[str]=None
+    def _generate_actor_rollouts(
+        self,
+        batch: DataProto,
+        timing_raw: Optional[dict] = None,
     ) -> DataProto:
-        if not self.use_hybrid_motion:
+        """Generate rollouts from the actor policy.
+
+        This helper centralizes how we call into the rollout engine (hybrid or async),
+        so that higher-level training code can request actor samples without
+        duplicating backend-specific logic. Preserves critic_response and motion_response
+        from the input batch into the output and merges them into extra_info. If the
+        actor rollout config has response_role "critic" or "motion", the generated
+        sequence is added to that key (and thus to extra_info) for reward.
+
+        Args:
+            batch: Input batch for generation. Expected to be already padded to the
+                appropriate divisor if required by the backend.
+            timing_raw: Optional dict for collecting raw timing metrics. If provided
+                and the rollout returns a "timing" entry in meta_info, it will be
+                merged into this dict.
+
+        Returns:
+            DataProto containing generated responses and associated tensors.
+        """
+        if not self.async_rollout_mode:
+            out = self.actor_rollout_wg.generate_sequences(batch)
+        else:
+            out = self.async_rollout_manager.generate_sequences(batch)
+
+        # Propagate timing metrics to the caller and clean up meta_info.
+        if timing_raw is not None and "timing" in out.meta_info:
+            timing_raw.update(out.meta_info["timing"])
+            out.meta_info.pop("timing", None)
+
+        # Preserve critic_response and motion_response from input so they are in the output.
+        for key in ["critic_response", "motion_response"]:
+            if key in batch.non_tensor_batch and key not in out.non_tensor_batch:
+                out.non_tensor_batch[key] = np.array(batch.non_tensor_batch[key], dtype=object)
+        if "extra_info" in batch.non_tensor_batch and "extra_info" not in out.non_tensor_batch:
+            out.non_tensor_batch["extra_info"] = batch.non_tensor_batch["extra_info"]
+
+        self._merge_rollout_responses_into_extra_info(out)
+
+        # If this actor rollout is labeled as "critic" or "motion", add the last generated sequence to that key.
+        response_role = self.config.actor_rollout_ref.rollout.get("response_role")
+        if response_role in ("critic", "motion"):
+            response_key = "critic_response" if response_role == "critic" else "motion_response"
+            decoded = self.tokenizer.batch_decode(out.batch["responses"], skip_special_tokens=True)
+
+            # Add decoded to reponse_key in one line
+            existing = out.non_tensor_batch.get(response_key).tolist()
+            out.non_tensor_batch[response_key] = np.array([
+                prev + [resp] for prev, resp in zip(existing, decoded)
+            ], dtype=object)
+
+            self._merge_rollout_responses_into_extra_info(out)
+
+        return out
+
+    def _merge_rollout_responses_into_extra_info(self, batch: DataProto) -> None:
+        """Copy critic_response and motion_response from non_tensor_batch into extra_info so rewards and logging see them. Creates extra_info if missing."""
+        nt = batch.non_tensor_batch
+        if "extra_info" not in nt:
+            nt["extra_info"] = np.array([{} for _ in range(len(batch))], dtype=object)
+        extra_info = nt["extra_info"]
+        if hasattr(extra_info, "tolist"):
+            extra_info = extra_info.tolist()
+        for key in ["critic_response", "motion_response"]:
+            if key not in nt:
+                continue
+            vals = nt[key]
+            if hasattr(vals, "tolist"):
+                vals = vals.tolist()
+            for i, val in enumerate(vals):
+                if i < len(extra_info):
+                    extra_info[i][key] = val
+
+    def _run_rollout_generations(
+        self,
+        batch: DataProto,
+        steps: list,
+        prev: Optional[DataProto] = None,
+        timing_raw: Optional[dict] = None,
+    ) -> DataProto:
+        """Run a sequence of extra-rollout generations from config (before_actor or after_actor). Updates prompts and returns the batch after all generations. Always merges critic_response and motion_response into batch.non_tensor_batch['extra_info'] after each step."""
+        if not steps:
             return batch
-        
-        # Ensure required keys are present
-        non_tensor_keys = [ "full_prompts", "multi_modal_data", "raw_prompt", "motion_responses" ]
+
+        non_tensor_keys = ["full_prompts", "multi_modal_data", "raw_prompt", "motion_response"]
         for key in non_tensor_keys:
             if key in batch.non_tensor_batch:
                 continue
-            if prev is not None and key in prev.non_tensor_batch:
+            if prev is not None and key in getattr(prev, "non_tensor_batch", {}):
                 batch.non_tensor_batch[key] = np.array(prev.non_tensor_batch[key], dtype=object)
 
-        # Update full_prompts and raw_prompt if previous batch is provided
-        if prev is not None:
-            batch_response = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-            batch.non_tensor_batch["raw_prompt"] = np.array(
-                [
-                    p + [text_to_llava(r, role="assistant")]
-                    for p, r in zip(prev.non_tensor_batch["raw_prompt"].tolist(), batch_response)
-                ],
-                dtype=object,
+        if "extra_info" not in batch.non_tensor_batch:
+            batch.non_tensor_batch["extra_info"] = np.array(
+                [{} for _ in range(len(batch))], dtype=object
             )
-            # np.array(self.processor.apply_chat_template(batch.non_tensor_batch["raw_prompt"].tolist(), tokenize=False, add_generation_prompt=True))
-            batch.non_tensor_batch["full_prompts"] = np.array(self.processor.apply_chat_template(
-                batch.non_tensor_batch["raw_prompt"].tolist(),
-                tokenize=False,
-                add_generation_prompt=True
-            ))
+        # Preserve extra_info from prev (e.g. gen_batch_input)
+        if prev is not None and "extra_info" in getattr(prev, "non_tensor_batch", {}):
+            prev_extra = prev.non_tensor_batch["extra_info"]
+            if len(prev_extra) == len(batch):
+                batch.non_tensor_batch["extra_info"] = np.array(
+                    [dict(x) for x in (prev_extra.tolist() if hasattr(prev_extra, "tolist") else prev_extra)],
+                    dtype=object,
+                )
 
-        batch.meta_info["prefill"] = prefill
-        batch.meta_info["postfill"] = postfill
+        divisor = (
+            self.config.actor_rollout_ref.rollout.agent.num_workers
+            if self.async_rollout_mode
+            else getattr(self.actor_rollout_wg, "world_size", None) or 1
+        )
 
-        if self.async_rollout_mode:
-            divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
-        else:
-            divisor = getattr(self.actor_rollout_wg, "world_size", None) or 1
-        padded, pad_size = pad_dataproto_to_divisor(batch, divisor)
+        current = batch
+        for step in steps:
+            spec = OmegaConf.to_container(step)
+            rollout_name = spec.get("rollout")
+            if not rollout_name:
+                raise ValueError(f"rollout_generations step must have 'rollout' key: {spec}")
 
-        if self.async_rollout_mode:
-            out = self.async_rollout_manager.generate_motion_sequences(padded)
-        else:
-            # TODO: Not implemented yet for sync mode
-            raise NotImplementedError("Synchronous motion generation not implemented yet.")
-            out = self.actor_rollout_wg.generate_motion_sequences(padded)
+            if prev is not None:
+                batch_response = self.tokenizer.batch_decode(current.batch["responses"], skip_special_tokens=True)
+                current.non_tensor_batch["raw_prompt"] = np.array(
+                    [
+                        p + [text_to_llava(r, role="assistant")]
+                        for p, r in zip(prev.non_tensor_batch["raw_prompt"].tolist(), batch_response)
+                    ],
+                    dtype=object,
+                )
+                current.non_tensor_batch["full_prompts"] = np.array(
+                    self.processor.apply_chat_template(
+                        current.non_tensor_batch["raw_prompt"].tolist(),
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                )
+                prev = None
 
-        # ONE_TO_ONE usually returns per-worker shards
-        if isinstance(out, list):
-            out = DataProto.concat(out)  # or whatever VeRL provides for concatenation in your version
+            current.meta_info["prefill"] = spec.get("prefill")
+            current.meta_info["postfill"] = spec.get("postfill")
 
-        return unpad_dataproto(out, pad_size=pad_size)
+            padded, pad_size = pad_dataproto_to_divisor(current, divisor)
+            if self.async_rollout_mode:
+                out = self.async_rollout_manager.generate_extra_rollout_sequences(rollout_name, padded)
+            else:
+                raise NotImplementedError("Synchronous extra rollout generation not implemented; use async mode.")
+            if isinstance(out, list):
+                out = DataProto.concat(out)
+            current = unpad_dataproto(out, pad_size=pad_size)
+            if timing_raw is not None and "timing" in current.meta_info:
+                timing_raw.update(current.meta_info.get("timing", {}))
+
+            self._merge_rollout_responses_into_extra_info(current)
+
+        return current
+
+    def _get_rollout_generation_steps(self, phase: str) -> list:
+        """Return rollout_generations.before_actor or .after_actor from config, or empty list."""
+        rg = self.config.actor_rollout_ref.get("rollout_generations")
+        if rg is None:
+            return []
+        steps = rg.get(phase)
+        if steps is None:
+            return []
+        return list(steps) if hasattr(steps, "__iter__") and not isinstance(steps, str) else []
 
     def _validate(self, merged: bool = False):
         data_source_lst = []
@@ -710,8 +820,10 @@ class RayPPOTrainer:
                 test_batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
-            
-            test_batch = self._generate_motion(test_batch, postfill="critic")
+
+            before_steps = self._get_rollout_generation_steps("before_actor")
+            if before_steps:
+                test_batch = self._run_rollout_generations(test_batch, before_steps)
 
             # repeat test batch
             test_batch = test_batch.repeat(
@@ -745,33 +857,30 @@ class RayPPOTrainer:
                 else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            # PATCH: defer reward computation until after motion generation
-            # test_gen_batch_padded.non_tensor_batch["__defer_reward__"] = np.array([False] * len(test_gen_batch_padded), dtype=bool)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            # Use unified actor rollout helper for generation.
+            test_output_gen_batch_padded = self._generate_actor_rollouts(
+                test_gen_batch_padded,
+                timing_raw=None,
+            )
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             test_output_gen_batch.non_tensor_batch["extra_info"] = test_batch.non_tensor_batch["extra_info"]
 
-            # TODO: Generate final motion tokens for reward computation, add motion_responses
-            motion_batch = self._generate_motion(test_output_gen_batch, prev=test_gen_batch, prefill="motion")
-            motion_responses = motion_batch.non_tensor_batch.get("motion_responses")
-            if motion_responses is not None:
-                # Create extra_info entry in test_output_gen_batch if it doesn't exist
-                # if 'extra_info' not in test_output_gen_batch.non_tensor_batch:
-                #     test_output_gen_batch.non_tensor_batch['extra_info'] = np.array([{} for _ in range(len(test_output_gen_batch))], dtype=object)
-
-                for info, motion in zip(test_batch.non_tensor_batch['extra_info'], motion_responses.tolist()):
-                    info['motion_response'] = motion
-
-                dup_report = tu.drop_dupe_keys(
-                    test_batch,
-                    test_output_gen_batch,
-                    attrs=["batch", "non_tensor_batch", "meta_info"]
+            after_steps = self._get_rollout_generation_steps("after_actor")
+            if after_steps:
+                motion_batch = self._run_rollout_generations(
+                    test_output_gen_batch, after_steps, prev=test_gen_batch
                 )
+                test_output_gen_batch.non_tensor_batch["extra_info"] = (
+                    motion_batch.non_tensor_batch["extra_info"]
+                )
+
+            dup_report = tu.drop_dupe_keys(
+                        test_batch,
+                        test_output_gen_batch,
+                        attrs=["batch", "non_tensor_batch", "meta_info"]
+                    )
             print("validation generation end")
 
             # Store generated outputs
@@ -788,6 +897,9 @@ class RayPPOTrainer:
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+            # Ensure motion_response/critic_response are in extra_info for reward_fn (reward_kwargs)
+            self._merge_rollout_responses_into_extra_info(test_batch)
 
             # evaluate using reward_function
             result = self._compute_or_extract_reward(test_batch, reward_fn=self.val_reward_fn, return_dict=True)
@@ -1058,10 +1170,11 @@ class RayPPOTrainer:
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
             
-        # Motion rollout is handled inside the actor rollout worker (hybrid motion).
+        # Motion rollout is handled via extra_rollouts (no deprecated motion/motion_rollout keys).
+        extra_list = OmegaConf.select(self.config.actor_rollout_ref, "extra_rollouts")
         self.use_hybrid_motion = bool(
-            OmegaConf.select(self.config.actor_rollout_ref, "motion") is not None
-            and OmegaConf.select(self.config.actor_rollout_ref, "motion_rollout") is not None
+            extra_list is not None
+            and any(getattr(e, "name", None) == "motion" for e in extra_list)
         )
 
         # create async rollout manager and request scheduler
@@ -1705,12 +1818,14 @@ class RayPPOTrainer:
                 gen_batch = self._get_gen_batch(batch)
                 gen_batch.meta_info["global_steps"] = self.global_steps
 
-                # PATCH: Generate motion tokens
-                if self.use_hybrid_motion:
-                    with marked_timer("motion_gen", timing_raw, color="orange"):
-                        gen_batch = self._generate_motion(gen_batch, postfill="critic")
-                        timing_raw.update(gen_batch.meta_info.get("timing", {}))
-
+                before_steps = self._get_rollout_generation_steps("before_actor")
+                if before_steps:
+                    with marked_timer("rollout_gen_before", timing_raw, color="orange"):
+                        gen_batch = self._run_rollout_generations(
+                            gen_batch, before_steps, timing_raw=timing_raw
+                        )
+                        if gen_batch.meta_info.get("timing"):
+                            timing_raw.update(gen_batch.meta_info["timing"])
                 # Now repeat the batch (with motion tokens already in prompts) n times
                 gen_batch_input = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
@@ -1720,26 +1835,23 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        # Generate actor responses
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_input)
-                        else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_input)
-
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                        # Generate actor responses using unified helper
+                        gen_batch_output = self._generate_actor_rollouts(
+                            gen_batch_input,
+                            timing_raw=timing_raw,
+                        )
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
-
+ 
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
-                            if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-                            else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                            gen_baseline_output = self._generate_actor_rollouts(
+                                gen_baseline_batch,
+                                timing_raw=timing_raw,
+                            )
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
                             rm_scores = None
@@ -1767,22 +1879,20 @@ class RayPPOTrainer:
 
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    # Align extra_info with gen_batch_output so union_numpy_dict's equality check passes;
+                    # gen_batch_output has the merged critic_response/motion_response from _generate_actor_rollouts.
+                    batch.non_tensor_batch["extra_info"] = gen_batch_output.non_tensor_batch["extra_info"]
                     batch = batch.union(gen_batch_output)
 
-                    # PATCH: Generate final motion tokens
-                    if self.use_hybrid_motion:
-                        with marked_timer("motion_gen", timing_raw, color="orange"):
-                            # Update non-tensor batch with latest response
-                            motion_batch = self._generate_motion(batch, prev=gen_batch_input, prefill="motion")
-                            # self.tokenizer.decode(motion_batch.batch['input_ids'][0], skip_special_tokens=True)
-                            
-                            motion_responses = motion_batch.non_tensor_batch.get("motion_responses")
-                            critic_responses = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                            if motion_responses is not None:
-                                # Expose motion responses directly for downstream logging
-                                for info, motion, critique in zip(batch.non_tensor_batch['extra_info'], motion_responses.tolist(), critic_responses):
-                                    info['motion_response'] = motion
-                                    info['critic_response'] = critique
+                    after_steps = self._get_rollout_generation_steps("after_actor")
+                    if after_steps:
+                        with marked_timer("rollout_gen_after", timing_raw, color="orange"):
+                            motion_batch = self._run_rollout_generations(
+                                batch, after_steps, prev=gen_batch_input, timing_raw=timing_raw
+                            )
+                            batch.non_tensor_batch["extra_info"] = (
+                                motion_batch.non_tensor_batch["extra_info"]
+                            )
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1804,6 +1914,9 @@ class RayPPOTrainer:
                     batch.meta_info["images_seqlens"] = images_seqlens_all
 
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        # Ensure motion_response/critic_response are in extra_info for reward_fn (reward_kwargs)
+                        self._merge_rollout_responses_into_extra_info(batch)
+
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             if not self.use_reward_loop:
@@ -1880,10 +1993,6 @@ class RayPPOTrainer:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
                             batch = batch.union(values)
-                    # for idx, rp in enumerate(batch.non_tensor_batch["raw_prompt"]):
-                    #     if len(rp) != 5:
-                    #         breakpoint()
-                    #         import pdb; pdb.set_trace()
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm

@@ -125,9 +125,20 @@ class TaskRunner:
         from verl.single_controller.ray import RayWorkerGroup
         from verl.trainer.ppo.ray_trainer import Role
 
-        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        # Support custom actor/rollout worker (e.g. hybrid motion + agent loop).
+        ext = config.actor_rollout_ref.get("external_worker", None)
+        if ext is not None and ext.get("path", None) is not None:
+            actor_rollout_cls = load_extern_object(ext.path, ext.name)
+            ray_worker_group_cls = RayWorkerGroup
+            if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+                role = Role.ActorRolloutRef
+            else:
+                role = Role.ActorRollout
+            self.role_worker_mapping[role] = ray.remote(actor_rollout_cls)
+            self.mapping[role] = "global_pool"
+            return actor_rollout_cls, ray_worker_group_cls
 
-        # use new model engine implementation
+        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         if use_legacy_worker_impl == "disable":
             from verl.workers.engine_workers import ActorRolloutRefWorker
 
@@ -148,8 +159,12 @@ class TaskRunner:
             self.mapping[role] = "global_pool"
             return actor_rollout_cls, ray_worker_group_cls
 
-        # Note: sync mode validation is now handled in RolloutConfig.__post_init__
-        # Always use async worker since sync mode is deprecated and rejected
+        if config.actor_rollout_ref.rollout.mode == "sync":
+            raise ValueError(
+                "Rollout mode 'sync' has been removed. Please set "
+                "`actor_rollout_ref.rollout.mode=async` to use the native server rollout."
+            )
+
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
 

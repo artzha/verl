@@ -9,7 +9,7 @@ defaults:
   # actor_rollout_ref.actor: trainer/config/actor/dp_actor.yaml
   - actor@actor_rollout_ref.actor: dp_actor
 
-  - data@data: critic_yt
+  - data@data: motion_grandtour
 
   # (Rule-based) Reward manager config.
   - reward_manager@reward_manager
@@ -20,6 +20,7 @@ defaults:
   # Rollout model config.
   - rollout@actor_rollout_ref.rollout: rollout
 
+  # Shared rollout config for all extra rollouts (motion, critic). Replaces deprecated motion_rollout.
   - rollout@actor_rollout_ref.extra_rollout_rollout: rollout
 
   # Model config.
@@ -101,6 +102,8 @@ actor_rollout_ref:
     top_p: 0.95
     prompt_length: 2048
     response_length: 512
+    # If set to "critic" or "motion", the actor's generated response is stored in that key and merged into extra_info for reward.
+    response_role: motion
 
     engine_kwargs:
       vllm:
@@ -114,17 +117,36 @@ actor_rollout_ref:
     # Reduces peak GPU memory usage
     # layered_summon: True
 
-  # Shared rollout config for extra rollouts (replaces deprecated motion_rollout).
+  # Which extra rollouts to run before and after the actor rollout.
+  # Each step can be a string (rollout name) or a dict: rollout, postfill? (before), prefill? (after), response_key? (after).
+  # Example: before_actor runs in order and each output updates prompts for the next; after_actor runs after actor and can store responses (e.g. motion_responses).
+  rollout_generations:
+    before_actor:
+      - rollout: motion
+        postfill: critic
+      - rollout: critic
+        postfill: motion
+    # after_actor:
+    #   - rollout: motion
+    #     prefill: motion
+    #     response_key: motion_responses
+
+  # Shared rollout config for all extra rollouts (replaces deprecated motion_rollout).
   extra_rollout_rollout:
     name: vllm
     mode: async
+
+    # Sampling parameters
     temperature: 1.0
     top_p: 0.95
     prompt_length: 2048
     response_length: 512
+
     tensor_model_parallel_size: 4
+
     enable_chunked_prefill: true
     enable_prefix_caching: true
+
     engine_kwargs:
       vllm:
         max_model_len: 4096
@@ -134,18 +156,19 @@ actor_rollout_ref:
         max_num_batched_tokens: 4096
         swap_space: 0
 
-  # Extra rollout servers (replaces deprecated motion + motion_rollout).
-  # motion: sync_with_actor true so the motion planner stays synced with the actor weights.
+  # Extra rollout servers (motion, critic). Replaces deprecated motion + motion_rollout.
+  # motion: sync_with_actor true so the motion planner uses the same trainable policy weights
+  # for rollouts (e.g. sampling initial motion prompts) and stays updated.
   extra_rollouts:
     - name: motion
       model:
-        path: Qwen/Qwen3-VL-8B-Instruct
+        path: Qwen/Qwen3-VL-2B-Instruct
         trust_remote_code: true
       rollout: ${actor_rollout_ref.extra_rollout_rollout}
       sync_with_actor: true
       prompt_paths:
-        critic: 'cotnav/models/prompts/datagen/critic_sft/critic_prompt.txt'
-        motion: 'cotnav/models/prompts/datagen/critic_sft/motion_refine_prompt.txt'
+        critic: 'cotnav/models/prompts/datagen/critic_sft/novgoal/critic_prompt.txt'
+        motion: 'cotnav/models/prompts/datagen/critic_sft/novgoal/motion_refine_prompt.txt'
     - name: critic
       model:
         path: Qwen/Qwen3-VL-8B-Instruct
@@ -153,7 +176,8 @@ actor_rollout_ref:
       rollout: ${actor_rollout_ref.extra_rollout_rollout}
       sync_with_actor: false
       prompt_paths:
-        critic: 'cotnav/models/prompts/datagen/critic_sft/critic_prompt.txt'
+        critic: 'cotnav/models/prompts/datagen/critic_sft/novgoal/critic_prompt.txt'
+        motion: 'cotnav/models/prompts/datagen/critic_sft/novgoal/motion_refine_prompt.txt'
 
 reward_model:
   use_reward_loop: false

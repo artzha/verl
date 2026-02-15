@@ -485,7 +485,7 @@ if __name__ == "__main__":
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
 
     from omegaconf import OmegaConf
-    config_path = "external/verl/verl/trainer/config/data/critic_yt.yaml"
+    config_path = "external/verl/verl/trainer/config/data/motion_grandtour.yaml"
     config = OmegaConf.load(config_path)
     OmegaConf.resolve(config)
 

@@ -2061,6 +2061,74 @@ def compute_policy_loss_reinforce(
     return pg_loss, pg_metrics
 
 
+@register_policy_loss("topk_ce")
+def compute_policy_loss_topk_ce(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    *,
+    responses: Optional[torch.Tensor] = None,
+    token_level_rewards: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Avg-NLL loss over top-K rollouts by reward (each rollout is one sample).
+
+    Formulation:
+        L_avg-NLL = (1/K) * sum_k sum_t -log p_θ(y^(k)_t | x, y^(k)_{<t})
+    where k indexes the top-K rollouts (by trajectory reward) and t indexes
+    response tokens. Each top-K rollout is treated as one sample; we average
+    the loss over the K rollouts.
+
+    Sort actor rollouts by trajectory reward (sum of token_level_rewards),
+    select the top K, then compute per-rollout NLL (sum over t) and average over K.
+
+    Args:
+        old_log_prob: Unused; kept for signature compatibility.
+        log_prob: Log probs of response tokens under current policy (bsz, response_len).
+        advantages: Unused; kept for signature compatibility.
+        response_mask: Mask for valid response tokens (bsz, response_len).
+        loss_agg_mode: Aggregation mode for the loss (e.g. "token-mean").
+        config: Actor config; must have policy_loss.topk_k.
+        rollout_is_weights: Unused.
+        responses: Response token ids (bsz, response_len). Required for topk_ce.
+        token_level_rewards: Per-token rewards (bsz, response_len). Required to sort by trajectory reward.
+
+    Returns:
+        (loss, metrics) where loss is scalar, metrics include actor/topk_ce_*.
+    """
+    assert config is not None, "ActorConfig required for topk_ce loss"
+    if token_level_rewards is None or responses is None:
+        raise ValueError(
+            "topk_ce loss requires responses and token_level_rewards to be passed from the batch."
+        )
+    k = int(getattr(config.policy_loss, "topk_k", 4))
+    breakpoint()
+    # Trajectory reward = sum of token-level rewards per sequence
+    trajectory_reward = token_level_rewards.sum(dim=-1)  # (bsz,)
+    # Indices of top K trajectories (descending reward)
+    topk = min(k, trajectory_reward.shape[0])
+    _, topk_indices = trajectory_reward.topk(topk, largest=True, sorted=False)  # (K,)
+
+    log_prob_topk = log_prob[topk_indices]  # (K, response_len)
+    response_mask_topk = response_mask[topk_indices].to(log_prob.dtype)  # (K, response_len)
+
+    # L_avg-NLL = (1/K) * sum_k [ sum_t -log p_θ(y^(k)_t | x, y^(k)_{<t}) ]
+    # Compute per-rollout NLL then average over K (each top-K rollout is one sample).
+    nll = -log_prob_topk  # (K, response_len)
+    per_rollout_nll = (nll * response_mask_topk).sum(dim=1)  # (K,) sum over t for each k
+    pg_loss = per_rollout_nll.mean()  # (1/K) * sum_k
+    breakpoint()
+    import pdb; pdb.set_trace()
+    pg_metrics = {
+        "actor/topk_ce_loss": pg_loss.detach().item(),
+        "actor/topk_k_used": float(topk),
+    }
+    return pg_loss, pg_metrics
+
+
 @register_policy_loss("bypass_mode")
 def compute_policy_loss_bypass_mode(
     old_log_prob: torch.Tensor,

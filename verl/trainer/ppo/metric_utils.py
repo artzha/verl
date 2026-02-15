@@ -124,10 +124,6 @@ def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
     raw_prompt = batch.non_tensor_batch['raw_prompt']
     extra = batch.non_tensor_batch["extra_info"]
 
-    # type checks
-    for idx, rp in enumerate(raw_prompt):
-        assert len(rp) == 5, f"raw_prompt at index {idx} should have 5 elements, got {len(rp)}"
-
     panel_row_list = []
     for idx in unique_indices:
         # base image (PIL -> np array)

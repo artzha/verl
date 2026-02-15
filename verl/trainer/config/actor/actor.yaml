@@ -75,6 +75,9 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # Top-K CE loss: number of top-reward rollouts to use as ground truth (when loss_mode: topk_ce)
+  topk_k: 4
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

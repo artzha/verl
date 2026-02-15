@@ -526,6 +526,9 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        # Top-K CE loss needs trajectory rewards and responses to sort and compute NLL
+        if self.config.policy_loss.get("loss_mode", "vanilla") == "topk_ce":
+            select_keys.append("token_level_rewards")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
@@ -605,7 +608,7 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
+                    policy_loss_kwargs = dict(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -614,6 +617,10 @@ class DataParallelPPOActor(BasePPOActor):
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
                     )
+                    if loss_mode == "topk_ce":
+                        policy_loss_kwargs["responses"] = model_inputs["responses"]
+                        policy_loss_kwargs["token_level_rewards"] = model_inputs["token_level_rewards"]
+                    pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kwargs)
                     micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)

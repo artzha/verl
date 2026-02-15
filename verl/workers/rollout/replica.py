@@ -125,25 +125,42 @@ class RolloutReplica(ABC):
         await self.launch_servers()
 
     # TODO(sgm): this should be the default solution, but need to make the RolloutMode more clear.
-    async def init_colocated(self, resource_pool: RayResourcePool):
+    async def init_colocated(
+        self,
+        resource_pool: RayResourcePool = None,
+        worker_group: RayWorkerGroup = None,
+        replica_rank: int = None,
+    ):
         """Init colocated rollout server, rollout engine and hybrid engine colocated in same ray placement group
         but in separate processes.
 
+        When tensor_model_parallel_size < n_gpus_per_node, multiple replicas share the same resource pool.
+        Pass a shared worker_group and replica_rank so each replica uses only its slice of workers
+        (workers [replica_rank*world_size : (replica_rank+1)*world_size]).
+
         Args:
             resource_pool: RayResourcePool, ray placement group where hybrid engine processes have been launched.
+            worker_group: Optional shared RayWorkerGroup; when set, use slice for this replica (replica_rank used).
+            replica_rank: Replica index when using shared worker_group (defaults to self.replica_rank).
         """
         self.rollout_mode = RolloutMode.COLOCATED
         self.resource_pool = resource_pool
 
-        worker_group = RayWorkerGroup(
-            resource_pool=self.resource_pool,
-            ray_cls_with_init=self.get_ray_class_with_init_args(),
-            bin_pack=False,
-            name_prefix=f"rollout_colocate_{self.replica_rank}"
-            if not self.is_reward_model
-            else f"rollout_reward_colocate_{self.replica_rank}",
-        )
-        self.workers = worker_group.workers
+        if worker_group is not None:
+            rank = self.replica_rank if replica_rank is None else replica_rank
+            start = rank * self.world_size
+            end = (rank + 1) * self.world_size
+            self.workers = worker_group.workers[start:end]
+        else:
+            worker_group = RayWorkerGroup(
+                resource_pool=self.resource_pool,
+                ray_cls_with_init=self.get_ray_class_with_init_args(),
+                bin_pack=False,
+                name_prefix=f"rollout_colocate_{self.replica_rank}"
+                if not self.is_reward_model
+                else f"rollout_reward_colocate_{self.replica_rank}",
+            )
+            self.workers = worker_group.workers
         await self.launch_servers()
 
     async def init_standalone(self):

@@ -46,10 +46,13 @@ unset CXX
 export CC=/usr/bin/gcc
 export CXX=/usr/bin/g++
 
+# Not stable yet with lora
 # actor_rollout_ref.model.lora_rank=64 \
 # actor_rollout_ref.model.lora_alpha=32 \
 # actor_rollout_ref.model.target_modules=all-linear \
 # actor_rollout_ref.model.exclude_modules='.*visual.*' \
+
+# actor_rollout_ref.rollout.max_num_seqs=64 \
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -78,7 +81,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$TP \
     actor_rollout_ref.rollout.name=$ENGINE \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
     actor_rollout_ref.rollout.max_model_len=4096 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
