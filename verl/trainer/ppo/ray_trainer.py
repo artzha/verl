@@ -1578,7 +1578,7 @@ class RayPPOTrainer:
 
         encoded = self.tokenizer(gt_texts, add_special_tokens=False, padding=False, return_attention_mask=False)
         gt_ids_list = encoded["input_ids"]
-
+        # breakpoint()
         gt_response_ids = torch.full_like(responses, fill_value=pad_token_id)
         gt_response_mask = torch.zeros_like(responses, dtype=prompt_attention_mask.dtype)
         for i, ids in enumerate(gt_ids_list):
@@ -1593,6 +1593,7 @@ class RayPPOTrainer:
 
         gt_input_ids = torch.cat([prompt_input_ids, gt_response_ids], dim=1)
         gt_attention_mask = torch.cat([prompt_attention_mask, gt_response_mask], dim=1)
+        # breakpoint()
 
         non_tensor_keys = []
         if "multi_modal_inputs" in base_batch.non_tensor_batch:
@@ -1632,7 +1633,8 @@ class RayPPOTrainer:
             index = torch.from_numpy(inverse).to(gt_log_probs.device)
             gt_log_probs = gt_log_probs.index_select(0, index)
             gt_response_mask = gt_response_mask.index_select(0, index)
-
+        # breakpoint()
+        # import pdb; pdb.set_trace()
         gt_log_prob = DataProto.from_single_dict(
             {
                 "gt_log_probs": gt_log_probs,
@@ -2135,13 +2137,15 @@ class RayPPOTrainer:
                         "training/epoch": epoch,
                     }
                 )
-                # for idx, rp in enumerate(batch.non_tensor_batch["raw_prompt"]):
-                #     if len(rp) != 5:
-                #         breakpoint()
-                #         import pdb; pdb.set_trace()
-
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(
+                    compute_data_metrics(
+                        batch=batch,
+                        use_critic=self.use_critic,
+                        config=self.config,
+                        metrics_from_actor=metrics,
+                    )
+                )
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

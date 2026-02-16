@@ -180,7 +180,12 @@ def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
         
     return panel_row_list    
 
-def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+def compute_data_metrics(
+    batch: DataProto,
+    use_critic: bool = True,
+    config: Any = None,
+    metrics_from_actor: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
 
@@ -191,6 +196,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     Args:
         batch: A DataProto object containing batch data with token-level scores, rewards, advantages, etc.
         use_critic: Whether to include critic-specific metrics. Defaults to True.
+        config: Optional trainer config; used to check policy_loss.loss_mode for topk_ce.
+        metrics_from_actor: Optional dict of metrics from actor update (e.g. actor/topk_ce_loss, actor/topk_k_used).
 
     Returns:
         A dictionary of metrics including:
@@ -335,6 +342,13 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             table.add_data(ride_name, semantic_goal, wandb.Image(panel_img))
         metrics["critic/rollout_panels"] = table
 
+    if 'vdist_score' in batch.non_tensor_batch:
+        vdist_scores = batch.non_tensor_batch['vdist_score']
+        metrics['critic/vdist_score/mean'] = float(np.mean(vdist_scores))
+        metrics['critic/vdist_score/max'] = float(np.max(vdist_scores))
+        metrics['critic/vdist_score/min'] = float(np.min(vdist_scores))
+        metrics['critic/vdist_score/std'] = float(np.std(vdist_scores))
+
     if "gt_log_probs" in batch.batch:
         gt_response_mask = batch.batch.get("gt_response_mask", None)
         if gt_response_mask is None:
@@ -363,6 +377,20 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
+    # Top-K CE loss: include actor/topk_ce_loss and actor/topk_k_used when present in metrics
+    # if config is not None and metrics_from_actor is not None:
+    #     policy_loss = getattr(
+    #         getattr(getattr(config, "actor_rollout_ref", None), "actor", None),
+    #         "policy_loss",
+    #         None,
+    #     )
+    #     loss_mode = getattr(policy_loss, "loss_mode", "vanilla") if policy_loss is not None else "vanilla"
+    #     if loss_mode == "topk_ce":
+    #         if "actor/topk_ce_loss" in metrics_from_actor:
+    #             metrics["actor/topk_ce_loss"] = metrics_from_actor["actor/topk_ce_loss"]
+    #         if "actor/topk_k_used" in metrics_from_actor:
+    #             metrics["actor/topk_k_used"] = metrics_from_actor["actor/topk_k_used"]
 
     return metrics
 

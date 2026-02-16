@@ -2105,7 +2105,7 @@ def compute_policy_loss_topk_ce(
             "topk_ce loss requires responses and token_level_rewards to be passed from the batch."
         )
     k = int(getattr(config.policy_loss, "topk_k", 4))
-    breakpoint()
+
     # Trajectory reward = sum of token-level rewards per sequence
     trajectory_reward = token_level_rewards.sum(dim=-1)  # (bsz,)
     # Indices of top K trajectories (descending reward)
@@ -2120,8 +2120,7 @@ def compute_policy_loss_topk_ce(
     nll = -log_prob_topk  # (K, response_len)
     per_rollout_nll = (nll * response_mask_topk).sum(dim=1)  # (K,) sum over t for each k
     pg_loss = per_rollout_nll.mean()  # (1/K) * sum_k
-    breakpoint()
-    import pdb; pdb.set_trace()
+
     pg_metrics = {
         "actor/topk_ce_loss": pg_loss.detach().item(),
         "actor/topk_k_used": float(topk),

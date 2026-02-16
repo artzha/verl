@@ -50,6 +50,7 @@ actor_rollout_ref:
     strategy: fsdp2
     fsdp_config:
       model_dtype: bf16
+      strategy: fsdp2
 
   model:
     # override_config:
@@ -83,7 +84,7 @@ actor_rollout_ref:
         # - linear_fc1
         # - linear_fc2
 
-      # exclude_modules: '.*visual.*'
+      exclude_modules: '.*visual.*'
       dropout_position: pre
       lora_A_init_method: xavier
       lora_B_init_method: zero
@@ -187,10 +188,10 @@ custom_reward_function:
 
   # The path to the file containing your customized reward function.
   # If not specified, pre-implemented reward functions will be used.
-  path: /robodata/arthurz/Research/cotnav/cotnav/verl_adapters/rewards/motion_trace.py
+  path: /robodata/arthurz/Research/cotnav/cotnav/verl_adapters/rewards/motion_refine.py
 
   # The name of the reward function within the specified file. Default is 'compute_score'.
-  name: compute_motion_trace_reward
+  name: compute_motion_refine_reward
 
 # config for the algorithm
 algorithm:
