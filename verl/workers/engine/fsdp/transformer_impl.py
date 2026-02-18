@@ -1006,9 +1006,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
 
+            # Keep loss as tensor to avoid GPU-CPU sync every micro_batch (improves utilization).
+            # _postprocess_output will sum and .item() once at the end.
             output = {
                 "model_output": model_output,
-                "loss": loss.detach().item(),
+                "loss": loss.detach(),
                 "metrics": metrics,
             }
 

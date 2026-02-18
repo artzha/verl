@@ -502,8 +502,8 @@ class MegatronPPOActor(BasePPOActor):
                     rollout_is_weights=rollout_is_weights,
                 )
                 if loss_mode == "topk_ce":
-                    policy_loss_kwargs["responses"] = data["responses"]
-                    policy_loss_kwargs["token_level_rewards"] = data["token_level_rewards"]
+                    policy_loss_kwargs["topk_ce_mask"] = data.get("topk_ce_mask", None)
+                    policy_loss_kwargs["token_level_rewards"] = data.get("token_level_rewards", None)
                 pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kwargs)
                 stats.update(pg_metrics)
 

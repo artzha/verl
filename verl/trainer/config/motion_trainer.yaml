@@ -39,6 +39,25 @@ defaults:
   # self config override anything above
   - _self_
 
+critic:
+  strategy: fsdp2
+  fsdp_config:
+    model_dtype: bf16
+    strategy: fsdp2
+
+  model:
+    # Use remove padding optimization (saves compute)
+    use_remove_padding: True
+
+    # LoRA knobs (VeRL infra) See model/hf_model.yaml for definitions
+    lora_rank: 0.0
+    lora_alpha: 0.0
+    target_modules: all-linear
+    # exclude_modules: '.*visual.*'
+    exclude_modules: null
+
+    freeze_vision_tower: False
+
 actor_rollout_ref:
   hybrid_engine: true
 
@@ -51,6 +70,8 @@ actor_rollout_ref:
     fsdp_config:
       model_dtype: bf16
       strategy: fsdp2
+
+    freeze_vision_tower: False
 
   model:
     # override_config:
@@ -70,35 +91,19 @@ actor_rollout_ref:
     # Whether to remove padding tokens in inputs during training
     use_remove_padding: True
 
-    # LoRA knobs (VeRL infra) See ppo_megatron_trainer.yaml for definitions
-    lora:
-      type: lora
+    # LoRA knobs (VeRL infra) See model/hf_model.yaml for definitions
+    lora_rank: 0.0
+    lora_alpha: 0.0
+    target_modules: all-linear
+    # exclude_modules: '.*visual.*'
+    exclude_modules: null
 
-      rank: 64
-      alpha: 64
-
-      dropout: 0.0
-      target_modules: all-linear
-        # - linear_qkv
-        # - linear_proj
-        # - linear_fc1
-        # - linear_fc2
-
-      exclude_modules: '.*visual.*'
-      dropout_position: pre
-      lora_A_init_method: xavier
-      lora_B_init_method: zero
-      a2a_experimental: False
-      dtype: null
-      adapter_path: null
-
-      freeze_vision_model: True
-      freeze_vision_projection: True
-      freeze_language_model: True
 
   rollout:
     name: vllm
     mode: async
+    # Return rollout_log_probs during generation so bypass_mode can skip expensive old_log_prob recompute.
+    calculate_log_probs: true
     temperature: 1.0
     top_p: 0.95
     prompt_length: 2048
@@ -141,7 +146,7 @@ actor_rollout_ref:
     temperature: 1.0
     top_p: 0.95
     prompt_length: 2048
-    response_length: 512
+    response_length: 256
 
     tensor_model_parallel_size: 4
 
@@ -152,7 +157,7 @@ actor_rollout_ref:
       vllm:
         max_model_len: 4096
         max_num_seqs: 64
-        gpu_memory_utilization: 0.9
+        gpu_memory_utilization: 0.9           
         dtype: bfloat16
         max_num_batched_tokens: 4096
         swap_space: 0
@@ -163,7 +168,7 @@ actor_rollout_ref:
   extra_rollouts:
     - name: motion
       model:
-        path: Qwen/Qwen3-VL-2B-Instruct
+        path: ${actor_rollout_ref.model.path}
         trust_remote_code: true
       rollout: ${actor_rollout_ref.extra_rollout_rollout}
       sync_with_actor: true
@@ -204,6 +209,10 @@ algorithm:
 
   # Trade-off between bias and variance in the GAE estimator
   lam: 1.0
+
+  # Rollout correction: bypass_mode uses rollout_log_probs as old_log_probs (skips ~425s actor forward).
+  rollout_correction:
+    bypass_mode: true
 
   # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
   adv_estimator: grpo

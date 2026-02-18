@@ -673,7 +673,14 @@ class RayPPOTrainer:
             if key in batch.non_tensor_batch and key not in out.non_tensor_batch:
                 out.non_tensor_batch[key] = np.array(batch.non_tensor_batch[key], dtype=object)
         if "extra_info" in batch.non_tensor_batch and "extra_info" not in out.non_tensor_batch:
-            out.non_tensor_batch["extra_info"] = batch.non_tensor_batch["extra_info"]
+            # Repeat() uses np.repeat which duplicates object refs; each repeated row shares the same
+            # extra_info dict. Deep-copy per row so _merge_rollout_responses_into_extra_info writes
+            # into distinct dicts and motion_response is per-rollout, not last-in-group.
+            extra = batch.non_tensor_batch["extra_info"]
+            out.non_tensor_batch["extra_info"] = np.array(
+                [deepcopy(d) for d in (extra.tolist() if hasattr(extra, "tolist") else extra)],
+                dtype=object,
+            )
 
         self._merge_rollout_responses_into_extra_info(out)
 
@@ -1878,7 +1885,6 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
-
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     # Align extra_info with gen_batch_output so union_numpy_dict's equality check passes;
@@ -2044,8 +2050,22 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-                        # breakpoint()
-                        # import pdb; pdb.set_trace()
+                        # Top-K CE: compute selection mask on full batch so minibatch split doesn't break groups
+                        loss_mode = OmegaConf.select(
+                            self.config, "actor_rollout_ref.actor.policy_loss.loss_mode"
+                        )
+
+                        if loss_mode == "topk_ce":
+                            topk_k = int(
+                                self.config.actor_rollout_ref.actor.policy_loss.get("topk_k", 4)
+                            )
+                            uid = batch.non_tensor_batch.get("uid", None)
+                            batch.batch["topk_ce_mask"] = core_algos.compute_topk_ce_mask(
+                                batch.batch["token_level_rewards"],
+                                k=topk_k,
+                                uid=uid,
+                                device=batch.batch["token_level_rewards"].device,
+                            )
                         self._assert_finite("token_level_scores", batch.batch.get("token_level_scores"))
                         self._assert_finite("token_level_rewards", batch.batch.get("token_level_rewards"))
                         self._assert_finite("advantages", batch.batch.get("advantages"))

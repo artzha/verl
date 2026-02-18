@@ -526,9 +526,10 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
-        # Top-K CE loss needs trajectory rewards and responses to sort and compute NLL
+        # Top-K CE: mask is computed on full batch in trainer; we only need mask + token_level_rewards (metrics)
         if self.config.policy_loss.get("loss_mode", "vanilla") == "topk_ce":
             select_keys.append("token_level_rewards")
+            select_keys.append("topk_ce_mask")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
@@ -618,8 +619,10 @@ class DataParallelPPOActor(BasePPOActor):
                         rollout_is_weights=rollout_is_weights,
                     )
                     if loss_mode == "topk_ce":
-                        policy_loss_kwargs["responses"] = model_inputs["responses"]
-                        policy_loss_kwargs["token_level_rewards"] = model_inputs["token_level_rewards"]
+                        policy_loss_kwargs["topk_ce_mask"] = model_inputs.get("topk_ce_mask", None)
+                        policy_loss_kwargs["token_level_rewards"] = model_inputs.get(
+                            "token_level_rewards", None
+                        )
                     pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kwargs)
                     micro_batch_metrics.update(pg_metrics)
 

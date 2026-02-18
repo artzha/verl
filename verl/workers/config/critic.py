@@ -235,6 +235,7 @@ class FSDPCriticModelCfg(BaseModelConfig):
         use_remove_padding (bool): Use remove-padding optimization (saves compute).
         enable_gradient_checkpointing (bool): Enable gradient checkpointing for memory efficiency.
         fsdp_config (FSDPEngineConfig): FSDP-specific configuration block.
+        freeze_vision_tower (bool): Whether to freeze the vision backbone for multimodal critics.
         lora_rank (int): Set to positive value to enable LoRA (e.g., 32).
         lora_alpha (int): LoRA scaling factor.
         target_modules (Union[str, List[str]]): LoRA target modules: "all-linear" or list of layer names.
@@ -245,6 +246,7 @@ class FSDPCriticModelCfg(BaseModelConfig):
     use_remove_padding: bool = False
     enable_gradient_checkpointing: bool = True
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
+    freeze_vision_tower: bool = False
     lora_rank: int = 0
     lora_alpha: int = 16
     target_modules: str | list[str] = "all-linear"

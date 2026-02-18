@@ -919,16 +919,21 @@ def apply_bypass_mode(
     policy_loss_config: PolicyLossConfig = None,
 ) -> None:
     """
-    Setup bypass mode: Use rollout_log_probs as old_log_probs.
+    Setup bypass mode: Use rollout_log_probs as old_log_probs (skip _compute_old_log_prob).
 
     Bypass mode skips expensive actor forward pass for old_log_prob computation
     by setting old_log_probs = rollout_log_probs (2 policies instead of 3).
+    This substitution is always done when this function is called.
 
-    Uses compute_policy_loss_bypass_mode() which supports:
+    Loss mode: If policy_loss_config.loss_mode is already "topk_ce" (or another
+    non-bypass loss), it is left unchanged so the actor uses that loss while still
+    benefiting from bypass (no old_log_prob recompute). Otherwise we set
+    loss_mode to "bypass_mode" and the actor uses compute_policy_loss_bypass_mode(),
+    which supports:
     - loss_type="ppo_clip" (default): PPO clipped objective (IS handled by ratio)
     - loss_type="reinforce": REINFORCE with explicit IS weights
 
-    Both loss types benefit from rejection sampling (RS) which masks out-of-distribution samples.
+    Both bypass loss types benefit from rejection sampling (RS).
 
     Note:
         The implementation is copied from szrlee <szrlee@gmail.com>.
@@ -947,5 +952,9 @@ def apply_bypass_mode(
     with open_dict(policy_loss_config):
         # Pass rollout_correction config to actor for loss computation and metrics
         policy_loss_config["rollout_correction"] = rollout_corr_config
-        # Always use bypass_mode loss function which handles both loss_types
-        policy_loss_config["loss_mode"] = "bypass_mode"
+        # Only switch to bypass_mode loss when user did not set a different loss (e.g. topk_ce).
+        # When loss_mode is topk_ce, we keep it so the actor uses topk_ce loss while still
+        # benefiting from bypass: old_log_probs = rollout_log_probs (no _compute_old_log_prob).
+        current_loss_mode = getattr(policy_loss_config, "loss_mode", None)
+        if str(current_loss_mode) != "topk_ce":
+            policy_loss_config["loss_mode"] = "bypass_mode"
