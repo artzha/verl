@@ -88,9 +88,8 @@ def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
     Args:
         batch: A DataProto object containing batch data with multi-modal information.
     """
-    from cotnav.utils.draw import draw_polyline
+    from cotnav.utils.draw import draw_polyline, make_query_panel
     from cotnav.models.vlms.interface import parse_and_unify, OutputFormat
-    from cotnav.eval.reflect_llava import make_query_panel
 
     def fig_to_uint8_rgb(fig) -> np.ndarray:
         """
@@ -197,9 +196,8 @@ def compute_motion_rollout_panels(batch: DataProto, max_groups: int = 32) -> lis
     We sample up to `max_groups` random uid groups and return
     (ride_name, semantic_goal, panel_image) triplets for logging.
     """
-    from cotnav.utils.draw import draw_polyline
+    from cotnav.utils.draw import draw_polyline, make_query_panel
     from cotnav.models.vlms.interface import parse_and_unify, OutputFormat
-    from cotnav.eval.reflect_llava import make_query_panel
 
     def fig_to_uint8_rgb(fig) -> np.ndarray:
         fig.canvas.draw()
