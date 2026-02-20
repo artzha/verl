@@ -449,7 +449,7 @@ if __name__ == "__main__":
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
 
     from omegaconf import OmegaConf
-    config_path = "external/verl/verl/trainer/config/critic_sft_trainer_engine.yaml"
+    config_path = "external/verl/verl/trainer/config/motion_sft_trainer_engine.yaml"
     config = OmegaConf.load(config_path)
     OmegaConf.resolve(config)
 

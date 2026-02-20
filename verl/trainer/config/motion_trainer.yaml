@@ -15,7 +15,7 @@ defaults:
   - reward_manager@reward_manager
 
   # Reference model config.
-  # - ref@actor_rollout_ref.ref: dp_ref
+  - ref@actor_rollout_ref.ref: dp_ref
 
   # Rollout model config.
   - rollout@actor_rollout_ref.rollout: rollout
@@ -70,8 +70,22 @@ actor_rollout_ref:
     fsdp_config:
       model_dtype: bf16
       strategy: fsdp2
+      # Match param_dtype to model_dtype so gradients and params share dtype (avoids FSDP assign error when using ref + KL loss)
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
 
     freeze_vision_tower: False
+
+  # Ref policy: use bf16 to match actor so ref_log_prob and loss stay bf16 (avoids FSDP2 grad/param dtype clash)
+  ref:
+    fsdp_config:
+      model_dtype: bf16
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
 
   model:
     # override_config:
@@ -193,7 +207,7 @@ custom_reward_function:
 
   # The path to the file containing your customized reward function.
   # If not specified, pre-implemented reward functions will be used.
-  path: /robodata/arthurz/Research/cotnav/cotnav/verl_adapters/rewards/motion_refine.py
+  path: cotnav/verl_adapters/rewards/motion_refine.py
 
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_motion_refine_reward

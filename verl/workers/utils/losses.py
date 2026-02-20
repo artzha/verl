@@ -182,6 +182,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     # add kl loss
     if config.use_kl_loss:
         ref_log_prob = data["ref_log_prob"]
+        # Cast ref_log_prob to match log_prob dtype so loss and gradients match actor params
+        # (ref often runs in fp32; mixing dtypes can cause gradient/param dtype mismatch in FSDP)
+        ref_log_prob = ref_log_prob.to(log_prob.dtype)
         # compute kl loss
         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
         kl_loss = agg_loss(

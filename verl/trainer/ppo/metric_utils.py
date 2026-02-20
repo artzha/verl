@@ -205,19 +205,16 @@ def compute_motion_rollout_panels(batch: DataProto, max_groups: int = 32) -> lis
         return rgba[..., :3].copy()
 
     # Required fields
-    if "topk_ce_mask" not in batch.batch:
-        return []
     if "uid" not in batch.non_tensor_batch:
         return []
     if "token_level_rewards" not in batch.batch:
         return []
 
     uids = np.asarray(batch.non_tensor_batch["uid"]).reshape(-1)
-    topk_mask = batch.batch["topk_ce_mask"].detach().cpu()
     traj_reward = batch.batch["token_level_rewards"].sum(dim=-1).detach().cpu()
 
     bsz = traj_reward.shape[0]
-    assert bsz == topk_mask.shape[0] == uids.shape[0], "Batch size mismatch between rewards, mask, and uids"
+    assert bsz == uids.shape[0], "Batch size mismatch between rewards and uids"
 
     raw_prompt = batch.non_tensor_batch["raw_prompt"]
     extra = batch.non_tensor_batch["extra_info"]
@@ -241,20 +238,10 @@ def compute_motion_rollout_panels(batch: DataProto, max_groups: int = 32) -> lis
         if group_idx.size == 0:
             continue
 
-        # Restrict to trajectories selected by topk_ce (within this uid group)
-        group_top_mask = topk_mask[group_idx] > 0.5
-        if not group_top_mask.any():
-            # No top-K selections for this group; skip it
-            continue
-
-        group_rewards = traj_reward[group_idx]
-        selected_local = np.where(group_top_mask.numpy())[0]
-        rewards_sel = group_rewards[selected_local].numpy()
-
-        # Sort selected by reward ascending to pick worst/best/median
-        order = np.argsort(rewards_sel)
-        selected_local = selected_local[order]
-        selected_global = group_idx[selected_local]
+        # Use all trajectories in this uid group and sort them by reward
+        group_rewards = traj_reward[group_idx].numpy()
+        order = np.argsort(group_rewards)
+        selected_global = group_idx[order]
 
         n_sel = len(selected_global)
         if n_sel == 0:
@@ -540,7 +527,7 @@ def compute_data_metrics(
         metrics['critic/vdist_score/min'] = float(np.min(vdist_scores))
         metrics['critic/vdist_score/std'] = float(np.std(vdist_scores))
 
-        panel_items = compute_motion_rollout_panels(batch, max_groups=32)
+        panel_items = compute_motion_rollout_panels(batch, max_groups=64)
 
         import wandb
         table = wandb.Table(columns=["ride_name", "semantic_goal", "panel"])

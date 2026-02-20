@@ -519,6 +519,8 @@ class FSDPEngine(BaseEngine):
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
+                    # FSDP2 can keep params in float32; cast loss to float32 so gradients match param dtype and avoid assign error
+                    loss = loss.float()
                     loss.backward()
 
             output_lst.append(meta_info)
