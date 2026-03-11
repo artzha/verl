@@ -95,7 +95,9 @@ def format_prompt(
     extra = non_tensor_dict["extra_info"][i]
     vgoal = extra.get("vgoal", [])
     semantic_goal = extra.get("semantic_goal", "")
-    vgoal_str = f"[{vgoal[0][0]:.3f}, {vgoal[0][1]:.3f}]" if len(vgoal) > 0 else "[N/A, N/A]"
+    # flatten list to 1D array
+    vgoal = np.array(vgoal, dtype=np.float64).flatten()
+    vgoal_str = f"[{vgoal[0]:.3f}, {vgoal[1]:.3f}]" if len(vgoal) > 0 else "[N/A, N/A]"
 
     prompt_template = prompt_msg["content"][0]["text"]
     prompt = format_prompt_cotnav(

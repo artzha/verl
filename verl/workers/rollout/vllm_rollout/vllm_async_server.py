@@ -90,6 +90,17 @@ class ExternalZeroMQDistributedExecutor(Executor):
     uses_ray: bool = False
 
     def _init_executor(self) -> None:
+        # Emit per-process model/LoRA config so warning lines from this process
+        # (e.g. model_manager.py) can be attributed to a concrete rollout model.
+        lora_cfg = getattr(self.vllm_config, "lora_config", None)
+        logger.info(
+            "WorkerDict startup: pid=%s model=%s enable_lora=%s enable_tower_connector_lora=%s",
+            os.getpid(),
+            getattr(getattr(self.vllm_config, "model_config", None), "model", "unknown"),
+            lora_cfg is not None,
+            getattr(lora_cfg, "enable_tower_connector_lora", None),
+        )
+
         dp_rank_local = self.vllm_config.parallel_config.data_parallel_rank_local
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
 
@@ -702,6 +713,19 @@ class vLLMReplica(RolloutReplica):
                 for worker in self.workers
             ]
         )
+        worker_runtime_info = await asyncio.gather(
+            *[
+                worker.__ray_call__.remote(
+                    lambda self: {
+                        "pid": __import__("os").getpid(),
+                        "model_path": getattr(getattr(self, "model_config", None), "local_path", None),
+                        "lora_rank": getattr(getattr(self, "model_config", None), "lora_rank", None),
+                    }
+                )
+                for worker in self.workers
+            ]
+        )
+        logger.info("Rollout worker runtime info (replica=%s): %s", self.replica_rank, worker_runtime_info)
 
         # For non-data parallel case, there's only one server whether it's single or multi nodes.
         nnodes, gpus_per_node = self.nnodes, self.gpus_per_node

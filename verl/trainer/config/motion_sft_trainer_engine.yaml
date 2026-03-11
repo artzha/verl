@@ -18,8 +18,8 @@ data:
   micro_batch_size_per_gpu: 4  # this is also val batch size
   max_token_len_per_gpu: 8192
   use_dynamic_bsz: True
-  train_files: data/grandtour_qwen_motion_sft_novgoal/parquet/train/train.parquet
-  val_files: data/grandtour_qwen_motion_sft_novgoal/parquet/val/val.parquet
+  train_files: data/unified_motion_sft_sgoal/parquet/train/train.parquet
+  val_files: data/unified_motion_sft_sgoal/parquet/val/val.parquet
   train_max_samples: -1  # set to -1 to use full dataset
   val_max_samples: -1  # set to -1 to use full dataset
   # Multi-turn settings
@@ -56,7 +56,8 @@ model:
     # - k_proj
 
   # Hack for excluding visual backbone
-  exclude_modules: ".*visual\\.blocks\\..*|.*visual\\.patch_embed\\..*|.*visual\\.pos_embed$|.*visual\\.rotary_pos_emb$"
+  exclude_modules: []
+  # exclude_modules: ".*visual\\.blocks\\..*|.*visual\\.patch_embed\\..*|.*visual\\.pos_embed$|.*visual\\.rotary_pos_emb$"
     # - '.*language_model\..*'
 
 # Checkpoint configuration

@@ -78,7 +78,24 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
         response_length=response_length,
     )
 
-def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
+def _build_ride_name(batch: DataProto, idx: int) -> str:
+    return f"{batch.non_tensor_batch['extra_info'][idx]['session_id']}"
+
+
+def _panel_score_keys(non_tensor_batch: dict[str, Any]) -> list[str]:
+    keys = [
+        str(k)
+        for k in non_tensor_batch.keys()
+        if isinstance(k, str) and (k == "score" or k.endswith("_score"))
+    ]
+    keys = sorted(set(keys))
+    if "score" in keys:
+        keys.remove("score")
+        keys = ["score"] + keys
+    return keys
+
+
+def _compute_rollout_panels(batch: DataProto, max_images=32, config: Any = None) -> None:
     """
     Draw annotated images for motion paths in the batch.
 
@@ -91,30 +108,20 @@ def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
     from cotnav.utils.draw import draw_polyline, make_query_panel
     from cotnav.models.vlms.interface import parse_and_unify, OutputFormat
 
-    def fig_to_uint8_rgb(fig) -> np.ndarray:
-        """
-        Convert a Matplotlib figure to a uint8 RGB image (HxWx3).
-        Works on modern Matplotlib where tostring_rgb() may not exist.
-        """
-        # Ensure the renderer has drawn the figure
-        fig.canvas.draw()
-        # RGBA buffer (H, W, 4) as uint8
-        rgba = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)
-        # Drop alpha -> RGB
-        rgb = rgba[..., :3].copy()
-        return rgb
+    critic_output_format = OutputFormat.VERDICT_V1
+    if config is not None:
+        cfg_fmt = config.actor_rollout_ref['critic_output_format']
+        critic_output_format = OutputFormat(cfg_fmt)
 
     # Sort by the the highest hdistances to visualize worst cases
     hdistances = batch.non_tensor_batch['hdistances']
     indices = np.argsort(hdistances[:, 0])[::-1]
-    def build_ride_name(idx: int) -> str:
-        return f"{batch.non_tensor_batch['extra_info'][idx]['ride']}_{batch.non_tensor_batch['extra_info'][idx]['seq']}"
 
     # Filter unique indices based on ride names to avoid duplicates
-    ride_names = set(build_ride_name(idx) for idx in indices)
+    ride_names = set(_build_ride_name(batch, idx) for idx in indices)
     unique_indices = []
     for idx in indices:
-        ride_name = build_ride_name(idx)
+        ride_name = _build_ride_name(batch, idx)
         if ride_name in ride_names:
             unique_indices.append(idx)
             ride_names.remove(ride_name)
@@ -123,6 +130,17 @@ def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
     # mm = batch.non_tensor_batch["multi_modal_data"]
     raw_prompt = batch.non_tensor_batch['raw_prompt']
     extra = batch.non_tensor_batch["extra_info"]
+
+    score_keys = _panel_score_keys(batch.non_tensor_batch)
+
+    def score_value_at(key: str, row_idx: int) -> float | None:
+        if key not in batch.non_tensor_batch:
+            return None
+        row = batch.non_tensor_batch[key][row_idx]
+        if isinstance(row, (list, tuple, np.ndarray)):
+            arr = np.asarray(row)
+            row = arr.reshape(-1)[0]
+        return float(row)
 
     panel_row_list = []
     for idx in unique_indices:
@@ -136,19 +154,14 @@ def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
         img = np.asarray(content['image'])
 
         traces = []
-        critiques = []
-        for (tr, cr) in zip(traces_raw, critique_raw):
+        if not isinstance(traces_raw, (list, tuple)):
+            traces_raw = []
+        for tr in traces_raw:
             try:
                 trace = parse_and_unify(tr, OutputFormat.TRAJECTORY_V1)
             except (ValueError, TypeError):
                 trace = None
             traces.append(trace)
-        
-        try:
-            critique = parse_and_unify(critique_raw, OutputFormat.VERDICT_V1)
-        except (ValueError, TypeError):
-            critique = None
-        critiques.append(critique)
 
         # Draw predicted paths
         q_images = [
@@ -161,27 +174,64 @@ def _compute_rollout_panels(batch: DataProto, max_images=32) -> None:
                 for q_img in q_images
             ]
 
-        q_reasons = [
-            c.unified['reason'] if c is not None and 'reason' in c.unified else "invalid critique"
-            for c in critiques
-        ] + ["no critique"] # add empty reason for last image
+        q_reasons = []
+        if isinstance(critique_raw, (list, tuple, np.ndarray)):
+            critique_list = list(critique_raw)
+        else:
+            critique_list = [critique_raw]
+        for q_idx in range(len(q_images)):
+            c_raw = critique_list[min(q_idx, len(critique_list) - 1)] if critique_list else ""
+            if isinstance(c_raw, (list, tuple, np.ndarray)):
+                c_raw = c_raw[0] if len(c_raw) > 0 else ""
+            c_raw = c_raw if isinstance(c_raw, str) else ""
+            reason = "no critique"
+            if c_raw.strip():
+                try:
+                    critique = parse_and_unify(c_raw, critic_output_format)
+                    parsed_reason = critique.unified.get("reason", "") if critique is not None else ""
+                    if isinstance(parsed_reason, str) and parsed_reason.strip():
+                        reason = parsed_reason.strip()
+                except (ValueError, TypeError):
+                    reason = "no critique"
+            q_reasons.append(reason)
         q_hds = batch.non_tensor_batch['hdistances'][idx].tolist()
 
         assert len(q_images) == len(q_reasons) == len(q_hds), "Length mismatch in images, reasons, and distances"
 
-        ride_name = build_ride_name(idx)
+        ride_name = _build_ride_name(batch,idx)
         semantic_goal = extra_i.get('semantic_goal', 'No goal provided')
         # breakpoint()
         # import pdb; pdb.set_trace()
-        panel_fig = make_query_panel(ride_name, semantic_goal, q_images, q_reasons, q_hausdorffs=q_hds)
-        panel_row_list.append( (ride_name, semantic_goal, fig_to_uint8_rgb(panel_fig)) )
-        # close the figure to free memory
-        panel_fig.clf()
+        q_samples = [
+            {
+                "image": q_images[i],
+                "reason": q_reasons[i],
+                "hausdorff": q_hds[i],
+                "scores": {
+                    **{k: [score_value_at(k, idx)] for k in score_keys},
+                    "hd": [q_hds[i]],
+                },
+            }
+            for i in range(len(q_images))
+        ]
+        panel_img = make_query_panel(
+            {
+                "sample_id": ride_name,
+                "goal_cmd": semantic_goal,
+                "distance_key": "HD",
+                "samples": q_samples,
+            }
+        )
+        panel_row_list.append((ride_name, semantic_goal, panel_img))
         
     return panel_row_list    
 
 
-def compute_motion_rollout_panels(batch: DataProto, max_groups: int = 32) -> list[tuple[str, str, np.ndarray]]:
+def compute_motion_rollout_panels(
+    batch: DataProto,
+    max_groups: int = 32,
+    config: Any = None,
+) -> list[tuple[str, str, np.ndarray]]:
     """
     Compute rollout panels that visualize variability within each uid group.
 
@@ -199,10 +249,10 @@ def compute_motion_rollout_panels(batch: DataProto, max_groups: int = 32) -> lis
     from cotnav.utils.draw import draw_polyline, make_query_panel
     from cotnav.models.vlms.interface import parse_and_unify, OutputFormat
 
-    def fig_to_uint8_rgb(fig) -> np.ndarray:
-        fig.canvas.draw()
-        rgba = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)
-        return rgba[..., :3].copy()
+    critic_output_format = OutputFormat.VERDICT_V1
+    if config is not None:
+        cfg_fmt = config.actor_rollout_ref['critic_output_format']
+        critic_output_format = OutputFormat(cfg_fmt)
 
     # Required fields
     if "uid" not in batch.non_tensor_batch:
@@ -218,10 +268,16 @@ def compute_motion_rollout_panels(batch: DataProto, max_groups: int = 32) -> lis
 
     raw_prompt = batch.non_tensor_batch["raw_prompt"]
     extra = batch.non_tensor_batch["extra_info"]
-    vdist_scores = batch.non_tensor_batch.get("vdist_score", None)
+    score_keys = _panel_score_keys(batch.non_tensor_batch)
 
-    def build_ride_name(idx: int) -> str:
-        return f"{extra[idx]['ride']}_{extra[idx]['seq']}"
+    def score_value_at(key: str, row_idx: int) -> float | None:
+        if key not in batch.non_tensor_batch:
+            return None
+        row = batch.non_tensor_batch[key][row_idx]
+        if isinstance(row, (tuple, list, np.ndarray)):
+            arr = np.asarray(row)
+            row = arr.reshape(-1)[0]
+        return float(row)
 
     # Randomly select up to max_groups uid groups
     all_group_ids = np.unique(uids)
@@ -242,7 +298,6 @@ def compute_motion_rollout_panels(batch: DataProto, max_groups: int = 32) -> lis
         group_rewards = traj_reward[group_idx].numpy()
         order = np.argsort(group_rewards)
         selected_global = group_idx[order]
-
         n_sel = len(selected_global)
         if n_sel == 0:
             continue
@@ -260,7 +315,7 @@ def compute_motion_rollout_panels(batch: DataProto, max_groups: int = 32) -> lis
         q_reasons: list[str] = []
         q_hds: list[float] = []
 
-        for j, idx in enumerate(panel_indices):
+        for _, idx in enumerate(panel_indices):
             content = raw_prompt[idx][1]["content"][0]
             img = np.asarray(content["image"])
             extra_i = extra[idx]
@@ -291,7 +346,7 @@ def compute_motion_rollout_panels(batch: DataProto, max_groups: int = 32) -> lis
                     img_annotated = draw_polyline(
                         trace_refine.unified["trajectory"],
                         img_annotated,
-                        color=(255, 255, 51), # yellow
+                        color=(51, 255, 51), # green
                         line_thickness=2,
                         dot_radius=3,
                     )
@@ -312,47 +367,55 @@ def compute_motion_rollout_panels(batch: DataProto, max_groups: int = 32) -> lis
 
             q_images.append(img_annotated)
 
-            # Critique: only for the first image (best); others are blank
-            if j == 0:
-                critique_raw = extra_i.get("critic_response", "")
-                if isinstance(critique_raw, list):
-                    critique_raw = critique_raw[0] if critique_raw else ""
+            # Critique: for all images.
+            critique_raw = extra_i.get("critic_response", "")
+            reason = "no critique"
+            if isinstance(critique_raw, (list, tuple, np.ndarray)):
+                critique_raw = critique_raw[0] if len(critique_raw) > 0 else ""
+            critique_raw = critique_raw if isinstance(critique_raw, str) else ""
+            if critique_raw.strip():
                 try:
-                    critique = parse_and_unify(critique_raw, OutputFormat.VERDICT_V1)
-                    reason = critique.unified.get("reason", "") if critique is not None else ""
+                    critique = parse_and_unify(critique_raw, critic_output_format)
+                    parsed_reason = critique.unified.get("reason", "") if critique is not None else ""
+                    if isinstance(parsed_reason, str) and parsed_reason.strip():
+                        reason = parsed_reason.strip()
                 except (ValueError, TypeError):
-                    reason = ""
-                q_reasons.append(reason or "no critique")
-            else:
-                q_reasons.append("")
+                    reason = "no critique"
+            q_reasons.append(reason)
 
             # Hausdorff distance per rollout (if available)
-            if vdist_scores is not None:
-                hd_row = vdist_scores[idx]
-                if hasattr(hd_row, "__len__"):
-                    hd_val = float(hd_row[0])
-                else:
-                    hd_val = float(hd_row)
-            else:
+            hd_val = score_value_at("score", idx)
+            if hd_val is None:
                 hd_val = 0.0
             q_hds.append(hd_val)
 
         assert len(q_images) == len(q_reasons) == len(q_hds), "Length mismatch in images, reasons, and distances"
 
         # Use the best rollout's index for naming / goal context
-        ride_name = build_ride_name(best_idx)
+        ride_name = _build_ride_name(batch, best_idx)
         semantic_goal = extra[best_idx].get("semantic_goal", "No goal provided")
-        panel_fig = make_query_panel(
-            ride_name, 
-            semantic_goal, 
-            q_images, 
-            q_reasons, 
-            q_hausdorffs=q_hds,
-            distance_key="VD"
+        q_samples = [
+            {
+                "image": q_images[i],
+                "reason": q_reasons[i],
+                "hausdorff": q_hds[i],
+                "scores": {
+                    **{k: [score_value_at(k, panel_indices[i])] for k in score_keys},
+                    "vd": [q_hds[i]],
+                },
+            }
+            for i in range(len(q_images))
+        ]
+        panel_img = make_query_panel(
+            {
+                "sample_id": ride_name,
+                "goal_cmd": semantic_goal,
+                "distance_key": "VD",
+                "samples": q_samples,
+            }
         )
-        panel_row_list.append((ride_name, semantic_goal, fig_to_uint8_rgb(panel_fig)))
-        panel_fig.clf()
-        # Image.fromarray(panel_row_list[0][2]).save(f"test.png")
+        panel_row_list.append((ride_name, semantic_goal, panel_img))
+        # Image.fromarray(panel_row_list[0][2]).save("test.png")
         # breakpoint()
         # import pdb; pdb.set_trace()
 
@@ -512,7 +575,7 @@ def compute_data_metrics(
         metrics['critic/vgoal_score/std'] = float(np.std(vgoal_scores))
 
         # Log annotated images
-        panel_items = _compute_rollout_panels(batch, max_images=64)
+        panel_items = _compute_rollout_panels(batch, max_images=64, config=config)
 
         import wandb
         table = wandb.Table(columns=["ride_name", "semantic_goal", "panel"])
@@ -527,14 +590,22 @@ def compute_data_metrics(
         metrics['critic/vdist_score/min'] = float(np.min(vdist_scores))
         metrics['critic/vdist_score/std'] = float(np.std(vdist_scores))
 
-        panel_items = compute_motion_rollout_panels(batch, max_groups=64)
-
+    score_keys = _panel_score_keys(batch.non_tensor_batch)
+    if len(score_keys) > 0:
+        panel_items = compute_motion_rollout_panels(batch, max_groups=64, config=config)
         import wandb
         table = wandb.Table(columns=["ride_name", "semantic_goal", "panel"])
         for (ride_name, semantic_goal, panel_img) in panel_items:  # you can return tuples instead
             table.add_data(ride_name, semantic_goal, wandb.Image(panel_img))
         metrics["critic/rollout_panels"] = table
 
+    for score_key in ['goal_align_score', 'start_align_score', 'improvement_score', 'smoothness_score']:
+        if score_key in batch.non_tensor_batch:
+            scores = batch.non_tensor_batch[score_key]
+            metrics[f'critic/{score_key}/mean'] = float(np.mean(scores))
+            metrics[f'critic/{score_key}/max'] = float(np.max(scores))
+            metrics[f'critic/{score_key}/min'] = float(np.min(scores))
+            metrics[f'critic/{score_key}/std'] = float(np.std(scores))
 
     if "gt_log_probs" in batch.batch:
         gt_response_mask = batch.batch.get("gt_response_mask", None)

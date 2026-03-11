@@ -40,6 +40,8 @@ defaults:
 
 actor_rollout_ref:
   hybrid_engine: true
+  critic_output_format: verdict:v1
+  critic_prompt_path: 'cotnav/prompts/datagen/critic_sft/novgoal/critic_prompt.txt'
 
   external_worker:
     path: cotnav/verl_adapters/workers/hybrid_motion_actor.py
@@ -97,10 +99,14 @@ actor_rollout_ref:
   rollout:
     name: vllm
     mode: async
+    # Return rollout_log_probs during generation so bypass_mode can skip expensive old_log_prob recompute.
+    calculate_log_probs: true
     temperature: 1.0
     top_p: 0.95
     prompt_length: 2048
     response_length: 512
+    # Store actor generations as critic response for reward/logging.
+    response_role: critic
 
     engine_kwargs:
       vllm:
@@ -108,11 +114,25 @@ actor_rollout_ref:
         max_num_seqs: 64
         max_num_batched_tokens: 4096
 
+        gpu_memory_utilization: 0.9
+
     # Required: Allows vllm to load base model
     load_format: safetensors
 
     # Reduces peak GPU memory usage
     # layered_summon: True
+
+  # Which extra rollouts to run before and after the actor rollout.
+  # before_actor runs motion first to augment actor prompt, then actor generates.
+  # after_actor runs motion refinement on actor output and stores it in extra_info.
+  rollout_generations:
+    before_actor:
+      - rollout: motion
+        postfill: critic
+    after_actor:
+      - rollout: motion
+        prefill: motion
+        response_key: motion_response
 
   # Shared rollout config for extra rollouts (replaces deprecated motion_rollout).
   extra_rollout_rollout:
@@ -135,25 +155,25 @@ actor_rollout_ref:
         swap_space: 0
 
   # Extra rollout servers (replaces deprecated motion + motion_rollout).
-  # motion: sync_with_actor true so the motion planner stays synced with the actor weights.
+  # motion: keep separate from actor so critic remains the trainable target.
   extra_rollouts:
     - name: motion
       model:
         path: Qwen/Qwen3-VL-8B-Instruct
         trust_remote_code: true
       rollout: ${actor_rollout_ref.extra_rollout_rollout}
-      sync_with_actor: true
+      sync_with_actor: false
       prompt_paths:
-        critic: 'cotnav/models/prompts/datagen/critic_sft/critic_prompt.txt'
-        motion: 'cotnav/models/prompts/datagen/critic_sft/motion_refine_prompt.txt'
+        critic: ${actor_rollout_ref.critic_prompt_path}
+        motion: 'cotnav/prompts/datagen/critic_sft/novgoal/motion_prompt_startgoal.txt'
     - name: critic
       model:
         path: Qwen/Qwen3-VL-8B-Instruct
         trust_remote_code: true
       rollout: ${actor_rollout_ref.extra_rollout_rollout}
-      sync_with_actor: false
+      sync_with_actor: true
       prompt_paths:
-        critic: 'cotnav/models/prompts/datagen/critic_sft/critic_prompt.txt'
+        critic: ${actor_rollout_ref.critic_prompt_path}
 
 reward_model:
   use_reward_loop: false
@@ -163,10 +183,10 @@ custom_reward_function:
 
   # The path to the file containing your customized reward function.
   # If not specified, pre-implemented reward functions will be used.
-  path: /robodata/arthurz/Research/cotnav/cotnav/verl_adapters/rewards/motion_trace.py
+  path: /robodata/arthurz/Research/cotnav/cotnav/verl_adapters/rewards/sparse_judge_refine.py
 
   # The name of the reward function within the specified file. Default is 'compute_score'.
-  name: compute_motion_trace_reward
+  name: compute_sparse_judge_reward
 
 # config for the algorithm
 algorithm:

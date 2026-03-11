@@ -519,6 +519,18 @@ class AgentLoopWorker:
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)
+        response_role = self.config.actor_rollout_ref.rollout.get("response_role", None)
+        if response_role in ("critic", "motion"):
+            response_key = "critic_response" if response_role == "critic" else "motion_response"
+            decoded = self.tokenizer.batch_decode(output.batch["responses"], skip_special_tokens=True)
+            existing = output.non_tensor_batch.get(response_key, None)
+            if existing is None:
+                output.non_tensor_batch[response_key] = np.array([[resp] for resp in decoded], dtype=object)
+            else:
+                existing_list = existing.tolist() if hasattr(existing, "tolist") else existing
+                output.non_tensor_batch[response_key] = np.array(
+                    [prev + [resp] for prev, resp in zip(existing_list, decoded)], dtype=object
+                )
 
         return output
 

@@ -60,6 +60,8 @@ critic:
 
 actor_rollout_ref:
   hybrid_engine: true
+  critic_output_format: verdict:v1
+  critic_prompt_path: 'cotnav/models/prompts/datagen/critic_sft/novgoal/critic_prompt.txt'
 
   external_worker:
     path: cotnav/verl_adapters/workers/hybrid_motion_actor.py
@@ -120,7 +122,7 @@ actor_rollout_ref:
     calculate_log_probs: true
     temperature: 1.0
     top_p: 0.95
-    prompt_length: 2048
+    prompt_length: 2560
     response_length: 512
     # If set to "critic" or "motion", the actor's generated response is stored in that key and merged into extra_info for reward.
     response_role: motion
@@ -159,8 +161,8 @@ actor_rollout_ref:
     # Sampling parameters
     temperature: 1.0
     top_p: 0.95
-    prompt_length: 2048
-    response_length: 256
+    prompt_length: 2560
+    response_length: 512
 
     tensor_model_parallel_size: 4
 
@@ -187,7 +189,7 @@ actor_rollout_ref:
       rollout: ${actor_rollout_ref.extra_rollout_rollout}
       sync_with_actor: true
       prompt_paths:
-        critic: 'cotnav/models/prompts/datagen/critic_sft/novgoal/critic_prompt.txt'
+        critic: ${actor_rollout_ref.critic_prompt_path}
         motion: 'cotnav/models/prompts/datagen/critic_sft/novgoal/motion_refine_prompt.txt'
     - name: critic
       model:
@@ -196,7 +198,7 @@ actor_rollout_ref:
       rollout: ${actor_rollout_ref.extra_rollout_rollout}
       sync_with_actor: false
       prompt_paths:
-        critic: 'cotnav/models/prompts/datagen/critic_sft/novgoal/critic_prompt.txt'
+        critic: ${actor_rollout_ref.critic_prompt_path}
         motion: 'cotnav/models/prompts/datagen/critic_sft/novgoal/motion_refine_prompt.txt'
 
 reward_model:

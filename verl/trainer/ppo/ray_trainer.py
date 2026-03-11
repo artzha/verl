@@ -682,32 +682,90 @@ class RayPPOTrainer:
                 dtype=object,
             )
 
-        self._merge_rollout_responses_into_extra_info(out)
-
-        # If this actor rollout is labeled as "critic" or "motion", add the last generated sequence to that key.
+        # If this actor rollout is labeled as "critic" or "motion", require backend
+        # to append exactly one new response per row to the corresponding key.
         response_role = self.config.actor_rollout_ref.rollout.get("response_role")
         if response_role in ("critic", "motion"):
             response_key = "critic_response" if response_role == "critic" else "motion_response"
-            decoded = self.tokenizer.batch_decode(out.batch["responses"], skip_special_tokens=True)
+            self.validate_rollout_responses_in_extra_info(batch, out, response_key)
 
-            # Add decoded to reponse_key in one line
-            existing = out.non_tensor_batch.get(response_key).tolist()
-            out.non_tensor_batch[response_key] = np.array([
-                prev + [resp] for prev, resp in zip(existing, decoded)
-            ], dtype=object)
-
-            self._merge_rollout_responses_into_extra_info(out)
+        self._merge_rollout_responses_into_extra_info(out)
 
         return out
 
+    def validate_rollout_responses_in_extra_info(
+        self,
+        batch: DataProto,
+        out: DataProto,
+        response_key: str,
+    ) -> None:
+        """Validate backend contract: output response list grows by exactly one per row."""
+        if response_key not in out.non_tensor_batch:
+            raise RuntimeError(
+                f"Rollout backend contract violated: missing `{response_key}` in output."
+            )
+
+        def _to_rows(arr):
+            rows = arr.tolist() if hasattr(arr, "tolist") else arr
+            normalized = []
+            for row in rows:
+                if isinstance(row, list):
+                    normalized.append(row)
+                elif row is None:
+                    normalized.append([])
+                else:
+                    normalized.append([row])
+            return normalized
+
+        post_rows = _to_rows(out.non_tensor_batch[response_key])
+        if len(post_rows) != len(out):
+            raise RuntimeError(
+                f"Rollout backend contract violated for `{response_key}`: "
+                f"output row count {len(post_rows)} != batch size {len(out)}."
+            )
+
+        pre_arr = batch.non_tensor_batch.get(response_key)
+        if pre_arr is None:
+            bad_rows = [i for i, row in enumerate(post_rows) if len(row) != 1]
+            if bad_rows:
+                raise RuntimeError(
+                    f"Rollout backend contract violated for `{response_key}`: expected length 1 "
+                    f"for new key, invalid rows {bad_rows[:8]}."
+                )
+            return
+
+        pre_rows = _to_rows(pre_arr)
+        if len(pre_rows) != len(post_rows):
+            raise RuntimeError(
+                f"Rollout backend contract violated for `{response_key}`: "
+                f"input/output row count mismatch {len(pre_rows)} vs {len(post_rows)}."
+            )
+
+        bad_rows = []
+        for i in range(len(post_rows)):
+            if len(post_rows[i]) != len(pre_rows[i]) + 1:
+                bad_rows.append(i)
+
+        if bad_rows:
+            raise RuntimeError(
+                f"Rollout backend contract violated for `{response_key}`: expected output length = "
+                f"input length + 1, invalid rows {bad_rows[:8]}."
+            )
+
     def _merge_rollout_responses_into_extra_info(self, batch: DataProto) -> None:
-        """Copy critic_response and motion_response from non_tensor_batch into extra_info so rewards and logging see them. Creates extra_info if missing."""
+        """Mirror canonical rollout responses from non_tensor_batch into extra_info.
+
+        For each sample row, this overwrites:
+        - extra_info[i]["motion_response"] with a list[str]
+        - extra_info[i]["critic_response"] with a list[str]
+        """
         nt = batch.non_tensor_batch
         if "extra_info" not in nt:
             nt["extra_info"] = np.array([{} for _ in range(len(batch))], dtype=object)
         extra_info = nt["extra_info"]
         if hasattr(extra_info, "tolist"):
             extra_info = extra_info.tolist()
+        critic_output_format = self.config.actor_rollout_ref['critic_output_format']
         for key in ["critic_response", "motion_response"]:
             if key not in nt:
                 continue
@@ -716,7 +774,14 @@ class RayPPOTrainer:
                 vals = vals.tolist()
             for i, val in enumerate(vals):
                 if i < len(extra_info):
-                    extra_info[i][key] = val
+                    if isinstance(val, list):
+                        normalized = list(val)
+                    elif val is None:
+                        normalized = []
+                    else:
+                        normalized = [val]
+                    extra_info[i][key] = normalized
+                    extra_info[i]["critic_output_format"] = critic_output_format
 
     def _run_rollout_generations(
         self,
@@ -725,11 +790,11 @@ class RayPPOTrainer:
         prev: Optional[DataProto] = None,
         timing_raw: Optional[dict] = None,
     ) -> DataProto:
-        """Run a sequence of extra-rollout generations from config (before_actor or after_actor). Updates prompts and returns the batch after all generations. Always merges critic_response and motion_response into batch.non_tensor_batch['extra_info'] after each step."""
+        """Run a sequence of extra-rollout generations from config (before_actor or after_actor). Updates prompts and returns the batch after all generations."""
         if not steps:
             return batch
 
-        non_tensor_keys = ["full_prompts", "multi_modal_data", "raw_prompt", "motion_response"]
+        non_tensor_keys = ["full_prompts", "multi_modal_data", "raw_prompt", "motion_response", "critic_response"]
         for key in non_tensor_keys:
             if key in batch.non_tensor_batch:
                 continue
@@ -793,8 +858,6 @@ class RayPPOTrainer:
             current = unpad_dataproto(out, pad_size=pad_size)
             if timing_raw is not None and "timing" in current.meta_info:
                 timing_raw.update(current.meta_info.get("timing", {}))
-
-            self._merge_rollout_responses_into_extra_info(current)
 
         return current
 
@@ -879,15 +942,19 @@ class RayPPOTrainer:
                 motion_batch = self._run_rollout_generations(
                     test_output_gen_batch, after_steps, prev=test_gen_batch
                 )
-                test_output_gen_batch.non_tensor_batch["extra_info"] = (
-                    motion_batch.non_tensor_batch["extra_info"]
-                )
-
+                # Propagate updated motion/critic responses and extra_info from motion_batch
+                # so that all generations (before_actor, actor, after_actor) are visible.
+                for key in ["motion_response", "critic_response"]:
+                    if key in motion_batch.non_tensor_batch:
+                        test_output_gen_batch.non_tensor_batch[key] = motion_batch.non_tensor_batch[key]
+                if "extra_info" in motion_batch.non_tensor_batch:
+                    test_output_gen_batch.non_tensor_batch["extra_info"] = motion_batch.non_tensor_batch["extra_info"]
+            
             dup_report = tu.drop_dupe_keys(
-                        test_batch,
-                        test_output_gen_batch,
-                        attrs=["batch", "non_tensor_batch", "meta_info"]
-                    )
+                test_batch,
+                test_output_gen_batch,
+                attrs=["batch", "non_tensor_batch", "meta_info"]
+            )
             print("validation generation end")
 
             # Store generated outputs
@@ -907,8 +974,8 @@ class RayPPOTrainer:
 
             # Ensure motion_response/critic_response are in extra_info for reward_fn (reward_kwargs)
             self._merge_rollout_responses_into_extra_info(test_batch)
-
             # evaluate using reward_function
+
             result = self._compute_or_extract_reward(test_batch, reward_fn=self.val_reward_fn, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -1898,9 +1965,12 @@ class RayPPOTrainer:
                             motion_batch = self._run_rollout_generations(
                                 batch, after_steps, prev=gen_batch_input, timing_raw=timing_raw
                             )
-                            batch.non_tensor_batch["extra_info"] = (
-                                motion_batch.non_tensor_batch["extra_info"]
-                            )
+                            # Keep canonical response lists from rollouts on the top-level batch.
+                            for key in ["motion_response", "critic_response"]:
+                                if key in motion_batch.non_tensor_batch:
+                                    batch.non_tensor_batch[key] = motion_batch.non_tensor_batch[key]
+                            if "extra_info" in motion_batch.non_tensor_batch:
+                                batch.non_tensor_batch["extra_info"] = motion_batch.non_tensor_batch["extra_info"]
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1924,7 +1994,6 @@ class RayPPOTrainer:
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # Ensure motion_response/critic_response are in extra_info for reward_fn (reward_kwargs)
                         self._merge_rollout_responses_into_extra_info(batch)
-
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             if not self.use_reward_loop:
