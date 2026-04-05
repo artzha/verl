@@ -523,11 +523,22 @@ class AgentLoopWorker:
         if response_role in ("critic", "motion"):
             response_key = "critic_response" if response_role == "critic" else "motion_response"
             decoded = self.tokenizer.batch_decode(output.batch["responses"], skip_special_tokens=True)
-            existing = output.non_tensor_batch.get(response_key, None)
-            if existing is None:
+            assert len(decoded) == len(output), (
+                f"Decoded response rows {len(decoded)} must match output batch size {len(output)}"
+            )
+
+            pre_existing = batch.non_tensor_batch.get(response_key, None)
+            if pre_existing is None:
                 output.non_tensor_batch[response_key] = np.array([[resp] for resp in decoded], dtype=object)
             else:
-                existing_list = existing.tolist() if hasattr(existing, "tolist") else existing
+                existing_list = pre_existing.tolist()
+                assert len(existing_list) == len(decoded), (
+                    f"Existing `{response_key}` rows {len(existing_list)} "
+                    f"must match decoded rows {len(decoded)}"
+                )
+                assert all(isinstance(row, list) for row in existing_list), (
+                    f"Expected `{response_key}` rows to be list[str] history."
+                )
                 output.non_tensor_batch[response_key] = np.array(
                     [prev + [resp] for prev, resp in zip(existing_list, decoded)], dtype=object
                 )

@@ -45,23 +45,23 @@ critic:
     model_dtype: bf16
     strategy: fsdp2
 
-  model:
-    # Use remove padding optimization (saves compute)
-    use_remove_padding: True
+  # model:
+  #   # Use remove padding optimization (saves compute)
+  #   use_remove_padding: True
 
-    # LoRA knobs (VeRL infra) See model/hf_model.yaml for definitions
-    lora_rank: 0.0
-    lora_alpha: 0.0
-    target_modules: all-linear
-    # exclude_modules: '.*visual.*'
-    exclude_modules: null
+  #   # LoRA knobs (VeRL infra) See model/hf_model.yaml for definitions
+  #   lora_rank: 0.0
+  #   lora_alpha: 0.0
+  #   target_modules: all-linear
+  #   # exclude_modules: '.*visual.*'
+  #   exclude_modules: null
 
-    freeze_vision_tower: False
+  #   freeze_vision_tower: False
 
 actor_rollout_ref:
   hybrid_engine: true
   critic_output_format: verdict:v1
-  critic_prompt_path: 'cotnav/models/prompts/datagen/critic_sft/novgoal/critic_prompt.txt'
+  critic_prompt_path: 'cotnav/prompts/datagen/critic_sft/novgoal/critic_prompt.txt'
 
   external_worker:
     path: cotnav/verl_adapters/workers/hybrid_motion_actor.py
@@ -132,6 +132,7 @@ actor_rollout_ref:
         max_model_len: 4096
         max_num_seqs: 64
         max_num_batched_tokens: 4096
+        gpu_memory_utilization: 0.9
 
     # Required: Allows vllm to load base model
     load_format: safetensors
@@ -190,7 +191,7 @@ actor_rollout_ref:
       sync_with_actor: true
       prompt_paths:
         critic: ${actor_rollout_ref.critic_prompt_path}
-        motion: 'cotnav/models/prompts/datagen/critic_sft/novgoal/motion_refine_prompt.txt'
+        motion: 'cotnav/prompts/datagen/critic_sft/novgoal/motion_refine_prompt.txt'
     - name: critic
       model:
         path: Qwen/Qwen3-VL-8B-Instruct
@@ -199,7 +200,7 @@ actor_rollout_ref:
       sync_with_actor: false
       prompt_paths:
         critic: ${actor_rollout_ref.critic_prompt_path}
-        motion: 'cotnav/models/prompts/datagen/critic_sft/novgoal/motion_refine_prompt.txt'
+        motion: 'cotnav/prompts/datagen/critic_sft/novgoal/motion_refine_prompt.txt'
 
 reward_model:
   use_reward_loop: false
@@ -209,10 +210,10 @@ custom_reward_function:
 
   # The path to the file containing your customized reward function.
   # If not specified, pre-implemented reward functions will be used.
-  path: cotnav/verl_adapters/rewards/motion_refine.py
+  path: /work/09156/arthurz/stampede3/research/cotnav/cotnav/verl_adapters/rewards/sparse_judge_refine.py
 
   # The name of the reward function within the specified file. Default is 'compute_score'.
-  name: compute_motion_refine_reward
+  name: compute_sparse_judge_reward
 
 # config for the algorithm
 algorithm:

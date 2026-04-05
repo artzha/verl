@@ -38,6 +38,12 @@ defaults:
   # self config override anything above
   - _self_
 
+critic:
+  strategy: fsdp2
+  fsdp_config:
+    model_dtype: bf16
+    strategy: fsdp2
+
 actor_rollout_ref:
   hybrid_engine: true
   critic_output_format: verdict:v1
@@ -71,30 +77,14 @@ actor_rollout_ref:
     use_remove_padding: True
 
     # LoRA knobs (VeRL infra) See ppo_megatron_trainer.yaml for definitions
-    lora:
-      type: lora
-
-      rank: 64
-      alpha: 64
-
-      dropout: 0.0
-      target_modules: all-linear
-        # - linear_qkv
-        # - linear_proj
-        # - linear_fc1
-        # - linear_fc2
-
-      # exclude_modules: '.*visual.*'
-      dropout_position: pre
-      lora_A_init_method: xavier
-      lora_B_init_method: zero
-      a2a_experimental: False
-      dtype: null
-      adapter_path: null
-
-      freeze_vision_model: True
-      freeze_vision_projection: True
-      freeze_language_model: True
+    lora_rank: 0.0
+    lora_alpha: 0.0
+    target_modules: all-linear
+    exclude_modules: null
+    # - linear_qkv
+    # - linear_proj
+    # - linear_fc1
+    # - linear_fc2
 
   rollout:
     name: vllm
@@ -113,7 +103,6 @@ actor_rollout_ref:
         max_model_len: 4096
         max_num_seqs: 64
         max_num_batched_tokens: 4096
-
         gpu_memory_utilization: 0.9
 
     # Required: Allows vllm to load base model
@@ -183,7 +172,7 @@ custom_reward_function:
 
   # The path to the file containing your customized reward function.
   # If not specified, pre-implemented reward functions will be used.
-  path: /robodata/arthurz/Research/cotnav/cotnav/verl_adapters/rewards/sparse_judge_refine.py
+  path: /work/09156/arthurz/stampede3/research/cotnav/cotnav/verl_adapters/rewards/sparse_judge_refine.py
 
   # The name of the reward function within the specified file. Default is 'compute_score'.
   name: compute_sparse_judge_reward

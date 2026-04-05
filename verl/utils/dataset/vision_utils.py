@@ -15,12 +15,20 @@
 from io import BytesIO
 from typing import Optional
 
+import numpy as np
 import torch
 from PIL import Image
 from qwen_vl_utils import fetch_image, fetch_video
 
 
-def process_image(image: dict | Image.Image, image_patch_size: int = 14) -> Image.Image:
+def process_image(
+    image: dict | Image.Image,
+    image_patch_size: int = 14,
+    resize_mode: str = "auto",
+) -> Image.Image:
+    if resize_mode not in {"auto", "original"}:
+        raise ValueError(f"Unsupported resize_mode: {resize_mode}. Expected one of ['auto', 'original'].")
+
     if isinstance(image, str):
         image = Image.open(image)
 
@@ -30,6 +38,16 @@ def process_image(image: dict | Image.Image, image_patch_size: int = 14) -> Imag
     if "bytes" in image:
         assert "image" not in image, "Cannot have both `bytes` and `image`"
         image["image"] = Image.open(BytesIO(image["bytes"]))
+
+    if resize_mode == "original":
+        raw_image = image.get("image", image.get("image_url"))
+        if not isinstance(raw_image, str | Image.Image):
+            raise NotImplementedError("resize_mode='original' only supports image path, image_url path, or PIL.Image.")
+        if isinstance(raw_image, Image.Image):
+            return raw_image.convert("RGB")
+        if raw_image.startswith("file://"):
+            raw_image = raw_image[7:]
+        return Image.open(raw_image).convert("RGB")
 
     return fetch_image(image, image_patch_size=image_patch_size)
 
@@ -65,6 +83,7 @@ eg.
 def process_video(
     video: dict,
     image_patch_size: int = 14,
+    resize_mode: str = "auto",
     nframes: Optional[int] = None,
     fps: Optional[float] = None,
     fps_min_frames: Optional[int] = None,
@@ -77,6 +96,8 @@ def process_video(
     Add video sample FPS in a future MR
     """
 
+    if resize_mode not in {"auto", "original"}:
+        raise ValueError(f"Unsupported resize_mode: {resize_mode}. Expected one of ['auto', 'original'].")
     if not isinstance(video, dict) or "video" not in video:
         raise NotImplementedError(VIDEO_FORMAT_HELP)
     assert nframes is None or fps is None, "Can't use both `nframes` or `fps`"
@@ -94,6 +115,40 @@ def process_video(
                 video["min_frames"] = fps_min_frames
             if fps_max_frames is not None:
                 video["max_frames"] = fps_max_frames
+
+    if resize_mode == "original":
+        if isinstance(video["video"], str):
+            raise NotImplementedError(
+                "resize_mode='original' for video files is not supported in this path. "
+                "Use frame-list videos to preserve original frame resolution."
+            )
+        if not isinstance(video["video"], (list, tuple)):
+            raise NotImplementedError(VIDEO_FORMAT_HELP)
+
+        image_list = [process_image(frame, resize_mode="original") for frame in video["video"]]
+        if len(image_list) == 0:
+            raise ValueError("Video frame list is empty.")
+
+        # Keep qwen frame-factor behavior without resizing frame resolution.
+        nframes_aligned = ((len(image_list) + 1) // 2) * 2
+        if len(image_list) < nframes_aligned:
+            image_list.extend([image_list[-1]] * (nframes_aligned - len(image_list)))
+
+        sample_fps = video.get("sample_fps", 0.5)
+        video_tensor = torch.stack(
+            [torch.from_numpy(np.array(image).transpose(2, 0, 1)) for image in image_list]
+        )
+        raw_fps = video.get("raw_fps", sample_fps)
+        video_metadata = dict(
+            fps=raw_fps,
+            frames_indices=[i for i in range(len(video_tensor))],
+            total_num_frames=(nframes_aligned / sample_fps) * raw_fps,
+        )
+
+        final_video = (video_tensor, video_metadata) if return_video_metadata else video_tensor
+        if return_video_sample_fps:
+            return final_video, sample_fps
+        return final_video
 
     return fetch_video(
         video,

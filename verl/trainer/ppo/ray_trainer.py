@@ -682,8 +682,8 @@ class RayPPOTrainer:
                 dtype=object,
             )
 
-        # If this actor rollout is labeled as "critic" or "motion", require backend
-        # to append exactly one new response per row to the corresponding key.
+        # If this actor rollout is labeled as "critic" or "motion", ensure there is
+        # exactly one newly generated response appended per row before validation.
         response_role = self.config.actor_rollout_ref.rollout.get("response_role")
         if response_role in ("critic", "motion"):
             response_key = "critic_response" if response_role == "critic" else "motion_response"
