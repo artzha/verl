@@ -1405,6 +1405,11 @@ class CriticWorker(Worker, DistProfilerExtension):
                 }
                 critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))
 
+            if self.rank == 0:
+                lora_trainable = [n for n, p in critic_module.named_parameters() if p.requires_grad and "lora_" in n]
+                print(f"[LoRA] trainable LoRA params: {len(lora_trainable)}")
+                print("\n".join(lora_trainable[:20]))
+
         if self.rank == 0:
             print_model_size(critic_module)
 

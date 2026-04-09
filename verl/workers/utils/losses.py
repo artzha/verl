@@ -148,7 +148,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
-    pg_loss, pg_metrics = policy_loss_fn(
+    policy_loss_kwargs = dict(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
         advantages=advantages,
@@ -157,6 +157,10 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         config=config,
         rollout_is_weights=rollout_is_weights,
     )
+    if loss_mode == "topk_ce":
+        policy_loss_kwargs["topk_ce_mask"] = data.get("topk_ce_mask", None)
+        policy_loss_kwargs["token_level_rewards"] = data.get("token_level_rewards", None)
+    pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kwargs)
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
@@ -178,6 +182,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     # add kl loss
     if config.use_kl_loss:
         ref_log_prob = data["ref_log_prob"]
+        # Cast ref_log_prob to match log_prob dtype so loss and gradients match actor params
+        # (ref often runs in fp32; mixing dtypes can cause gradient/param dtype mismatch in FSDP)
+        ref_log_prob = ref_log_prob.to(log_prob.dtype)
         # compute kl loss
         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
         kl_loss = agg_loss(

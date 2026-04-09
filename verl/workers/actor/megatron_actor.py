@@ -492,7 +492,7 @@ class MegatronPPOActor(BasePPOActor):
                 # Extract pre-computed rollout correction weights if present
                 # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                 rollout_is_weights = data.get("rollout_is_weights", None)
-                pg_loss, pg_metrics = policy_loss_fn(
+                policy_loss_kwargs = dict(
                     old_log_prob=old_log_prob,
                     log_prob=log_prob,
                     advantages=advantages,
@@ -501,6 +501,10 @@ class MegatronPPOActor(BasePPOActor):
                     config=self.config,
                     rollout_is_weights=rollout_is_weights,
                 )
+                if loss_mode == "topk_ce":
+                    policy_loss_kwargs["topk_ce_mask"] = data.get("topk_ce_mask", None)
+                    policy_loss_kwargs["token_level_rewards"] = data.get("token_level_rewards", None)
+                pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kwargs)
                 stats.update(pg_metrics)
 
                 # Skip if using bypass_mode loss (metrics already computed in pg_metrics)

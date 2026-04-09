@@ -124,8 +124,14 @@ class vLLMAsyncRollout(BaseRollout):
         self.tokenizer = self.model_config.tokenizer
         self.inference_engine: WorkerWrapperBase = None
         self.address = self._init_zeromq()
+        vllm_engine_kwargs = (self.config.engine_kwargs or {}).get("vllm", {})
+        enable_tower_connector_lora = bool(vllm_engine_kwargs.get("enable_tower_connector_lora", False))
         self.lora_config = (
-            {"max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank)}
+            {
+                "max_loras": 1,
+                "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank),
+                "enable_tower_connector_lora": enable_tower_connector_lora,
+            }
             if self.model_config.lora_rank > 0
             else {}
         )
@@ -214,6 +220,14 @@ class vLLMAsyncRollout(BaseRollout):
         if self.lora_config:
             lora_dtype = getattr(torch, self.config.dtype)
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
+        lora_cfg = getattr(self.vllm_config, "lora_config", None)
+        logger.warning(
+            "WorkerDict init: pid=%s model=%s enable_lora=%s enable_tower_connector_lora=%s",
+            os.getpid(),
+            getattr(getattr(self.vllm_config, "model_config", None), "model", "unknown"),
+            lora_cfg is not None,
+            getattr(lora_cfg, "enable_tower_connector_lora", None),
+        )
         if self.config.quantization is not None:
             _SUPPORTED_QUANTIZATION = ["fp8", "torchao"]
             if self.config.quantization not in _SUPPORTED_QUANTIZATION:

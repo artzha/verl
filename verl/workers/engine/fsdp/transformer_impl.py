@@ -519,6 +519,8 @@ class FSDPEngine(BaseEngine):
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
+                    # FSDP2 can keep params in float32; cast loss to float32 so gradients match param dtype and avoid assign error
+                    loss = loss.float()
                     loss.backward()
 
             output_lst.append(meta_info)
@@ -1006,9 +1008,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
 
+            # Keep loss as tensor to avoid GPU-CPU sync every micro_batch (improves utilization).
+            # _postprocess_output will sum and .item() once at the end.
             output = {
                 "model_output": model_output,
-                "loss": loss.detach().item(),
+                "loss": loss.detach(),
                 "metrics": metrics,
             }
 

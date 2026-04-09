@@ -31,6 +31,9 @@ model:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.FSDPCriticModelCfg
 
+  # Whether to freeze the vision tower (for multimodal critics like Qwen-VL)
+  freeze_vision_tower: False
+
   # Whether to use shared memory for loading the model
   use_shm: False
 

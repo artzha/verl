@@ -32,7 +32,6 @@ from PIL import Image
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
-from qwen_vl_utils import process_vision_info
 
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.agent_loop.utils import resolve_config_path
@@ -52,10 +51,8 @@ from verl.utils.rollout_trace import (
 )
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
-from cotnav.core.constants import MOTION_START_TOKEN, MOTION_END_TOKEN, MOTION_GOAL_TOKEN, LANGUAGE_GOAL_TOKEN
+from verl.trainer.ppo import prompt_utils as prompt_utils_ppo
 from cotnav.core.format import text_to_llava
-from cotnav.models.vlms.interface import OutputFormat, parse_and_unify
-from cotnav.utils.draw import draw_polyline
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -356,26 +353,29 @@ class AgentLoopWorker:
         config: DictConfig,
         server_handles: list[ray.actor.ActorHandle],
         reward_router_address: str = None,
-        motion_server_handles: Optional[list[ray.actor.ActorHandle]] = None,
+        extra_server_handles: Optional[dict[str, list]] = None,
+        extra_rollouts_list: Optional[list] = None,
     ):
-        """Initialize agent loop manager.
+        """Initialize agent loop worker.
+
         Args:
-            config (DictConfig): YAML config.
-            server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
-            reward_router_address (str): reward router address.
+            config: YAML config.
+            server_handles: OpenAI compatible LLM server actor handles (primary rollout).
+            reward_router_address: reward router address.
+            extra_server_handles: Optional dict mapping rollout name -> list of server handles.
+            extra_rollouts_list: Optional list of extra rollout configs (each with name, model, rollout, prompt_paths).
         """
         self.config = config
 
-        # for recipe to change
         if not hasattr(self, "server_manager"):
             self.server_manager = AsyncLLMServerManager(config, server_handles)
 
         self.dataset_cls = get_dataset_class(config.data)
         self.reward_router_address = reward_router_address
-        self.motion_server_manager = None
-        self.motion_tokenizer = None
-        self.motion_processor = None
-        self.motion_prompts = {}
+        self.extra_managers = {}
+        self.extra_tokenizers = {}
+        self.extra_processors = {}
+        self.extra_prompts = {}
 
         model_path = config.actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
@@ -383,22 +383,30 @@ class AgentLoopWorker:
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
         self.processor = hf_processor(local_path, trust_remote_code=True)
 
-        if motion_server_handles:
-            self.motion_server_manager = AsyncLLMServerManager(config, motion_server_handles)
-            motion_model_cfg = self.config.actor_rollout_ref.motion.model
-            motion_local_path = copy_to_local(motion_model_cfg.path)
-            motion_trust = getattr(motion_model_cfg, "trust_remote_code", True)
-            self.motion_tokenizer = hf_tokenizer(motion_local_path, trust_remote_code=motion_trust)
-            self.motion_processor = hf_processor(motion_local_path, trust_remote_code=motion_trust)
-            motion_template = motion_model_cfg.get("custom_chat_template", None)
-            if motion_template is not None:
-                if self.motion_processor is not None:
-                    self.motion_processor.chat_template = motion_template
-                self.motion_tokenizer.chat_template = motion_template
-            prompt_paths = getattr(self.config.actor_rollout_ref.motion, "prompt_paths", {}) or {}
+        extra_server_handles = extra_server_handles or {}
+        extra_rollouts_list = extra_rollouts_list if extra_rollouts_list is not None else []
+        for entry in extra_rollouts_list:
+            name = entry.name
+            handles = extra_server_handles.get(name)
+            if not handles:
+                continue
+            self.extra_managers[name] = AsyncLLMServerManager(config, handles)
+            model_cfg = entry.model
+            local_path = copy_to_local(model_cfg.path)
+            trust = getattr(model_cfg, "trust_remote_code", True)
+            self.extra_tokenizers[name] = hf_tokenizer(local_path, trust_remote_code=trust)
+            self.extra_processors[name] = hf_processor(local_path, trust_remote_code=trust)
+            template = getattr(model_cfg, "custom_chat_template", None)
+            if template is not None:
+                if self.extra_processors[name] is not None:
+                    self.extra_processors[name].chat_template = template
+                self.extra_tokenizers[name].chat_template = template
+            prompt_paths = getattr(entry, "prompt_paths", None) or {}
+            prompts = {}
             for key, path in prompt_paths.items():
                 with open(path, "r") as handle:
-                    self.motion_prompts[key] = text_to_llava(handle.read(), role="user")
+                    prompts[key] = text_to_llava(handle.read(), role="user")
+            self.extra_prompts[name] = prompts
 
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
         if agent_loop_config_path:
@@ -432,127 +440,7 @@ class AgentLoopWorker:
 
     def draw_path(self, new_non_tensor: dict, cur_idx: int = 0) -> dict:
         """Parse motion response strings and draw polylines on the source image."""
-        assert "motion_responses" in new_non_tensor, "Expected motion_responses in non_tensor_batch."
-        motion_responses = new_non_tensor["motion_responses"]
-        images = []
-        traces = []
-        for i, trace_list in enumerate(motion_responses):
-            trace_str = trace_list[0] if isinstance(trace_list, (list, tuple, np.ndarray)) else trace_list
-            try:
-                payload = parse_and_unify(trace_str, OutputFormat.TRAJECTORY_V1)
-            except (ValueError, TypeError):
-                payload = None
-
-            if hasattr(payload, "unified") and "trajectory" in payload.unified:
-                trace = payload.unified["trajectory"]
-            else:
-                trace = None
-
-            traces.append(trace)
-            if trace is None:
-                images.append(None)
-                continue
-
-            cur_img = new_non_tensor["multi_modal_data"][i]["image"][cur_idx]
-            ann_img = draw_polyline(trace, np.array(cur_img), line_thickness=2, color=(255, 255, 51))
-            images.append(Image.fromarray(ann_img))
-
-        return {"trace": traces, "image": images}
-
-    def format_prompt(
-        self,
-        non_tensor_dict,
-        i: int,
-        prompt_msg,
-        prev_message=None
-    ):
-        """Format prompt with tokens"""
-        extra = non_tensor_dict['extra_info'][i]
-        vgoal = extra.get('vgoal', [])  # (1, 2) normalized coords
-        semantic_goal = extra.get('semantic_goal', '')
-        if len(vgoal) > 0:
-            vgoal_str = f"[{vgoal[0][0]:.3f}, {vgoal[0][1]:.3f}]"
-        else:
-            vgoal_str = "[N/A, N/A]"
-
-        prompt_template = prompt_msg['content'][0]['text']
-        prompt = prompt_template.replace(
-            LANGUAGE_GOAL_TOKEN, semantic_goal
-        ).replace(
-            MOTION_GOAL_TOKEN, vgoal_str
-        )
-
-        if prev_message is not None:
-            try:
-                payload = parse_and_unify(prev_message[0]['text'], OutputFormat.TRAJECTORY_V1)
-                trace_pts = payload.unified["trajectory"]  # (N, 2) normalized coords
-                trace_pts_str = "[" + ", ".join([f"[{pt[0]:.3f}, {pt[1]:.3f}]" for pt in trace_pts]) + "]"
-                prompt = prompt.replace(
-                    f"{MOTION_START_TOKEN}{MOTION_END_TOKEN}", trace_pts_str
-                )
-            except (ValueError, TypeError):
-                pass
-        prompt_msg['content'][0]['text'] = prompt
-        return prompt_msg
-
-    def update_prompt(
-        self,
-        non_tensor_dict: dict,
-        i: int,
-        response_text: str,
-        ann=None,
-        prefill=None,
-        postfill=None,
-    ):
-        """Update raw_prompt/full_prompts/multi_modal_data in place with prefill/postfill."""
-        messages = list(non_tensor_dict["raw_prompt"][i])
-        if messages and isinstance(messages[0], list):
-            raise RuntimeError(
-                f"raw_prompt[{i}] is nested (list of lists); expected list of dicts. "
-                "Check upstream raw_prompt construction."
-            )
-    
-        if prefill is not None:
-            if prefill not in self.motion_prompts:
-                raise RuntimeError(f"Unknown prefill key {prefill}")
-            prefill_msg = copy.deepcopy(self.motion_prompts[prefill])
-            prefill_msg = self.format_prompt(
-                non_tensor_dict,
-                i,
-                prompt_msg=prefill_msg,
-                prev_message=messages[-1]["content"] if messages else None
-            )
-            if not messages or messages[-1] != prefill_msg:
-                messages.append(copy.deepcopy(prefill_msg))
-
-        messages.append(text_to_llava(response_text, role="assistant"))
-
-        if postfill is not None:
-            if postfill not in self.motion_prompts:
-                raise RuntimeError(f"Unknown postfill key {postfill}")
-            post_msg = copy.deepcopy(self.motion_prompts[postfill])
-            post_msg = self.format_prompt(
-                non_tensor_dict,
-                i,
-                prompt_msg=post_msg,
-                prev_message=messages[-1]["content"] if messages else None
-            )
-            if ann is not None:
-                post_msg["content"].insert(0, {"type": "image", "image": ann})
-            messages.append(post_msg)
-
-        if self.motion_processor is None:
-            raise RuntimeError("motion_processor is required to update prompts")
-        new_full_prompt = self.motion_processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        non_tensor_dict["raw_prompt"][i] = messages
-        non_tensor_dict["full_prompts"][i] = new_full_prompt
-        if ann is not None:
-            non_tensor_dict["multi_modal_data"][i]["image"].append(ann)
+        return prompt_utils_ppo.draw_path(new_non_tensor, cur_idx=cur_idx)
 
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
@@ -631,44 +519,57 @@ class AgentLoopWorker:
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)
+        response_role = self.config.actor_rollout_ref.rollout.get("response_role", None)
+        if response_role in ("critic", "motion"):
+            response_key = "critic_response" if response_role == "critic" else "motion_response"
+            decoded = self.tokenizer.batch_decode(output.batch["responses"], skip_special_tokens=True)
+            assert len(decoded) == len(output), (
+                f"Decoded response rows {len(decoded)} must match output batch size {len(output)}"
+            )
+
+            pre_existing = batch.non_tensor_batch.get(response_key, None)
+            if pre_existing is None:
+                output.non_tensor_batch[response_key] = np.array([[resp] for resp in decoded], dtype=object)
+            else:
+                existing_list = pre_existing.tolist()
+                assert len(existing_list) == len(decoded), (
+                    f"Existing `{response_key}` rows {len(existing_list)} "
+                    f"must match decoded rows {len(decoded)}"
+                )
+                assert all(isinstance(row, list) for row in existing_list), (
+                    f"Expected `{response_key}` rows to be list[str] history."
+                )
+                output.non_tensor_batch[response_key] = np.array(
+                    [prev + [resp] for prev, resp in zip(existing_list, decoded)], dtype=object
+                )
 
         return output
 
     @tqbridge()
     async def generate_motion_sequences(self, batch: DataProto) -> DataProto:
-        """Generate motion sequences via the motion async rollout servers."""
-        if self.motion_server_manager is None:
-            raise RuntimeError("motion_server_manager is not initialized; check config.actor_rollout_ref.motion_rollout")
-        if self.motion_tokenizer is None:
-            raise RuntimeError("motion_tokenizer is not initialized; check motion model config")
-
-        def prepare_inputs_for_vllm(messages: list[dict]) -> dict[str, Any]:
-            if self.motion_processor is None:
-                raise RuntimeError("motion_processor is required to build prompts from raw_prompt")
-            text = self.motion_processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
+        """Generate motion sequences via extra_rollouts['motion']."""
+        if "motion" not in self.extra_managers:
+            raise RuntimeError(
+                "motion rollout is not initialized; add a 'motion' entry to config.actor_rollout_ref.extra_rollouts"
             )
-            image_inputs, video_inputs, _video_kwargs = process_vision_info(
-                messages,
-                image_patch_size=self.motion_processor.image_processor.patch_size,
-                return_video_kwargs=True,
-                return_video_metadata=True,
-            )
-            mm_data = {}
-            if image_inputs is not None:
-                mm_data["image"] = image_inputs
-            if video_inputs is not None:
-                mm_data["video"] = video_inputs
-            return {"prompt": text, "multi_modal_data": mm_data}
-
-        motion_cfg = self.config.actor_rollout_ref.motion_rollout
+        motion_manager = self.extra_managers["motion"]
+        motion_tokenizer = self.extra_tokenizers["motion"]
+        motion_processor = self.extra_processors.get("motion")
+        motion_prompts = self.extra_prompts.get("motion", {})
+        
+        extra_list = OmegaConf.select(self.config.actor_rollout_ref, "extra_rollouts")
+        motion_cfg = (
+            next((e.rollout for e in extra_list if e.name == "motion"), None)
+            if extra_list
+            else None
+        )
+        if motion_cfg is None:
+            motion_cfg = self.config.actor_rollout_ref.rollout
         prefill = batch.meta_info.get("prefill", None)
         postfill = batch.meta_info.get("postfill", None)
         sampling_params = {
-            "temperature": motion_cfg.temperature,
-            "top_p": motion_cfg.top_p,
+            "temperature": getattr(motion_cfg, "temperature", 1.0),
+            "top_p": getattr(motion_cfg, "top_p", 0.95),
             "repetition_penalty": getattr(motion_cfg, "repetition_penalty", 1.0),
         }
         if getattr(motion_cfg, "response_length", None) is not None:
@@ -679,28 +580,29 @@ class AgentLoopWorker:
         new_non_tensor = copy.deepcopy(batch.non_tensor_batch)
         full_prompts = new_non_tensor.get("full_prompts")
         raw_prompt = new_non_tensor.get("raw_prompt")
-        vllm_prompts = None
         raw_prompt_list = None
         if raw_prompt is not None:
-            raw_prompt_list = raw_prompt.tolist() if hasattr(raw_prompt, "tolist") else raw_prompt
+            raw_prompt_list = raw_prompt.tolist() if hasattr(raw_prompt, "tolist") else list(raw_prompt)
             for i, msgs in enumerate(raw_prompt_list):
                 if isinstance(msgs, list) and msgs and isinstance(msgs[0], list):
                     raise RuntimeError(
                         f"raw_prompt[{i}] is nested (list of lists); expected list of dicts. "
                         "Check upstream raw_prompt construction."
                     )
-            if prefill is not None:
-                if prefill not in self.motion_prompts:
-                    raise RuntimeError(f"Unknown prefill key {prefill}")
-                prefill_msg = self.motion_prompts[prefill]
-                prefill_msg = self.format_prompt(
-                    new_non_tensor,
-                    i,
-                    prompt_msg=prefill_msg,
-                    prev_message=msgs[-1]["content"] if msgs else None
-                )
-                raw_prompt_list = [msgs + [prefill_msg] for msgs in raw_prompt_list]
-            vllm_prompts = [prepare_inputs_for_vllm(messages) for messages in raw_prompt_list]
+            if prefill is not None and prefill in motion_prompts:
+                prefill_msg_list = []
+                for i, msgs in enumerate(raw_prompt_list):
+                    prefill_msg = copy.deepcopy(motion_prompts[prefill])
+                    prompt_utils_ppo.format_prompt(
+                        new_non_tensor, i, prefill_msg,
+                        prev_message=msgs[-1]["content"] if msgs else None,
+                    )
+                    prefill_msg_list.append(prefill_msg)
+                raw_prompt_list = [msgs + [copy.deepcopy(pfm)] for msgs, pfm in zip(raw_prompt_list, prefill_msg_list)]
+            vllm_prompts = [
+                prompt_utils_ppo.prepare_inputs_for_vllm(messages, motion_processor)
+                for messages in raw_prompt_list
+            ]
             full_prompts = np.array([p["prompt"] for p in vllm_prompts], dtype=object)
             new_non_tensor["raw_prompt"] = raw_prompt_list
             new_non_tensor["full_prompts"] = [p["prompt"] for p in vllm_prompts]
@@ -711,9 +613,9 @@ class AgentLoopWorker:
         multi_modal_data = new_non_tensor.get("multi_modal_data")
         uid = new_non_tensor.get("uid")
         tasks = []
-
-        prompt_ids_list = self.motion_tokenizer.batch_encode_plus(
-            full_prompts.tolist(),
+        full_prompts_list = full_prompts.tolist() if hasattr(full_prompts, "tolist") else full_prompts
+        prompt_ids_list = motion_tokenizer.batch_encode_plus(
+            full_prompts_list,
             add_special_tokens=False,
             return_attention_mask=False,
             return_token_type_ids=False,
@@ -729,7 +631,7 @@ class AgentLoopWorker:
             request_id = uid[i] if uid is not None else uuid4().hex
             tasks.append(
                 asyncio.create_task(
-                    self.motion_server_manager.generate(
+                    motion_manager.generate(
                         request_id=request_id,
                         prompt_ids=prompt_ids,
                         sampling_params=dict(sampling_params),
@@ -739,16 +641,16 @@ class AgentLoopWorker:
             )
 
         outputs = await asyncio.gather(*tasks)
-        responses = self.motion_tokenizer.batch_decode(
+        responses = motion_tokenizer.batch_decode(
             [out.token_ids for out in outputs],
             skip_special_tokens=True,
         )
 
-        if new_non_tensor.get("motion_responses", None) is None:
-            new_non_tensor["motion_responses"] = np.array([[r] for r in responses], dtype=object)
+        if new_non_tensor.get("motion_response", None) is None:
+            new_non_tensor["motion_response"] = np.array([[r] for r in responses], dtype=object)
         else:
-            old = new_non_tensor["motion_responses"].tolist()
-            new_non_tensor["motion_responses"] = np.array(
+            old = new_non_tensor["motion_response"].tolist()
+            new_non_tensor["motion_response"] = np.array(
                 [prev + [resp] for prev, resp in zip(old, responses)], dtype=object
             )
 
@@ -764,21 +666,216 @@ class AgentLoopWorker:
         ann_payload = self.draw_path(new_non_tensor, cur_idx=0)
         for i in range(len(responses)):
             ann_img = ann_payload["image"][i]
-            self.update_prompt(
+            prompt_utils_ppo.update_prompt_after_response(
                 new_non_tensor,
                 i,
                 responses[i],
-                ann_img,
-                prefill,
-                postfill,
+                motion_processor,
+                motion_prompts,
+                prefill=prefill,
+                postfill=postfill,
+                ann=ann_img,
+                format_prompt_fn=prompt_utils_ppo.format_prompt,
             )
-
         new_non_tensor["full_prompts"] = np.array(new_non_tensor["full_prompts"], dtype=object)
         new_non_tensor["raw_prompt"] = np.array(new_non_tensor["raw_prompt"], dtype=object)
         if new_non_tensor.get("multi_modal_data") is not None:
             new_non_tensor["multi_modal_data"] = np.array(new_non_tensor["multi_modal_data"], dtype=object)
 
         return DataProto(batch=batch.batch, non_tensor_batch=new_non_tensor, meta_info=batch.meta_info)
+
+    @tqbridge()
+    async def generate_judge_sequences(self, batch: DataProto) -> DataProto:
+        """Generate judge/critic text using the critic extra rollout. Updates raw_prompt, full_prompts, and multi_modal_data the same way as generate_motion_sequences (via update_prompt_after_response) so the next rollout step sees the critic response and optional postfill in the conversation."""
+        if "critic" not in self.extra_managers:
+            raise RuntimeError(
+                "critic rollout is not initialized; add a 'critic' entry to config.actor_rollout_ref.extra_rollouts"
+            )
+        critic_manager = self.extra_managers["critic"]
+        critic_tokenizer = self.extra_tokenizers["critic"]
+        critic_processor = self.extra_processors.get("critic")
+        critic_prompts = self.extra_prompts.get("critic", {})
+        full_prompts = batch.non_tensor_batch.get("full_prompts")
+        if full_prompts is None:
+            raise RuntimeError("generate_judge_sequences requires full_prompts in non_tensor_batch")
+        full_prompts_list = full_prompts.tolist() if hasattr(full_prompts, "tolist") else full_prompts
+        multi_modal_data = batch.non_tensor_batch.get("multi_modal_data")
+        uid = batch.non_tensor_batch.get("uid")
+        prefill = batch.meta_info.get("prefill", None)
+        postfill = batch.meta_info.get("postfill", None)
+        extra_list = OmegaConf.select(self.config.actor_rollout_ref, "extra_rollouts") or []
+        rollout_cfg = next(
+            (e.rollout for e in extra_list if e.name == "critic"),
+            self.config.actor_rollout_ref.rollout,
+        )
+        sampling_params = {
+            "temperature": getattr(rollout_cfg, "temperature", 0.0),
+            "top_p": getattr(rollout_cfg, "top_p", 1.0),
+            "repetition_penalty": getattr(rollout_cfg, "repetition_penalty", 1.0),
+        }
+        if getattr(rollout_cfg, "response_length", None) is not None:
+            sampling_params["max_tokens"] = rollout_cfg.response_length
+        prompt_ids_list = critic_tokenizer.batch_encode_plus(
+            full_prompts_list,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        prompt_ids_batch = prompt_ids_list["input_ids"]
+        tasks = []
+        for i in range(len(batch)):
+            image_data = None
+            if multi_modal_data is not None:
+                item = multi_modal_data[i].item() if hasattr(multi_modal_data[i], "item") else multi_modal_data[i]
+                if isinstance(item, dict):
+                    image_data = item.get("image")
+            request_id = uid[i] if uid is not None else uuid4().hex
+            tasks.append(
+                asyncio.create_task(
+                    critic_manager.generate(
+                        request_id=request_id,
+                        prompt_ids=prompt_ids_batch[i],
+                        sampling_params=dict(sampling_params),
+                        image_data=image_data,
+                    )
+                )
+            )
+        outputs = await asyncio.gather(*tasks)
+        responses = critic_tokenizer.batch_decode(
+            [out.token_ids for out in outputs],
+            skip_special_tokens=True,
+        )
+        new_non_tensor = copy.deepcopy(batch.non_tensor_batch)
+        new_non_tensor["critic_response"] = np.array(responses, dtype=object)
+
+        if critic_processor is not None and "raw_prompt" in new_non_tensor:
+            raw_prompt_val = new_non_tensor.get("raw_prompt")
+            if isinstance(raw_prompt_val, np.ndarray):
+                new_non_tensor["raw_prompt"] = raw_prompt_val.tolist()
+            full_prompts_val = new_non_tensor.get("full_prompts")
+            if isinstance(full_prompts_val, np.ndarray):
+                new_non_tensor["full_prompts"] = full_prompts_val.tolist()
+            multi_modal_val = new_non_tensor.get("multi_modal_data")
+            if isinstance(multi_modal_val, np.ndarray):
+                new_non_tensor["multi_modal_data"] = multi_modal_val.tolist()
+            for i in range(len(responses)):
+                prompt_utils_ppo.update_prompt_after_response(
+                    new_non_tensor,
+                    i,
+                    responses[i],
+                    critic_processor,
+                    critic_prompts,
+                    prefill=prefill,
+                    postfill=postfill,
+                    ann=None,
+                    format_prompt_fn=prompt_utils_ppo.format_prompt,
+                )
+            new_non_tensor["full_prompts"] = np.array(new_non_tensor["full_prompts"], dtype=object)
+            new_non_tensor["raw_prompt"] = np.array(new_non_tensor["raw_prompt"], dtype=object)
+            if new_non_tensor.get("multi_modal_data") is not None:
+                new_non_tensor["multi_modal_data"] = np.array(new_non_tensor["multi_modal_data"], dtype=object)
+
+        return DataProto(batch=batch.batch, non_tensor_batch=new_non_tensor, meta_info=batch.meta_info)
+
+    @tqbridge()
+    async def generate_actor_rollouts_sync(self, chunk: DataProto) -> DataProto:
+        """Generate rollouts from the primary actor only (no agent loop, no tools). Returns DataProto with prompts, responses, input_ids, attention_mask, position_ids, response_mask."""
+        config = self.config.actor_rollout_ref.rollout
+        sampling_params = dict(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
+        )
+        full_prompts = chunk.non_tensor_batch.get("full_prompts")
+        if full_prompts is None:
+            raise RuntimeError("generate_actor_rollouts_sync requires full_prompts in non_tensor_batch")
+        full_prompts_list = full_prompts.tolist() if hasattr(full_prompts, "tolist") else full_prompts
+        multi_modal_data = chunk.non_tensor_batch.get("multi_modal_data")
+        uid = chunk.non_tensor_batch.get("uid")
+        prompt_ids_list = self.tokenizer.batch_encode_plus(
+            full_prompts_list,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        prompt_ids_batch = prompt_ids_list["input_ids"]
+        tasks = []
+        for i in range(len(chunk)):
+            image_data = None
+            if multi_modal_data is not None:
+                item = multi_modal_data[i]
+                if isinstance(item, dict):
+                    image_data = item.get("image")
+            request_id = uid[i] if uid is not None else uuid4().hex
+            tasks.append(
+                asyncio.create_task(
+                    self.server_manager.generate(
+                        request_id=request_id,
+                        prompt_ids=prompt_ids_batch[i],
+                        sampling_params=dict(sampling_params),
+                        image_data=image_data,
+                    )
+                )
+            )
+        outputs = await asyncio.gather(*tasks)
+        response_ids_list = [out.token_ids for out in outputs]
+        responses_decoded = self.tokenizer.batch_decode(response_ids_list, skip_special_tokens=True)
+        prompt_length = config.prompt_length
+        response_length = config.response_length
+        self.tokenizer.padding_side = "left"
+        prompt_tensors = []
+        response_tensors = []
+        response_mask_tensors = []
+        attention_mask_tensors = []
+        for prompt_ids, response_ids in zip(prompt_ids_batch, response_ids_list):
+            prompt_out = self.tokenizer.pad(
+                {"input_ids": prompt_ids},
+                padding="max_length",
+                max_length=prompt_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            if prompt_out["input_ids"].dim() == 1:
+                prompt_out["input_ids"] = prompt_out["input_ids"].unsqueeze(0)
+                prompt_out["attention_mask"] = prompt_out["attention_mask"].unsqueeze(0)
+            self.tokenizer.padding_side = "right"
+            resp_out = self.tokenizer.pad(
+                {"input_ids": response_ids},
+                padding="max_length",
+                max_length=response_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            if resp_out["input_ids"].dim() == 1:
+                resp_out["input_ids"] = resp_out["input_ids"].unsqueeze(0)
+                resp_out["attention_mask"] = resp_out["attention_mask"].unsqueeze(0)
+            resp_mask = [1] * len(response_ids) + [0] * (response_length - len(response_ids))
+            resp_mask_t = torch.tensor(resp_mask, dtype=torch.long).unsqueeze(0) * resp_out["attention_mask"]
+            prompt_tensors.append(prompt_out["input_ids"])
+            response_tensors.append(resp_out["input_ids"])
+            response_mask_tensors.append(resp_mask_t)
+            attention_mask_tensors.append(
+                torch.cat([prompt_out["attention_mask"], resp_out["attention_mask"]], dim=1)
+            )
+            self.tokenizer.padding_side = "left"
+        prompts_padded = torch.cat(prompt_tensors, dim=0)
+        responses_padded = torch.cat(response_tensors, dim=0)
+        response_mask_padded = torch.cat(response_mask_tensors, dim=0)
+        attention_mask = torch.cat(attention_mask_tensors, dim=0)
+        input_ids = torch.cat([prompts_padded, responses_padded], dim=1)
+        position_ids = compute_position_id_with_mask(attention_mask)
+        batch_dict = {
+            "prompts": prompts_padded,
+            "responses": responses_padded,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "response_mask": response_mask_padded,
+        }
+        new_non_tensor = copy.deepcopy(chunk.non_tensor_batch)
+        new_non_tensor["responses_decoded"] = np.array(responses_decoded, dtype=object)
+        return DataProto(batch=batch_dict, non_tensor_batch=new_non_tensor, meta_info=chunk.meta_info)
 
     async def _run_agent_loop(
         self,
@@ -1179,23 +1276,25 @@ class AgentLoopManager:
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
 
         self._initialize_llm_servers()
-        self.motion_rollout_replicas = []
-        self.motion_server_handles = []
-        self.motion_server_addresses = []
+        self.extra_rollout_replicas = {}
+        self.extra_server_handles = {}
+        self.extra_server_addresses = {}
+        self.extra_rollout_wake_up = {}
+        self.extra_rollout_sleep = {}
+        self._extra_rollout_entries = {}
 
-        # Release actor rollout weights before initializing motion servers.
+        # Release actor rollout weights before initializing extra rollout servers.
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.sleep()
-        if (
-            OmegaConf.select(self.config.actor_rollout_ref, "motion_rollout") is not None
-            and OmegaConf.select(self.config.actor_rollout_ref, "motion.model") is not None
-        ):
-            self._initialize_motion_llm_servers()
+
+        self._initialize_extra_rollout_servers()
         self._init_agent_loop_workers()
 
-        # Initially we're in sleep mode.
-        if self.motion_rollout_replicas and self.config.actor_rollout_ref.motion_rollout.free_cache_engine:
-            self.motion_sleep()
+        # Initially put extra rollouts that use free_cache_engine to sleep.
+        for name, replicas in self.extra_rollout_replicas.items():
+            entry = self._extra_rollout_entries.get(name)
+            if entry and getattr(entry.rollout, "free_cache_engine", True) and replicas:
+                self.extra_rollout_sleep[name]()
 
     def _initialize_llm_servers(self):
         rollout_world_size = (
@@ -1250,61 +1349,113 @@ class AgentLoopManager:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
             update_prometheus_config(rollout_config.prometheus, self.server_addresses, rollout_config.name)
 
-    def _initialize_motion_llm_servers(self):
-        motion_rollout_cfg = self.config.actor_rollout_ref.motion_rollout
-        motion_model_cfg = self.config.actor_rollout_ref.motion.model
-        motion_rollout_world_size = (
-            motion_rollout_cfg.tensor_model_parallel_size
-            * motion_rollout_cfg.data_parallel_size
-            * motion_rollout_cfg.pipeline_model_parallel_size
-        )
+    def _initialize_extra_rollout_servers(self):
+        extra_rollouts_list = OmegaConf.select(self.config.actor_rollout_ref, "extra_rollouts")
+        if extra_rollouts_list is None or (hasattr(extra_rollouts_list, "__len__") and len(extra_rollouts_list) == 0):
+            return
+
         world_size = (
             self.worker_group.world_size
             if self.worker_group
             else self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
         )
-        if world_size % motion_rollout_world_size != 0:
-            raise ValueError(
-                "motion rollout world_size mismatch: "
-                f"world_size={world_size} is not divisible by motion_rollout_world_size={motion_rollout_world_size}"
-            )
-        num_replicas = world_size // motion_rollout_world_size
 
-        motion_replica_class = get_rollout_replica_class(motion_rollout_cfg.name)
-        self.motion_rollout_replicas = [
-            motion_replica_class(
-                replica_rank=replica_rank,
-                config=motion_rollout_cfg,
-                model_config=motion_model_cfg,
-                gpus_per_node=self.config.trainer.n_gpus_per_node,
-            )
-            for replica_rank in range(num_replicas)
-        ]
+        for entry in extra_rollouts_list:
+            name = entry.name
+            rollout_cfg = entry.rollout
+            model_cfg = entry.model
+            sync_with_actor = entry.get("sync_with_actor", False)
 
-        if self.worker_group:
-            if self.rollout_resource_pool is None:
-                raise ValueError(
-                    "Motion rollout is configured for colocated mode, but rollout_resource_pool is missing."
+            # vLLM sleep mode allows only one instance per process. When motion (or any extra)
+            # syncs with the actor, use the primary rollout instead of creating a second hybrid.
+            if sync_with_actor and self.worker_group:
+                self.extra_rollout_replicas[name] = []
+                self.extra_server_handles[name] = list(self.server_handles)
+                self.extra_server_addresses[name] = list(self.server_addresses)
+                self._extra_rollout_entries[name] = entry
+                self.extra_rollout_wake_up[name] = self.wake_up
+                self.extra_rollout_sleep[name] = self.sleep
+                logger.info(
+                    "AgentLoopManager: extra rollout '%s' uses primary rollout (sync_with_actor=true, one vLLM per process).",
+                    name,
                 )
-            logger.info("AgentLoopManager: initializing motion rollout in colocated mode.")
-            self._run_all([server.init_colocated(self.rollout_resource_pool) for server in self.motion_rollout_replicas])
-        else:
-            self._run_all([server.init_standalone() for server in self.motion_rollout_replicas])
+                continue
 
-        self.motion_server_handles = [server._server_handle for server in self.motion_rollout_replicas]
-        self.motion_server_addresses = [server._server_address for server in self.motion_rollout_replicas]
-        print(f"AgentLoopManager (motion): {self.motion_server_addresses}")
-
-        if motion_rollout_cfg.prometheus.enable:
-            if motion_rollout_cfg.disable_log_stats:
-                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
-            update_prometheus_config(
-                motion_rollout_cfg.prometheus, self.motion_server_addresses, f"{motion_rollout_cfg.name}_motion"
+            rollout_world_size = (
+                rollout_cfg.tensor_model_parallel_size
+                * rollout_cfg.data_parallel_size
+                * rollout_cfg.pipeline_model_parallel_size
             )
+            if world_size % rollout_world_size != 0:
+                raise ValueError(
+                    f"extra rollout '{name}' world_size mismatch: "
+                    f"world_size={world_size} is not divisible by rollout_world_size={rollout_world_size}"
+                )
+            num_replicas = world_size // rollout_world_size
+
+            replica_class = get_rollout_replica_class(rollout_cfg.name)
+            replicas = [
+                replica_class(
+                    replica_rank=replica_rank,
+                    config=rollout_cfg,
+                    model_config=model_cfg,
+                    gpus_per_node=self.config.trainer.n_gpus_per_node,
+                )
+                for replica_rank in range(num_replicas)
+            ]
+
+            if self.rollout_resource_pool is not None:
+                logger.info("AgentLoopManager: initializing extra rollout '%s' in colocated mode.", name)
+                if num_replicas > 1:
+                    # Multiple replicas share the same pool; each must use only its slice of workers
+                    # so that len(workers) == world_size (tp * dp * pp) per replica.
+                    shared_wg = RayWorkerGroup(
+                        resource_pool=self.rollout_resource_pool,
+                        ray_cls_with_init=replicas[0].get_ray_class_with_init_args(),
+                        bin_pack=False,
+                        name_prefix=f"rollout_colocate_extra_{name}",
+                    )
+                    self._run_all(
+                        [
+                            server.init_colocated(worker_group=shared_wg, replica_rank=i)
+                            for i, server in enumerate(replicas)
+                        ]
+                    )
+                else:
+                    self._run_all([server.init_colocated(self.rollout_resource_pool) for server in replicas])
+            else:
+                self._run_all([server.init_standalone() for server in replicas])
+
+            self.extra_rollout_replicas[name] = replicas
+            self.extra_server_handles[name] = [s._server_handle for s in replicas]
+            self.extra_server_addresses[name] = [s._server_address for s in replicas]
+            self._extra_rollout_entries[name] = entry
+
+            def _make_wake_sleep(replica_list):
+                def wake():
+                    self._run_all([r.wake_up() for r in replica_list])
+
+                def sleep():
+                    self._run_all([r.sleep() for r in replica_list])
+
+                return wake, sleep
+
+            wake_fn, sleep_fn = _make_wake_sleep(replicas)
+            self.extra_rollout_wake_up[name] = wake_fn
+            self.extra_rollout_sleep[name] = sleep_fn
+
+            print(f"AgentLoopManager (extra rollout '{name}'): {self.extra_server_addresses[name]}")
+            if getattr(rollout_cfg, "prometheus", None) and getattr(rollout_cfg.prometheus, "enable", False):
+                if getattr(rollout_cfg, "disable_log_stats", True):
+                    raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+                update_prometheus_config(
+                    rollout_cfg.prometheus, self.extra_server_addresses[name], f"{rollout_cfg.name}_{name}"
+                )
 
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
+        extra_rollouts_list = OmegaConf.select(self.config.actor_rollout_ref, "extra_rollouts")
 
         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
         for i in range(num_workers):
@@ -1316,7 +1467,13 @@ class AgentLoopManager:
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
                     ),
-                ).remote(self.config, self.server_handles, self.reward_router_address, self.motion_server_handles)
+                ).remote(
+                    self.config,
+                    self.server_handles,
+                    self.reward_router_address,
+                    self.extra_server_handles,
+                    extra_rollouts_list,
+                )
             )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -1357,12 +1514,12 @@ class AgentLoopManager:
         return output
 
     def generate_motion_sequences(self, prompts: DataProto) -> DataProto:
-        """Generate motion sequences through motion async rollout servers."""
-        if not self.motion_rollout_replicas:
-            raise RuntimeError("motion rollout servers are not initialized; check config.actor_rollout_ref.motion_rollout")
-
-        self.motion_wake_up()
-
+        """Generate motion sequences via extra_rollouts['motion'] (primary when sync_with_actor, else dedicated)."""
+        if "motion" not in self.extra_rollout_wake_up or not self.extra_server_handles.get("motion"):
+            raise RuntimeError(
+                "motion rollout is not initialized; add a 'motion' entry to config.actor_rollout_ref.extra_rollouts"
+            )
+        self.extra_rollout_wake_up["motion"]()
         chunks = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
             [
@@ -1371,8 +1528,50 @@ class AgentLoopManager:
             ]
         )
         output = DataProto.concat(outputs)
+        self.extra_rollout_sleep["motion"]()
+        return output
 
-        self.motion_sleep()
+    def generate_judge_sequences(self, prompts: DataProto) -> DataProto:
+        """Generate judge/critic text via the critic extra rollout servers."""
+        if "critic" not in self.extra_rollout_wake_up:
+            raise RuntimeError(
+                "critic rollout is not initialized; add a 'critic' entry to config.actor_rollout_ref.extra_rollouts"
+            )
+        self.extra_rollout_wake_up["critic"]()
+        chunks = prompts.chunk(len(self.agent_loop_workers))
+        outputs = ray.get(
+            [
+                worker.generate_judge_sequences.remote(chunk)
+                for worker, chunk in zip(self.agent_loop_workers, chunks, strict=True)
+            ]
+        )
+        output = DataProto.concat(outputs)
+        self.extra_rollout_sleep["critic"]()
+        return output
+
+    def generate_extra_rollout_sequences(self, rollout_name: str, prompts: DataProto) -> DataProto:
+        """Generate sequences using a named extra rollout (dispatches to motion or critic)."""
+        if rollout_name == "motion":
+            return self.generate_motion_sequences(prompts)
+        if rollout_name == "critic":
+            return self.generate_judge_sequences(prompts)
+        raise ValueError(
+            f"Unknown extra rollout name '{rollout_name}'; "
+            "supported: 'motion', 'critic'. Add more in AgentLoopManager.generate_extra_rollout_sequences if needed."
+        )
+
+    def generate_actor_rollouts(self, prompts: DataProto) -> DataProto:
+        """Generate rollouts from the primary actor only (no agent loop, no tools)."""
+        self.wake_up()
+        chunks = prompts.chunk(len(self.agent_loop_workers))
+        outputs = ray.get(
+            [
+                worker.generate_actor_rollouts_sync.remote(chunk)
+                for worker, chunk in zip(self.agent_loop_workers, chunks, strict=True)
+            ]
+        )
+        output = DataProto.concat(outputs)
+        self.sleep()
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
@@ -1404,18 +1603,6 @@ class AgentLoopManager:
     def sleep(self):
         """Sleep all rollout replica instances."""
         self._run_all([replica.sleep() for replica in self.rollout_replicas])
-
-    def motion_wake_up(self):
-        """Wake up all motion rollout replica instances."""
-        if not self.motion_rollout_replicas:
-            return
-        self._run_all([replica.wake_up() for replica in self.motion_rollout_replicas])
-
-    def motion_sleep(self):
-        """Sleep all motion rollout replica instances."""
-        if not self.motion_rollout_replicas:
-            return
-        self._run_all([replica.sleep() for replica in self.motion_rollout_replicas])
 
     def clear_kv_cache(self):
         """Clear all rollout kv cache, but don`t sleep."""

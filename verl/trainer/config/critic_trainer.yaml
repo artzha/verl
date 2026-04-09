@@ -20,7 +20,7 @@ defaults:
   # Rollout model config.
   - rollout@actor_rollout_ref.rollout: rollout
 
-  - rollout@actor_rollout_ref.motion_rollout: rollout
+  - rollout@actor_rollout_ref.extra_rollout_rollout: rollout
 
   # Model config.
   - model@actor_rollout_ref.model: hf_model
@@ -38,8 +38,16 @@ defaults:
   # self config override anything above
   - _self_
 
+critic:
+  strategy: fsdp2
+  fsdp_config:
+    model_dtype: bf16
+    strategy: fsdp2
+
 actor_rollout_ref:
   hybrid_engine: true
+  critic_output_format: verdict:v1
+  critic_prompt_path: 'cotnav/prompts/datagen/critic_sft/novgoal/critic_prompt.txt'
 
   external_worker:
     path: cotnav/verl_adapters/workers/hybrid_motion_actor.py
@@ -69,44 +77,33 @@ actor_rollout_ref:
     use_remove_padding: True
 
     # LoRA knobs (VeRL infra) See ppo_megatron_trainer.yaml for definitions
-    lora:
-      type: lora
-
-      rank: 64
-      alpha: 64
-
-      dropout: 0.0
-      target_modules: all-linear
-        # - linear_qkv
-        # - linear_proj
-        # - linear_fc1
-        # - linear_fc2
-
-      # exclude_modules: '.*visual.*'
-      dropout_position: pre
-      lora_A_init_method: xavier
-      lora_B_init_method: zero
-      a2a_experimental: False
-      dtype: null
-      adapter_path: null
-
-      freeze_vision_model: True
-      freeze_vision_projection: True
-      freeze_language_model: True
+    lora_rank: 0.0
+    lora_alpha: 0.0
+    target_modules: all-linear
+    exclude_modules: null
+    # - linear_qkv
+    # - linear_proj
+    # - linear_fc1
+    # - linear_fc2
 
   rollout:
     name: vllm
     mode: async
+    # Return rollout_log_probs during generation so bypass_mode can skip expensive old_log_prob recompute.
+    calculate_log_probs: true
     temperature: 1.0
     top_p: 0.95
     prompt_length: 2048
     response_length: 512
+    # Store actor generations as critic response for reward/logging.
+    response_role: critic
 
     engine_kwargs:
       vllm:
         max_model_len: 4096
         max_num_seqs: 64
         max_num_batched_tokens: 4096
+        gpu_memory_utilization: 0.9
 
     # Required: Allows vllm to load base model
     load_format: safetensors
@@ -114,32 +111,29 @@ actor_rollout_ref:
     # Reduces peak GPU memory usage
     # layered_summon: True
 
-  motion:
-    model:
-      path: Qwen/Qwen3-VL-8B-Instruct
-      trust_remote_code: true
-    prompt_paths: 
-      critic: 'cotnav/models/prompts/datagen/critic_sft/critic_prompt.txt'
-      motion: 'cotnav/models/prompts/datagen/critic_sft/motion_refine_prompt.txt'
+  # Which extra rollouts to run before and after the actor rollout.
+  # before_actor runs motion first to augment actor prompt, then actor generates.
+  # after_actor runs motion refinement on actor output and stores it in extra_info.
+  rollout_generations:
+    before_actor:
+      - rollout: motion
+        postfill: critic
+    after_actor:
+      - rollout: motion
+        prefill: motion
+        response_key: motion_response
 
-  motion_rollout:
+  # Shared rollout config for extra rollouts (replaces deprecated motion_rollout).
+  extra_rollout_rollout:
     name: vllm
     mode: async
-
-    # Sampling parameters
     temperature: 1.0
     top_p: 0.95
     prompt_length: 2048
     response_length: 512
-
-    # dtype: bfloat16
-    # gpu_memory_utilization: 0.7
     tensor_model_parallel_size: 4
-
     enable_chunked_prefill: true
     enable_prefix_caching: true
-
-    # VLLM async engine parameters
     engine_kwargs:
       vllm:
         max_model_len: 4096
@@ -147,27 +141,28 @@ actor_rollout_ref:
         gpu_memory_utilization: 0.9
         dtype: bfloat16
         max_num_batched_tokens: 4096
-        
         swap_space: 0
 
-    # max_prompt_length: 3072
-
-
-    # # Required: Allows vllm to load base model
-    # load_format: safetensors
-
-    # image_patch_size: 16
-    # truncation: error # Safeguard for training stability
-
-    # # generation defaults (can still be overridden by batch.meta_info)
-    # max_tokens: 256 # Keep small to prevent unbounded generations
-    # temperature: 1.1
-    # top_p: 0.95
-    # top_k: 0
-
-    # # make sure this can fit prompt(1024 (mp) + 256 (mr) + 512 (cp) + 1024 (cr) + 256 (mrp) + 256 (mr)
-    # max_model_length: 4096
-    # max_prompt_length: 3072
+  # Extra rollout servers (replaces deprecated motion + motion_rollout).
+  # motion: keep separate from actor so critic remains the trainable target.
+  extra_rollouts:
+    - name: motion
+      model:
+        path: Qwen/Qwen3-VL-8B-Instruct
+        trust_remote_code: true
+      rollout: ${actor_rollout_ref.extra_rollout_rollout}
+      sync_with_actor: false
+      prompt_paths:
+        critic: ${actor_rollout_ref.critic_prompt_path}
+        motion: 'cotnav/prompts/datagen/critic_sft/novgoal/motion_prompt_startgoal.txt'
+    - name: critic
+      model:
+        path: Qwen/Qwen3-VL-8B-Instruct
+        trust_remote_code: true
+      rollout: ${actor_rollout_ref.extra_rollout_rollout}
+      sync_with_actor: true
+      prompt_paths:
+        critic: ${actor_rollout_ref.critic_prompt_path}
 
 reward_model:
   use_reward_loop: false
@@ -177,10 +172,10 @@ custom_reward_function:
 
   # The path to the file containing your customized reward function.
   # If not specified, pre-implemented reward functions will be used.
-  path: /robodata/arthurz/Research/cotnav/cotnav/verl_adapters/rewards/motion_trace.py
+  path: /work/09156/arthurz/stampede3/research/cotnav/cotnav/verl_adapters/rewards/sparse_judge_refine.py
 
   # The name of the reward function within the specified file. Default is 'compute_score'.
-  name: compute_motion_trace_reward
+  name: compute_sparse_judge_reward
 
 # config for the algorithm
 algorithm:

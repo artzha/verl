@@ -144,7 +144,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # perform all gather in dp group to ensure that it's correct.
         # Here each metric in metrics can be a list (micro-batch metrics) or a singleton
         # we should always sum the loss of each micro-batch as we scale by global_bsz/global_token
-        loss = torch.sum(torch.tensor(output.pop("loss"), device=self.device_name))
+        loss_list = output.pop("loss")
+        if loss_list and isinstance(loss_list[0], torch.Tensor):
+            loss = torch.stack(loss_list).sum()
+        else:
+            loss = torch.sum(torch.tensor(loss_list, device=self.device_name))
         torch.distributed.all_reduce(
             loss, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
         )

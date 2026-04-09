@@ -20,7 +20,14 @@ from PIL import Image
 from qwen_vl_utils import fetch_image, fetch_video
 
 
-def process_image(image: dict | Image.Image, image_patch_size: int = 14) -> Image.Image:
+def process_image(
+    image: dict | Image.Image,
+    image_patch_size: int = 14,
+    resize_mode: str = "auto",
+) -> Image.Image:
+    if resize_mode not in {"auto", "original"}:
+        raise ValueError(f"Unsupported resize_mode: {resize_mode}. Expected one of ['auto', 'original'].")
+
     if isinstance(image, str):
         image = Image.open(image)
 
@@ -30,6 +37,16 @@ def process_image(image: dict | Image.Image, image_patch_size: int = 14) -> Imag
     if "bytes" in image:
         assert "image" not in image, "Cannot have both `bytes` and `image`"
         image["image"] = Image.open(BytesIO(image["bytes"]))
+
+    if resize_mode == "original":
+        raw_image = image.get("image", image.get("image_url"))
+        if not isinstance(raw_image, str | Image.Image):
+            raise NotImplementedError("resize_mode='original' only supports image path, image_url path, or PIL.Image.")
+        if isinstance(raw_image, Image.Image):
+            return raw_image.convert("RGB")
+        if raw_image.startswith("file://"):
+            raw_image = raw_image[7:]
+        return Image.open(raw_image).convert("RGB")
 
     return fetch_image(image, image_patch_size=image_patch_size)
 
@@ -65,6 +82,7 @@ eg.
 def process_video(
     video: dict,
     image_patch_size: int = 14,
+    resize_mode: str = "auto",
     nframes: Optional[int] = None,
     fps: Optional[float] = None,
     fps_min_frames: Optional[int] = None,
@@ -77,6 +95,8 @@ def process_video(
     Add video sample FPS in a future MR
     """
 
+    if resize_mode not in {"auto", "original"}:
+        raise ValueError(f"Unsupported resize_mode: {resize_mode}. Expected one of ['auto', 'original'].")
     if not isinstance(video, dict) or "video" not in video:
         raise NotImplementedError(VIDEO_FORMAT_HELP)
     assert nframes is None or fps is None, "Can't use both `nframes` or `fps`"
@@ -94,6 +114,22 @@ def process_video(
                 video["min_frames"] = fps_min_frames
             if fps_max_frames is not None:
                 video["max_frames"] = fps_max_frames
+
+    if resize_mode == "original":
+        if isinstance(video["video"], str):
+            raise NotImplementedError(
+                "resize_mode='original' for video files is not supported in this path. "
+                "Use frame-list videos to preserve original frame resolution."
+            )
+        if not isinstance(video["video"], (list, tuple)):
+            raise NotImplementedError(VIDEO_FORMAT_HELP)
+        if len(video["video"]) == 0:
+            raise ValueError("Video frame list is empty.")
+        first_frame = process_image(video["video"][0], resize_mode="original")
+        width, height = first_frame.size
+        # Force fetch_video to keep the original frame resolution.
+        video["resized_height"] = height
+        video["resized_width"] = width
 
     return fetch_video(
         video,

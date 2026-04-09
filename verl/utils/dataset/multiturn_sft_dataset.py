@@ -19,6 +19,7 @@ Multi-turn SFT dataset that supports training on conversation data with multiple
 import logging
 import os
 import re
+from functools import wraps
 from typing import Any, Optional
 
 import math
@@ -26,11 +27,12 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from omegaconf import DictConfig, ListConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
-from verl.models.transformers.qwen2_vl import get_rope_index
+# from verl.models.transformers.qwen2_vl import get_rope_index
+from verl.models.transformers.qwen3_vl import get_rope_index
 from verl.utils import hf_tokenizer
 from verl.utils.chat_template import extract_system_prompt_and_generation
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -53,6 +55,33 @@ def convert_nested_value_to_list_recursive(data_item):
         # Base case: item is already a primitive type (int, str, float, bool, etc.)
         return data_item
 
+
+def once(func):
+    """Decorator to ensure a function runs only once. Subsequent calls do nothing."""
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not hasattr(wrapper, "called"):
+            wrapper.called = True
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+@once
+def print_assembled_message(tokenizer, message_list, input_ids, loss_mask, attn_mask, tools):
+    """
+    Print the message after applying the chat template
+    """
+
+    tokenized = tokenizer.apply_chat_template(message_list, add_generation_prompt=False, tokenize=False, tools=tools)
+    sep = "\n\n"
+    str = f"tokenized entire message:\n{tokenized}"
+    str += sep
+    decoded_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
+    str += f"tokenized seperately    :\n{tokenizer.decode(decoded_ids)}"
+
+    logger.debug(str)
 
 class MultiTurnSFTDataset(Dataset):
     """
@@ -91,15 +120,30 @@ class MultiTurnSFTDataset(Dataset):
         self.image_patch_size = config.get(
             "image_patch_size", processor.image_processor.patch_size if processor else None
         )
+        self.resize_mode = config.get("resize_mode", "auto")
+        self.resize_height = config.get("resize_height", None)
+        self.resize_width = config.get("resize_width", None)
         self.tools_key = config.get("tools_key", "tools")
         self.enable_thinking_key = config.get("enable_thinking_key", "enable_thinking")
-        self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        self.apply_chat_template_kwargs = {}
+        for k, v in config.get("apply_chat_template_kwargs", {}).items():
+            self.apply_chat_template_kwargs[k] = v
+            if OmegaConf.is_config(v):
+                self.apply_chat_template_kwargs[k] = OmegaConf.to_container(v, resolve=True)
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
         self.max_samples = max_samples
         self.ignore_input_ids_mismatch = config.get("ignore_input_ids_mismatch", False)
         self.return_messages = config.get("return_messages", False)
         assert self.truncation in ["error", "left", "right"]
+        assert self.resize_mode in ["auto", "original"], (
+            f"Expect resize_mode to be 'auto' or 'original'. Got {self.resize_mode}"
+        )
+        if self.resize_height is not None or self.resize_width is not None:
+            raise ValueError(
+                "resize_height/resize_width are not supported yet. "
+                "Use resize_mode='auto' or resize_mode='original'."
+            )
 
         if not isinstance(parquet_files, list | ListConfig):
             parquet_files = [parquet_files]
@@ -198,7 +242,10 @@ class MultiTurnSFTDataset(Dataset):
         apply_chat_template_kwargs = {**self.apply_chat_template_kwargs}
         if enable_thinking is not None:
             apply_chat_template_kwargs["enable_thinking"] = enable_thinking
-
+        # IMPORTANT! Use all the frames since they're all keyframes!
+        if self.processor is not None and self.processor.__class__.__name__ == "Qwen3VLProcessor":
+            apply_chat_template_kwargs.setdefault("do_sample_frames", False)
+        
         inputs = processor.apply_chat_template(
             [message],
             tools=tools,
@@ -259,11 +306,29 @@ class MultiTurnSFTDataset(Dataset):
             segments = [item for item in segments if item != ""]
             for segment in segments:
                 if segment == "<image>":
-                    image = process_image(images[image_offset], image_patch_size=self.image_patch_size)
+                    image = process_image(
+                        images[image_offset],
+                        image_patch_size=self.image_patch_size,
+                        resize_mode=self.resize_mode,
+                    )
                     content_list.append({"type": "image", "image": image})
                     image_offset += 1
                 elif segment == "<video>":
-                    video = process_video(videos[video_offset], image_patch_size=self.image_patch_size)
+                    videos_item = videos[video_offset]
+                    if isinstance(videos_item, np.ndarray):
+                        videos_item = videos_item.tolist()
+                    if not isinstance(videos_item, dict) or "video" not in videos_item:
+                        raise NotImplementedError(
+                            f"video input must be dict containing 'video', got {type(videos_item)}"
+                        )
+                    videos_item = dict(videos_item)
+                    if isinstance(videos_item["video"], np.ndarray):
+                        videos_item["video"] = videos_item["video"].tolist()
+                    video = process_video(
+                        videos_item, 
+                        image_patch_size=self.image_patch_size,
+                        resize_mode=self.resize_mode,
+                    )
                     content_list.append({"type": "video", "video": video})
                     video_offset += 1
                 else:
@@ -272,11 +337,11 @@ class MultiTurnSFTDataset(Dataset):
 
         assert image_offset == len(images), f"image_offset {image_offset} != len(images) {len(images)}"
         assert video_offset == len(videos), f"video_offset {video_offset} != len(videos) {len(videos)}"
+       
         return messages
 
     def __getitem__(self, item):
         row_dict: dict = self.dataframe.iloc[item].to_dict()
-
         messages = self._build_messages(row_dict)
         tools = self.tools[item] if self.tools is not None else None
         enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
@@ -284,7 +349,7 @@ class MultiTurnSFTDataset(Dataset):
         if self.reward_key is not None:
             assert self.reward_key in row_dict, f"Missing reward key {self.reward_key} in dataset row."
             loss_weight = math.exp(float(row_dict[self.reward_key]))
-
+        
         # 1. tokenize each message
         input_ids, loss_mask, attention_mask, multi_modal_inputs = [], [], [], {}
         for i, message in enumerate(messages):
@@ -307,6 +372,7 @@ class MultiTurnSFTDataset(Dataset):
         assert input_ids.shape == loss_mask.shape == attention_mask.shape, (
             f"Shape mismatch: {input_ids.shape}, {loss_mask.shape}, {attention_mask.shape}"
         )
+        print_assembled_message(self.tokenizer, messages, input_ids, loss_mask, attention_mask, tools)
         self.sanity_check(input_ids, messages, tools, enable_thinking)
 
         # Since the tokenizer may return user-customized results, we need to filter out inconsistent tensor shapes
@@ -323,13 +389,29 @@ class MultiTurnSFTDataset(Dataset):
 
         for k, v in multi_modal_inputs.items():
             multi_modal_inputs[k] = torch.concat(v, dim=0)
-
+        
         # 2. handle position_ids for Qwen-VL series models
+        # THE Qwen3-VL processor uses Qwen2-Image processor for some reason
+        # This isn't compatible for videos
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
             image_grid_thw = multi_modal_inputs.get("image_grid_thw", None)
             video_grid_thw = multi_modal_inputs.get("video_grid_thw", None)
             second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts", None)
 
+            # vision_start_id = self.processor.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+            # video_id = self.processor.tokenizer.convert_tokens_to_ids("<|video_pad|>")
+            # image_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+
+            # vision_start_idx = torch.argwhere(input_ids == vision_start_id).squeeze(-1)
+            # vision_next = input_ids[vision_start_idx + 1] if vision_start_idx.numel() > 0 else torch.tensor([], device=input_ids.device)
+
+            # video_nums = int((vision_next == video_id).sum().item())
+            # image_nums = int((vision_next == image_id).sum().item())
+
+            # print("[DBG] vision_start_count=", int(vision_start_idx.numel()))
+            # print("[DBG] video_nums_used_by_get_rope_index=", video_nums)
+            # print("[DBG] image_nums_used_by_get_rope_index=", image_nums)
+            # print("[DBG] video_grid_thw_rows=", None if video_grid_thw is None else int(video_grid_thw.shape[0]))
             vision_position_ids = get_rope_index(
                 self.processor,
                 input_ids=input_ids,
@@ -418,6 +500,8 @@ class MultiTurnSFTDataset(Dataset):
         apply_chat_template_kwargs = {**self.apply_chat_template_kwargs}
         if enable_thinking is not None:
             apply_chat_template_kwargs["enable_thinking"] = enable_thinking
+        if self.processor is not None and self.processor.__class__.__name__ == "Qwen3VLProcessor":
+            apply_chat_template_kwargs.setdefault("do_sample_frames", False)
         inputs = processor.apply_chat_template(
             messages,
             tools=tools,
@@ -449,9 +533,11 @@ if __name__ == "__main__":
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
 
     from omegaconf import OmegaConf
-    config_path = "external/verl/verl/trainer/config/critic_sft_trainer_engine.yaml"
+    config_path = "external/verl/verl/trainer/config/motion_sft_trainer_engine.yaml"
     config = OmegaConf.load(config_path)
     OmegaConf.resolve(config)
+    config.data.train_files = "data/unified_motion_sft_v3/parquet/train/train.parquet"
+    config.data.val_files = "data/unified_motion_sft_v3/parquet/val/val.parquet"
 
     parquet_files = ListConfig([
         config.data.train_files,
@@ -473,5 +559,5 @@ if __name__ == "__main__":
         if "multi_modal_inputs" in sample:
             for k, v in sample["multi_modal_inputs"].items():
                 print(f"multi_modal_inputs[{k}]: {v.shape}")
-        import pdb; pdb.set_trace()
+
         print("="*50)
