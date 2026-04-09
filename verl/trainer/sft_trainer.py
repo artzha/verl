@@ -195,16 +195,19 @@ class SFTTrainer:
         self.global_batch_size = config.data.train_batch_size
         self.train_batch_size_per_dp = self.global_batch_size // dp_size
         self.collate_fn = SFTTensorCollator(config.data.pad_mode)
+        dataloader_num_workers = int(config.data.get("dataloader_num_workers", 12))
+        pin_memory = bool(config.data.get("pin_memory", False))
+        pin_memory_device = device_name if pin_memory else ""
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=self.train_batch_size_per_dp,
             sampler=self.train_sampler,
             collate_fn=self.collate_fn,
-            num_workers=8,
-            pin_memory=False,
+            num_workers=dataloader_num_workers,
+            pin_memory=pin_memory,
             drop_last=True,
-            pin_memory_device=device_name,
+            pin_memory_device=pin_memory_device,
         )
 
         if self.val_dataset:
@@ -216,10 +219,10 @@ class SFTTrainer:
                 batch_size=self.train_batch_size_per_dp,
                 sampler=self.val_sampler,
                 collate_fn=self.collate_fn,
-                num_workers=8,
-                pin_memory=False,
+                num_workers=dataloader_num_workers,
+                pin_memory=pin_memory,
                 drop_last=True,
-                pin_memory_device=device_name,
+                pin_memory_device=pin_memory_device,
             )
         else:
             self.val_dataloader = None

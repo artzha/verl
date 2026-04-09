@@ -315,7 +315,15 @@ class MultiTurnSFTDataset(Dataset):
                     image_offset += 1
                 elif segment == "<video>":
                     videos_item = videos[video_offset]
-                    videos_item['video'] = videos_item['video'].tolist()
+                    if isinstance(videos_item, np.ndarray):
+                        videos_item = videos_item.tolist()
+                    if not isinstance(videos_item, dict) or "video" not in videos_item:
+                        raise NotImplementedError(
+                            f"video input must be dict containing 'video', got {type(videos_item)}"
+                        )
+                    videos_item = dict(videos_item)
+                    if isinstance(videos_item["video"], np.ndarray):
+                        videos_item["video"] = videos_item["video"].tolist()
                     video = process_video(
                         videos_item, 
                         image_patch_size=self.image_patch_size,
@@ -551,4 +559,5 @@ if __name__ == "__main__":
         if "multi_modal_inputs" in sample:
             for k, v in sample["multi_modal_inputs"].items():
                 print(f"multi_modal_inputs[{k}]: {v.shape}")
+
         print("="*50)

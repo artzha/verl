@@ -15,7 +15,6 @@
 from io import BytesIO
 from typing import Optional
 
-import numpy as np
 import torch
 from PIL import Image
 from qwen_vl_utils import fetch_image, fetch_video
@@ -124,31 +123,13 @@ def process_video(
             )
         if not isinstance(video["video"], (list, tuple)):
             raise NotImplementedError(VIDEO_FORMAT_HELP)
-
-        image_list = [process_image(frame, resize_mode="original") for frame in video["video"]]
-        if len(image_list) == 0:
+        if len(video["video"]) == 0:
             raise ValueError("Video frame list is empty.")
-
-        # Keep qwen frame-factor behavior without resizing frame resolution.
-        nframes_aligned = ((len(image_list) + 1) // 2) * 2
-        if len(image_list) < nframes_aligned:
-            image_list.extend([image_list[-1]] * (nframes_aligned - len(image_list)))
-
-        sample_fps = video.get("sample_fps", 0.5)
-        video_tensor = torch.stack(
-            [torch.from_numpy(np.array(image).transpose(2, 0, 1)) for image in image_list]
-        )
-        raw_fps = video.get("raw_fps", sample_fps)
-        video_metadata = dict(
-            fps=raw_fps,
-            frames_indices=[i for i in range(len(video_tensor))],
-            total_num_frames=(nframes_aligned / sample_fps) * raw_fps,
-        )
-
-        final_video = (video_tensor, video_metadata) if return_video_metadata else video_tensor
-        if return_video_sample_fps:
-            return final_video, sample_fps
-        return final_video
+        first_frame = process_image(video["video"][0], resize_mode="original")
+        width, height = first_frame.size
+        # Force fetch_video to keep the original frame resolution.
+        video["resized_height"] = height
+        video["resized_width"] = width
 
     return fetch_video(
         video,

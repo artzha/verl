@@ -16,6 +16,8 @@ defaults:
 data:
   train_batch_size: 256 # global batch size
   micro_batch_size_per_gpu: 4  # this is also val batch size
+  dataloader_num_workers: 12
+  pin_memory: False # for some reason this raises an iterable error
   max_token_len_per_gpu: 8192
   use_dynamic_bsz: True
   train_files: ''
