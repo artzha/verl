@@ -1072,3 +1072,169 @@ class FSDPEngineWithValueHead(FSDPEngineWithLMHead):
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
         return {"values": values}
+
+
+@EngineRegistry.register(model_type="reward_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
+class FSDPEngineWithRewardHead(FSDPEngine):
+    """FSDP engine for sequence-level reward models (e.g. Qwen3VLRewardModel).
+
+    Differences from FSDPEngineWithLMHead:
+      - ``_build_module`` loads via ``AutoModelForTokenClassification`` after
+        importing ``qwen3_vl_reward`` to trigger its registration.
+      - ``prepare_model_inputs`` omits temperature / rolled input-ids (not needed
+        for reward scoring).
+      - ``prepare_model_outputs`` extracts the scalar score at the *last valid
+        token* of each sequence and returns ``{"rewards": (bsz,)}``.
+      - ``_build_model_optimizer`` is inherited from ``FSDPEngine`` unchanged.
+    """
+
+    # ------------------------------------------------------------------
+    # Model construction
+    # ------------------------------------------------------------------
+
+    def _build_module(self):
+        """Load Qwen3VLRewardModel via AutoModelForTokenClassification.
+
+        Importing ``qwen3_vl_reward`` triggers the module-level
+        ``AutoModelForTokenClassification.register(Qwen3VLConfig, Qwen3VLRewardModel)``
+        call, after which ``AutoModelForTokenClassification.from_pretrained``
+        will instantiate ``Qwen3VLRewardModel``.
+        """
+        import warnings
+
+        import verl.models.transformers.qwen3_vl_reward  # noqa: F401 — registers Qwen3VLRewardModel
+        from transformers import AutoModelForTokenClassification
+        from verl.utils.torch_dtypes import PrecisionType
+
+        torch_dtype = self.engine_config.model_dtype
+        if torch_dtype is None:
+            torch_dtype = torch.float32 if not self.engine_config.forward_only else torch.bfloat16
+        torch_dtype = PrecisionType.to_dtype(torch_dtype)
+
+        config = self.model_config.hf_config
+        config.num_labels = 1
+        config.classifier_dropout = 0.0
+
+        init_context = get_init_weight_context_manager(
+            use_meta_tensor=not config.tie_word_embeddings,
+            mesh=self.device_mesh,
+        )
+
+        with init_context(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            module = AutoModelForTokenClassification.from_pretrained(
+                pretrained_model_name_or_path=self.model_config.local_path,
+                config=config,
+                torch_dtype=torch_dtype,
+                trust_remote_code=self.model_config.trust_remote_code,
+            )
+            # Patch the module directly — it IS a Qwen3VLForConditionalGeneration
+            # subclass, so model.config.model_type == "qwen3_vl" and the patch
+            # targets Qwen3VLForConditionalGeneration.forward at the class level.
+            apply_monkey_patch(
+                model=module,
+                use_remove_padding=self.use_remove_padding,
+                ulysses_sp_size=self.ulysses_sequence_parallel_size,
+            )
+
+        return module
+
+    # ------------------------------------------------------------------
+    # Input / output preparation
+    # ------------------------------------------------------------------
+
+    def prepare_model_inputs(self, micro_batch: "TensorDict"):
+        """Prepare packed inputs for the reward model forward pass.
+
+        Unlike the LM-head engine, we do **not** produce rolled input IDs or
+        temperature tensors.  We do store ``cu_seqlens`` so that
+        ``prepare_model_outputs`` can locate the last token of each sequence.
+        """
+        pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+        assert pad_mode == DatasetPadMode.NO_PADDING, f"reward_model engine only supports no_padding, got {pad_mode}"
+
+        use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
+
+        multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
+        input_ids = micro_batch["input_ids"]    # nested (bsz, *)
+        position_ids = micro_batch["position_ids"]  # nested (bsz, 4, *) or (bsz, *)
+
+        output_args = {
+            # Store offsets before unpacking so prepare_model_outputs can find
+            # the last token of every sequence in the flat representation.
+            "cu_seqlens": input_ids.offsets(),  # (bsz + 1,)
+        }
+
+        if use_remove_padding:
+            input_ids_rmpad = input_ids.values().unsqueeze(0)       # (1, total_nnz)
+            if position_ids.dim() == 3:
+                position_ids_rmpad = position_ids.values().unsqueeze(1)  # (4, 1, total_nnz)
+            else:
+                position_ids_rmpad = position_ids.values().unsqueeze(0)  # (1, total_nnz)
+
+            model_inputs = {
+                "input_ids": input_ids_rmpad,
+                "attention_mask": None,
+                "position_ids": position_ids_rmpad,
+            }
+        else:
+            raise NotImplementedError("reward_model engine requires use_remove_padding=True")
+
+        model_inputs.update(multi_modal_inputs)
+        return model_inputs, output_args
+
+    def prepare_model_outputs(self, output, output_args, micro_batch: "TensorDict"):
+        """Extract per-sequence scalar rewards from the last valid token.
+
+        ``output.logits`` has shape ``(1, total_nnz, 1)`` for packed sequences.
+        ``cu_seqlens[i+1] - 1`` is the index of the last token of sequence i in
+        the flat representation.
+        """
+        use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
+
+        logits = output.logits  # (1, total_nnz, 1)
+
+        if use_remove_padding:
+            scores_flat = logits.squeeze(0).squeeze(-1)   # (total_nnz,)
+
+            cu_seqlens = output_args["cu_seqlens"]         # (bsz + 1,) on same device
+            last_token_idxs = cu_seqlens[1:] - 1           # (bsz,)
+            rewards = scores_flat[last_token_idxs]         # (bsz,)
+        else:
+            raise NotImplementedError("reward_model engine requires use_remove_padding=True")
+
+        return {"rewards": rewards}
+
+    # ------------------------------------------------------------------
+    # Forward step
+    # ------------------------------------------------------------------
+
+    def forward_step(self, micro_batch: "TensorDict", loss_function, forward_only):
+        device_name = get_device_name()
+        micro_batch = micro_batch.to(get_device_id())
+        model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+
+        with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+            raw_output = self.module(**model_inputs, use_cache=False)
+
+            model_output = self.prepare_model_outputs(
+                output=raw_output, output_args=output_args, micro_batch=micro_batch
+            )
+
+            if loss_function is not None:
+                loss, metrics = loss_function(
+                    model_output=model_output,
+                    data=micro_batch,
+                    dp_group=self.get_data_parallel_group(),
+                )
+            else:
+                assert forward_only
+                loss = torch.tensor(1.0, device=device_name)
+                metrics = {}
+
+            output = {
+                "model_output": model_output,
+                "loss": loss.detach(),
+                "metrics": metrics,
+            }
+            return loss, output

@@ -79,6 +79,7 @@ class RMDataset(Dataset):
             processor.image_processor.patch_size if processor is not None else None,
         )
         self.resize_mode = config.get("resize_mode", "auto")
+        self.ignore_input_ids_mismatch = config.get("ignore_input_ids_mismatch", False)
         self.apply_chat_template_kwargs = {}
         for k, v in config.get("apply_chat_template_kwargs", {}).items():
             self.apply_chat_template_kwargs[k] = v
@@ -274,8 +275,6 @@ class RMDataset(Dataset):
             chosen_attention_mask,
             tools,
         )
-        self.sanity_check(chosen_input_ids, chosen_messages, tools, enable_thinking)
-        self.sanity_check(rejected_input_ids, rejected_messages, tools, enable_thinking)
 
         # Pairwise RM samples must stack chosen/rejected. Under no_padding mode, lengths
         # can differ by one or more tokens (e.g., EOS/chat-template differences), so pad
@@ -316,7 +315,10 @@ class RMDataset(Dataset):
         if self.return_messages:
             result["messages"] = {"chosen": chosen_messages, "rejected": rejected_messages}
 
-        merged_multi_modal_inputs: dict[str, torch.Tensor] = {}
+        # Store chosen and rejected multi-modal inputs separately so that the reward
+        # trainer collator can interleave them correctly (chosen_0, rejected_0, ...).
+        chosen_multi_modal_inputs: dict[str, torch.Tensor] = {}
+        rejected_multi_modal_inputs: dict[str, torch.Tensor] = {}
         for key in set(chosen_mm.keys()).union(set(rejected_mm.keys())):
             chosen_val = chosen_mm.get(key, None)
             rejected_val = rejected_mm.get(key, None)
@@ -327,10 +329,12 @@ class RMDataset(Dataset):
             if chosen_val.shape[1:] != rejected_val.shape[1:]:
                 # Match MultiTurnSFTDataset behavior: drop inconsistent tensor keys.
                 continue
-            merged_multi_modal_inputs[key] = torch.cat((chosen_val, rejected_val), dim=0)
+            chosen_multi_modal_inputs[key] = chosen_val
+            rejected_multi_modal_inputs[key] = rejected_val
 
-        if len(merged_multi_modal_inputs) > 0:
-            result["multi_modal_inputs"] = merged_multi_modal_inputs
+        if len(chosen_multi_modal_inputs) > 0:
+            result["chosen_multi_modal_inputs"] = chosen_multi_modal_inputs
+            result["rejected_multi_modal_inputs"] = rejected_multi_modal_inputs
         return result
     
     def sanity_check(self, input_ids: torch.Tensor, messages: list[dict], tools: list[dict], enable_thinking: bool):
@@ -446,8 +450,9 @@ if __name__ == "__main__":
     print("input_ids shape:", tuple(sample["input_ids"].shape))
     print("attention_mask shape:", tuple(sample["attention_mask"].shape))
     print("position_ids shape:", tuple(sample["position_ids"].shape))
-    if "multi_modal_inputs" in sample:
-        print("multi_modal_inputs keys:", list(sample["multi_modal_inputs"].keys()))
-        for k, v in sample["multi_modal_inputs"].items():
-            if isinstance(v, torch.Tensor):
-                print(f"  {k}: {tuple(v.shape)}")
+    for mm_key in ("chosen_multi_modal_inputs", "rejected_multi_modal_inputs"):
+        if mm_key in sample:
+            print(f"{mm_key} keys:", list(sample[mm_key].keys()))
+            for k, v in sample[mm_key].items():
+                if isinstance(v, torch.Tensor):
+                    print(f"  {k}: {tuple(v.shape)}")

@@ -76,10 +76,11 @@ model:
     # - v_proj
     # - k_proj
 
-  # Hack for excluding visual backbone
-  exclude_modules: []
+  # Exclude the reward head from LoRA so it trains with full gradients.
+  # The score head is newly initialised and small (hidden_size -> 1),
+  # so full-rank updates are both cheap and more expressive than low-rank.
+  exclude_modules: ".*\\.score$"
   # exclude_modules: ".*visual\\.blocks\\..*|.*visual\\.patch_embed\\..*|.*visual\\.pos_embed$|.*visual\\.rotary_pos_emb$"
-    # - '.*language_model\..*'
 
 # Checkpoint configuration
 checkpoint:

@@ -73,3 +73,62 @@ class SFTTensorCollator:
                 final_batch[key] = torch.stack(tensors, dim=0)
 
         return final_batch
+
+
+# ---------------------------------------------------------------------------
+# Collator
+# ---------------------------------------------------------------------------
+
+class RMTensorCollator:
+    """Collates RMDataset pairs into an interleaved flat batch for the engine.
+
+    Each item from RMDataset has:
+      - ``input_ids``:      (2, seq_len) — index 0 = chosen, 1 = rejected
+      - ``attention_mask``: (2, seq_len)
+      - ``position_ids``:   (2, seq_len) or (2, 4, seq_len) for Qwen3-VL
+      - ``chosen_multi_modal_inputs``  (optional): dict[str, Tensor]
+      - ``rejected_multi_modal_inputs`` (optional): dict[str, Tensor]
+
+    Output is a dict with nested tensors of shape (2*N, *) in interleaved order:
+      [chosen_0, rejected_0, chosen_1, rejected_1, ...]
+    plus a synthetic ``loss_mask`` equal to ``attention_mask`` (required by the
+    engine's ``forward_backward_batch`` to compute ``batch_num_tokens``).
+    """
+
+    def __call__(self, batch: list[dict]) -> dict:
+        N = len(batch)
+        all_input_ids: list[torch.Tensor] = []
+        all_attention_mask: list[torch.Tensor] = []
+        all_position_ids: list[torch.Tensor] = []
+        all_mm: list[NonTensorData] = []
+
+        has_mm = "chosen_multi_modal_inputs" in batch[0]
+
+        for item in batch:
+            # index 0 = chosen, index 1 = rejected
+            all_input_ids.append(item["input_ids"][0])
+            all_input_ids.append(item["input_ids"][1])
+            all_attention_mask.append(item["attention_mask"][0])
+            all_attention_mask.append(item["attention_mask"][1])
+            all_position_ids.append(item["position_ids"][0])
+            all_position_ids.append(item["position_ids"][1])
+            if has_mm:
+                all_mm.append(NonTensorData(item.get("chosen_multi_modal_inputs", None)))
+                all_mm.append(NonTensorData(item.get("rejected_multi_modal_inputs", None)))
+
+        result = {
+            "input_ids": torch.nested.as_nested_tensor(all_input_ids, layout=torch.jagged),
+            "attention_mask": torch.nested.as_nested_tensor(all_attention_mask, layout=torch.jagged),
+            "position_ids": torch.nested.as_nested_tensor(all_position_ids, layout=torch.jagged),
+            # Synthetic loss_mask: engine uses data["loss_mask"].sum() for batch_num_tokens.
+            # We use attention_mask (all valid tokens) as a proxy.
+            "loss_mask": torch.nested.as_nested_tensor(
+                [m.clone() for m in all_attention_mask], layout=torch.jagged
+            ),
+        }
+
+        if has_mm and all_mm:
+            result["multi_modal_inputs"] = torch.stack(all_mm, dim=0)
+
+        return result
+
