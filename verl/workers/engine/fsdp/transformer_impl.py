@@ -1168,7 +1168,17 @@ class FSDPEngineWithRewardHead(FSDPEngine):
         if use_remove_padding:
             input_ids_rmpad = input_ids.values().unsqueeze(0)       # (1, total_nnz)
             if position_ids.dim() == 3:
-                position_ids_rmpad = position_ids.values().unsqueeze(1)  # (4, 1, total_nnz)
+                # For jagged 3D nested tensors, .values() layout can vary with ragged axis
+                # (e.g., equal-length batches may expose shape (bsz*4, seqlen)). Re-pack from
+                # per-sequence tensors to enforce canonical channel-first layout: (4, 1, total_nnz).
+                position_ids_rows = position_ids.unbind()
+                position_ids_packed = torch.cat(position_ids_rows, dim=-1)
+                position_ids_rmpad = position_ids_packed.unsqueeze(1)  # (4, 1, total_nnz)
+                if position_ids_rmpad.shape[0] != 4:
+                    raise ValueError(
+                        "Expected Qwen3-VL packed position_ids leading dimension to be 4 "
+                        f"(text + 3 vision channels), got {tuple(position_ids_rmpad.shape)}."
+                    )
             else:
                 position_ids_rmpad = position_ids.values().unsqueeze(0)  # (1, total_nnz)
 

@@ -125,8 +125,15 @@ def postprocess_batch_func(output_lst, indices, data: TensorDict):
     # concat results from micro batches
     for key, val in model_output.items():
         if pad_mode == DatasetPadMode.NO_PADDING:
-            tensors = [tensor for nt in model_output[key] for tensor in nt.unbind()]
-            model_output[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+            first = model_output[key][0]
+            if first.is_nested:
+                tensors = [tensor for nt in model_output[key] for tensor in nt.unbind()]
+                model_output[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+            elif first.dim() == 0:
+                model_output[key] = torch.stack(model_output[key], dim=0)
+            else:
+                # Keep dense outputs (e.g. RM rewards) dense after micro-batch merge.
+                model_output[key] = torch.cat(model_output[key], dim=0)
         else:
             raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
