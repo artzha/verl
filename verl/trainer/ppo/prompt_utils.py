@@ -35,7 +35,7 @@ from cotnav.core.constants import (
 )
 from cotnav.core.format import format_prompt as format_prompt_cotnav
 from cotnav.core.format import text_to_llava
-from cotnav.models.vlms.interface import OutputFormat, parse_and_unify
+from cotnav.prompts.interface import OutputFormat, parse_and_unify
 from cotnav.utils.draw import draw_polyline
 
 

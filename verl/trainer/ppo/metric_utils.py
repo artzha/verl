@@ -106,7 +106,7 @@ def _compute_rollout_panels(batch: DataProto, max_images=32, config: Any = None)
         batch: A DataProto object containing batch data with multi-modal information.
     """
     from cotnav.utils.draw import draw_polyline, make_query_panel
-    from cotnav.models.vlms.interface import parse_and_unify, OutputFormat
+    from cotnav.prompts.interface import parse_and_unify, OutputFormat
 
     critic_output_format = OutputFormat.VERDICT_V1
     if config is not None:
@@ -247,7 +247,7 @@ def compute_motion_rollout_panels(
     (ride_name, semantic_goal, panel_image) triplets for logging.
     """
     from cotnav.utils.draw import draw_polyline, make_query_panel
-    from cotnav.models.vlms.interface import parse_and_unify, OutputFormat
+    from cotnav.prompts.interface import parse_and_unify, OutputFormat
 
     critic_output_format = OutputFormat.VERDICT_V1
     if config is not None:
