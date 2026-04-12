@@ -80,7 +80,8 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
+from verl.models.transformers.qwen3_vl import get_rope_index
+from verl.utils.model import compute_position_id_with_mask, convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
@@ -1731,6 +1732,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 input_tokenizer_local_path, trust_remote_code=config.model.get("trust_remote_code", False)
             )
             self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
+        # Processor is optional but required for multimodal chat-template re-tokenization.
+        self.processor = hf_processor(local_path, trust_remote_code=config.model.get("trust_remote_code", False), use_fast=True)
 
         trust_remote_code = config.model.get("trust_remote_code", False)
         override_config = OmegaConf.to_container(OmegaConf.create(config.model.get("override_config", {})))
@@ -1804,7 +1807,25 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         import_external_libs(self.config.model.get("external_lib", None))
         self.reward_module = self._build_model(config=self.config)
 
-    def _forward_micro_batch(self, micro_batch):
+    def _prepare_multimodal_kwargs(self, micro_batch: Any, multi_modal_inputs: Optional[list[Any]] = None) -> dict[str, Any]:
+        """Extract and device-move multimodal kwargs for reward forward."""
+        mm_source = multi_modal_inputs
+        if mm_source is None:
+            return {}
+
+        mm_kwargs = extract_multi_modal_inputs(mm_source)
+        if not mm_kwargs:
+            return {}
+
+        prepared_kwargs: dict[str, Any] = {}
+        for key, value in mm_kwargs.items():
+            if torch.is_tensor(value):
+                prepared_kwargs[key] = value.to(get_device_id())
+            else:
+                prepared_kwargs[key] = value
+        return prepared_kwargs
+
+    def _forward_micro_batch(self, micro_batch, multi_modal_inputs: Optional[list[Any]] = None):
         from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
         from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 
@@ -1813,10 +1834,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
+            model_kwargs = self._prepare_multimodal_kwargs(micro_batch, multi_modal_inputs=multi_modal_inputs)
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
 
-            if self.use_remove_padding:
+            # NOTE: current remove-padding path does not preserve per-sample multimodal alignment.
+            # Fall back to dense forward when multimodal kwargs are present.
+            if self.use_remove_padding and not model_kwargs:
                 input_ids_rmpad, indices, *_ = unpad_input(
                     input_ids.unsqueeze(-1), attention_mask
                 )  # input_ids_rmpad (total_nnz, ...)
@@ -1842,7 +1866,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 output = self.reward_module(
-                    input_ids=input_ids_rmpad, attention_mask=None, position_ids=position_ids_rmpad, use_cache=False
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    use_cache=False,
+                    **model_kwargs,
                 )
                 reward_rmpad = output.logits
                 reward_rmpad = reward_rmpad.squeeze(0)  # (total_nnz)
@@ -1857,7 +1885,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 rm_score = pad_input(reward_rmpad, indices=indices, batch=batch_size, seqlen=seqlen).squeeze(-1)
             else:
                 output = self.reward_module(
-                    input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    **model_kwargs,
                 )
                 rm_score = output.logits  # (batch_size, seq_len, 1)
                 rm_score = rm_score.squeeze(-1)
@@ -1889,9 +1921,12 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         src_tokenizer = self.input_tokenizer
         target_tokenizer = self.tokenizer
+        target_processor = self.processor
 
         rm_input_ids = []
         rm_attention_mask = []
+        rm_position_ids = []
+        rm_multi_modal_inputs: list[dict[str, Any] | None] = []
 
         for i in range(data.batch.batch_size[0]):
             if not isinstance(data.non_tensor_batch["raw_prompt"][i], list | np.ndarray):
@@ -1927,7 +1962,21 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             if max_length is None:
                 max_length = src_max_length
 
-            model_inputs = target_tokenizer(prompt_with_chat_template, return_tensors="pt", add_special_tokens=False)
+            if target_processor is not None:
+                apply_chat_template_kwargs = {}
+                if target_processor.__class__.__name__ == "Qwen3VLProcessor":
+                    apply_chat_template_kwargs.setdefault("do_sample_frames", True)
+                model_inputs = target_processor.apply_chat_template(
+                    chat,
+                    add_generation_prompt=False,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                    **apply_chat_template_kwargs,
+                )
+                model_inputs = dict(model_inputs)
+            else:
+                model_inputs = target_tokenizer(prompt_with_chat_template, return_tensors="pt", add_special_tokens=False)
             input_ids, attention_mask = verl_F.postprocess_data(
                 input_ids=model_inputs["input_ids"],
                 attention_mask=model_inputs["attention_mask"],
@@ -1939,15 +1988,33 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
             rm_input_ids.append(input_ids)
             rm_attention_mask.append(attention_mask)
+            if target_processor is not None and hasattr(target_processor, "image_processor"):
+                vision_position_ids = get_rope_index(
+                    target_processor,
+                    input_ids=input_ids[0],
+                    image_grid_thw=model_inputs.get("image_grid_thw", None),
+                    video_grid_thw=model_inputs.get("video_grid_thw", None),
+                    second_per_grid_ts=model_inputs.get("second_per_grid_ts", None),
+                    attention_mask=attention_mask[0],
+                )  # (3, seq_len)
+                text_position_ids = torch.arange(input_ids.shape[-1], dtype=torch.long).unsqueeze(0)  # (1, seq_len)
+                cur_position_ids = torch.cat((text_position_ids, vision_position_ids), dim=0).unsqueeze(0)  # (1, 4, seq)
+                mm_inputs = {
+                    k: v for k, v in model_inputs.items() if k not in {"input_ids", "attention_mask"} and v is not None
+                }
+            else:
+                cur_position_ids = compute_position_id_with_mask(attention_mask)
+                mm_inputs = None
+            rm_position_ids.append(cur_position_ids)
+            rm_multi_modal_inputs.append(mm_inputs)
 
         rm_input_ids = torch.cat(rm_input_ids, dim=0)
         rm_attention_mask = torch.cat(rm_attention_mask, dim=0)
-
-        rm_position_ids = compute_position_id_with_mask(rm_attention_mask)
+        rm_position_ids = torch.cat(rm_position_ids, dim=0)
 
         rm_inputs = {"input_ids": rm_input_ids, "attention_mask": rm_attention_mask, "position_ids": rm_position_ids}
 
-        return DataProto.from_dict(rm_inputs)
+        return DataProto.from_dict(tensors=rm_inputs, non_tensors={"multi_modal_inputs": rm_multi_modal_inputs})
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="brown", role="compute_rm_score")
@@ -1959,7 +2026,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # Support all hardwares
         data = data.to(get_device_id())
         if self._do_switch_chat_template:
+            breakpoint()
             rm_data = self._switch_chat_template(data)
+            all_multi_modal_inputs = rm_data.non_tensor_batch.get("multi_modal_inputs", None)
+            breakpoint()
         else:
             rm_input_ids = data.batch["input_ids"]
             rm_attention_mask = data.batch["attention_mask"]
@@ -1970,9 +2040,12 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 "position_ids": rm_position_ids,
             }
             rm_data = DataProto.from_dict(rm_inputs)
+            all_multi_modal_inputs = data.non_tensor_batch.get("multi_modal_inputs", None)
 
         # Support all hardwares
         rm_data = rm_data.to(get_device_id())
+        if all_multi_modal_inputs is not None and hasattr(all_multi_modal_inputs, "tolist"):
+            all_multi_modal_inputs = all_multi_modal_inputs.tolist()
 
         # perform forward computation
         with self.ulysses_sharding_manager:
@@ -1982,9 +2055,20 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 micro_batches, indices = rearrange_micro_batches(batch=rm_data.batch, max_token_len=max_token_len)
             else:
                 micro_batches = rm_data.batch.split(self.config.micro_batch_size_per_gpu)
+                # optimize this later
+                indices = []
+                offset = 0
+                for micro_batch in micro_batches:
+                    batch_size = int(micro_batch.batch_size[0]) if hasattr(micro_batch, "batch_size") else len(micro_batch)
+                    indices.append(list(range(offset, offset + batch_size)))
+                    offset += batch_size
+            
             output = []
-            for micro_batch in micro_batches:
-                rm_score = self._forward_micro_batch(micro_batch)
+            for micro_batch, micro_indices in zip(micro_batches, indices, strict=True):
+                mm_inputs = None
+                if all_multi_modal_inputs is not None:
+                    mm_inputs = [all_multi_modal_inputs[idx] for idx in micro_indices]
+                rm_score = self._forward_micro_batch(micro_batch, multi_modal_inputs=mm_inputs)
                 output.append(rm_score)
             scores = torch.cat(output, dim=0)  # (batch_size)
 

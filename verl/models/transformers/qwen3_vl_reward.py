@@ -38,6 +38,7 @@ Usage (direct):
 import logging
 import os
 
+import torch
 import torch.nn as nn
 from transformers import AutoModelForTokenClassification
 from transformers.modeling_outputs import ModelOutput
@@ -125,6 +126,7 @@ class Qwen3VLRewardModel(Qwen3VLForConditionalGeneration):
         # hidden_states[-1]: last transformer layer output
         last_hidden = outputs.hidden_states[-1]  # (..., hidden_size)
         logits = self.score(last_hidden)          # (..., num_labels)
+
         return ModelOutput(logits=logits)
 
 

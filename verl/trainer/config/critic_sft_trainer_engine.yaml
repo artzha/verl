@@ -16,19 +16,28 @@ defaults:
 data:
   train_batch_size: 256 # global batch size
   micro_batch_size_per_gpu: 4  # this is also val batch size
+  dataloader_num_workers: 8
   max_token_len_per_gpu: 8192
   use_dynamic_bsz: True
-  train_files: data/grandtour_qwen_critic_sft_novgoal/parquet/train/train.parquet
-  val_files: data/grandtour_qwen_critic_sft_novgoal/parquet/val/val.parquet
+  train_files: ''
+  val_files: ''
   train_max_samples: -1  # set to -1 to use full dataset
   val_max_samples: -1  # set to -1 to use full dataset
   # Multi-turn settings
   messages_key: messages  # Key for messages list in multi-turn mode
-  reward_key: vgoal_score
-  # reward_key: null
+  reward_key: null
   tools_key: tools  # Key for tools list in multi-turn mode
   enable_thinking_key: enable_thinking  # Whether to enable thinking in multi-turn mode
   pad_mode: no_padding
+  # Vision resize mode for both images and videos in MultiTurnSFTDataset.
+  # - auto: use qwen_vl_utils default smart resize
+  # - original: preserve original image/frame resolution
+  resize_mode: original
+
+  # Reserved fields for future fixed-size resize mode support.
+  resize_height: null
+  resize_width: null
+
   # for right padding
   max_length: 2048
   truncation: error
@@ -37,7 +46,13 @@ data:
     path: null
     name: null
   use_shm: False
-  apply_chat_template_kwargs: {}
+  apply_chat_template_kwargs: {
+    video_metadata: {
+      fps: 0.5,
+      frames_indices: [0, 1, 2, 3], # Frames to use
+      total_num_frames: 4           # Observation history
+    }
+  }
 
   # MultiTurnSFTDataset apply_chat_template to each turn separately and concat `input_ids`
   # as a whole sequence, which may not equal to apply_chat_template to whole messages at once. 
@@ -57,7 +72,7 @@ model:
     # - k_proj
 
   # Hack for excluding visual backbone
-  exclude_modules: ".*visual\\.blocks\\..*|.*visual\\.patch_embed\\..*|.*visual\\.pos_embed$|.*visual\\.rotary_pos_emb$"
+  exclude_modules: []
     # - '.*language_model\..*'
 
 # Checkpoint configuration

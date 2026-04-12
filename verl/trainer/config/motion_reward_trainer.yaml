@@ -97,7 +97,7 @@ trainer:
   default_hdfs_dir: null
   project_name: motion-reward
   experiment_name: qwen3vl2b-rm
-  total_epochs: 4
+  total_epochs: 15
   total_training_steps: null
   logger: [ 'console', 'wandb' ]
   seed: 1
@@ -126,3 +126,4 @@ trainer:
 
 optim:
   lr_scheduler_type: cosine
+  lr_warmup_steps_ratio: 0.05

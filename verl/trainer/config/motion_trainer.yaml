@@ -204,16 +204,29 @@ actor_rollout_ref:
 
 reward_model:
   use_reward_loop: false
+  strategy: fsdp2
+  model:
+    path: null
+    external_lib: null
+    trust_remote_code: true
+    input_tokenizer: null
+    use_remove_padding: true
+    use_dynamic_bsz: true
+
+reward_manager:
+  name: naive
 
 # custom reward function definition
 custom_reward_function:
 
   # The path to the file containing your customized reward function.
   # If not specified, pre-implemented reward functions will be used.
-  path: /work/09156/arthurz/stampede3/research/cotnav/cotnav/verl_adapters/rewards/sparse_judge_refine.py
+  # path: /work/09156/arthurz/stampede3/research/cotnav/cotnav/verl_adapters/rewards/sparse_judge_refine.py
+  path: null
 
   # The name of the reward function within the specified file. Default is 'compute_score'.
-  name: compute_sparse_judge_reward
+  # name: compute_sparse_judge_reward
+  name: null
 
 # config for the algorithm
 algorithm:

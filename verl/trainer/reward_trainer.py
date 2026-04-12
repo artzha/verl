@@ -362,8 +362,13 @@ class RewardTrainer(SFTTrainer):
                     # Forward RM-specific metrics if present
                     for key in list(metrics.keys()):
                         if key.startswith("rm/"):
-                            metrics[f"train/{key[3:]}"] = metrics.pop(key)
-
+                            val = metrics.pop(key)
+                            with torch.no_grad():
+                                if isinstance(val, (list, tuple, torch.Tensor)):
+                                    val = torch.as_tensor(val, dtype=torch.float32).flatten()
+                                    val = val.mean().item()
+                            metrics[f"train/{key[3:]}"] = val
+                    
                     if self.engine.get_data_parallel_rank() == 0:
                         tracking.log(data=metrics, step=global_step)
 
