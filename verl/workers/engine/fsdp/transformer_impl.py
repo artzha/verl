@@ -1164,9 +1164,12 @@ class FSDPEngineWithRewardHead(FSDPEngine):
             # the last token of every sequence in the flat representation.
             "cu_seqlens": input_ids.offsets(),  # (bsz + 1,)
         }
+        attention_mask = micro_batch["attention_mask"]  # nested (bsz, *)
 
         if use_remove_padding:
             input_ids_rmpad = input_ids.values().unsqueeze(0)       # (1, total_nnz)
+            valid_lens = torch.stack([seq.to(torch.int64).sum() for seq in attention_mask.unbind()], dim=0)
+            output_args["last_valid_token_idxs"] = output_args["cu_seqlens"][:-1] + torch.clamp(valid_lens, min=1) - 1
             if position_ids.dim() == 3:
                 # For jagged 3D nested tensors, .values() layout can vary with ragged axis
                 # (e.g., equal-length batches may expose shape (bsz*4, seqlen)). Re-pack from
@@ -1197,8 +1200,8 @@ class FSDPEngineWithRewardHead(FSDPEngine):
         """Extract per-sequence scalar rewards from the last valid token.
 
         ``output.logits`` has shape ``(1, total_nnz, 1)`` for packed sequences.
-        ``cu_seqlens[i+1] - 1`` is the index of the last token of sequence i in
-        the flat representation.
+        ``last_valid_token_idxs`` is computed in ``prepare_model_inputs`` from
+        ``attention_mask`` and points to the last non-pad token of each sequence.
         """
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
 
@@ -1206,9 +1209,7 @@ class FSDPEngineWithRewardHead(FSDPEngine):
 
         if use_remove_padding:
             scores_flat = logits.squeeze(0).squeeze(-1)   # (total_nnz,)
-
-            cu_seqlens = output_args["cu_seqlens"]         # (bsz + 1,) on same device
-            last_token_idxs = cu_seqlens[1:] - 1           # (bsz,)
+            last_token_idxs = output_args["last_valid_token_idxs"].to(device=scores_flat.device, dtype=torch.long)
             rewards = scores_flat[last_token_idxs]         # (bsz,)
         else:
             raise NotImplementedError("reward_model engine requires use_remove_padding=True")

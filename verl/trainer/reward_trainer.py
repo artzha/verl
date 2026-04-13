@@ -34,6 +34,7 @@ Usage:
 
 import logging
 import os
+import warnings
 from functools import partial
 
 os.environ["NCCL_DEBUG"] = "WARN"
@@ -99,6 +100,14 @@ def rm_loss(config, model_output, data, dp_group=None):
 
     # Bradley-Terry loss: -log sigmoid(r_chosen - r_rejected)
     loss = -F.logsigmoid(chosen_rewards - rejected_rewards).mean()
+    # global_batch_size = tu.get_non_tensor_data(data=data, key="global_batch_size", default=None)
+    # if global_batch_size is not None:
+    #     # If microbatching, average loss after summing over all pairs.
+    #     # (a + b) / n = a/n + b/n
+    #     total_pairs = max(int(global_batch_size) // 2, 1)
+    #     loss = loss.sum() / total_pairs
+    # else:
+    #     loss = loss.mean()
 
     with torch.no_grad():
         margin = (chosen_rewards - rejected_rewards).mean()
@@ -276,7 +285,11 @@ class RewardTrainer(SFTTrainer):
         last_valid_metric = None
         early_stop_patience = int(getattr(self.config.trainer, "early_stop_patience", 0) or 0)
         early_stop_min_delta = float(getattr(self.config.trainer, "early_stop_min_delta", 0.0) or 0.0)
-        best_val_loss = None
+        early_stop_metric = str(getattr(self.config.trainer, "early_stop_metric", "val/accuracy"))
+        early_stop_mode = str(getattr(self.config.trainer, "early_stop_mode", "max")).lower()
+        if early_stop_mode not in {"min", "max"}:
+            raise ValueError(f"trainer.early_stop_mode must be 'min' or 'max', got {early_stop_mode!r}")
+        best_val_metric = None
         bad_val_steps = 0
 
         log_with_rank(
@@ -379,6 +392,7 @@ class RewardTrainer(SFTTrainer):
 
                 if is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step):
                     val_losses = []
+                    val_accuracies = []
                     for val_data in self.val_dataloader:
                         val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
                         output = self.training_client.infer_batch(val_data)
@@ -386,6 +400,8 @@ class RewardTrainer(SFTTrainer):
                         if self.engine.is_mp_src_rank_with_outputs():
                             val_metrics = tu.get(output, "metrics")
                             val_losses.append(val_metrics["loss"])
+                            if "rm/accuracy" in val_metrics:
+                                val_accuracies.append(val_metrics["rm/accuracy"])
 
                     if self.engine.is_mp_src_rank_with_outputs():
                         val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
@@ -395,15 +411,44 @@ class RewardTrainer(SFTTrainer):
                             group=self.engine.get_data_parallel_group(),
                         )
                         val_loss_value = val_loss.detach().item()
+                        if len(val_accuracies) > 0:
+                            val_acc = torch.mean(torch.tensor(val_accuracies, device=self.device_name))
+                            torch.distributed.all_reduce(
+                                val_acc,
+                                op=torch.distributed.ReduceOp.AVG,
+                                group=self.engine.get_data_parallel_group(),
+                            )
+                            val_accuracy_value = val_acc.detach().item()
+                        else:
+                            val_accuracy_value = None
 
                     if is_logging:
                         metric = {"val/loss": val_loss_value}
+                        if val_accuracy_value is not None:
+                            metric["val/accuracy"] = val_accuracy_value
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
 
                     if self.engine.is_mp_src_rank_with_outputs() and early_stop_patience > 0:
-                        if best_val_loss is None or val_loss_value < best_val_loss - early_stop_min_delta:
-                            best_val_loss = val_loss_value
+                        if early_stop_metric == "val/accuracy":
+                            current_metric_value = val_accuracy_value
+                        elif early_stop_metric == "val/loss":
+                            current_metric_value = val_loss_value
+                        else:
+                            raise ValueError(f"Unsupported early_stop_metric={early_stop_metric!r}. Falling back to val/loss.")
+
+                        if (
+                            best_val_metric is None
+                            or (
+                                early_stop_mode == "min"
+                                and current_metric_value < best_val_metric - early_stop_min_delta
+                            )
+                            or (
+                                early_stop_mode == "max"
+                                and current_metric_value > best_val_metric + early_stop_min_delta
+                            )
+                        ):
+                            best_val_metric = current_metric_value
                             bad_val_steps = 0
                         else:
                             bad_val_steps += 1
@@ -418,7 +463,10 @@ class RewardTrainer(SFTTrainer):
 
                 if should_stop:
                     if is_logging:
-                        print(f"Early stopping at step {global_step} (best val loss: {best_val_loss:.6f}).")
+                        print(
+                            f"Early stopping at step {global_step} "
+                            f"(best {early_stop_metric}: {best_val_metric:.6f})."
+                        )
                     return
 
                 if is_last_step or (self.save_freq > 0 and is_save_step):
