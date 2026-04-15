@@ -61,6 +61,8 @@ class RMDataset(Dataset):
         self.rejected_key = config.get("rejected_key", "rejected")
         self.image_key = config.get("image_key", "image")
         self.video_key = config.get("video_key", "video")
+        self.chosen_image_key = config.get("chosen_image_key", "chosen_image")
+        self.rejected_image_key = config.get("rejected_image_key", "rejected_image")
 
         self.pad_mode = config.get("pad_mode", "right")
         assert self.pad_mode in ["right", "no_padding"], (
@@ -124,23 +126,36 @@ class RMDataset(Dataset):
         prompt = convert_nested_value_to_list_recursive(example[self.prompt_key])
         if not isinstance(prompt, list) or len(prompt) == 0:
             raise ValueError(f"{self.prompt_key} must be a non-empty list of messages.")
-
-        branch_message = convert_nested_value_to_list_recursive(example[branch_key])
-        if not isinstance(branch_message, dict):
-            raise ValueError(f"{branch_key} must be a message dict, got {type(branch_message)}")
-        if branch_message.get("role") != "assistant":
-            raise ValueError(f"{branch_key} role must be 'assistant', got {branch_message.get('role')!r}")
-        if not isinstance(branch_message.get("content"), str):
-            raise ValueError(f"{branch_key} content must be str, got {type(branch_message.get('content'))}")
+        
+        branch_messages = convert_nested_value_to_list_recursive(example[branch_key])
+        if not isinstance(branch_messages, list) or len(branch_messages) == 0:
+            raise ValueError(f"{branch_key} must be a non-empty list of messages.")
 
         messages = copy.deepcopy(prompt)
-        messages.append({"role": "assistant", "content": branch_message["content"]})
+        messages.extend(copy.deepcopy(branch_messages))
 
-        images = convert_nested_value_to_list_recursive(example[self.image_key]) if self.image_key in example else []
+        images = []
+        if self.image_key in example:
+            images = convert_nested_value_to_list_recursive(example[self.image_key])
+            if not isinstance(images, list):
+                images = [images]
+        branch_image_key = self.chosen_image_key if branch_key == self.chosen_key else self.rejected_image_key
+        branch_images = []
+        if branch_image_key in example:
+            branch_image_payload = convert_nested_value_to_list_recursive(example[branch_image_key])
+            if isinstance(branch_image_payload, list) and len(branch_image_payload) > 0:
+                first_item = branch_image_payload[0]
+                if isinstance(first_item, dict) and "image" in first_item:
+                    branch_images = first_item["image"]
+                else:
+                    branch_images = branch_image_payload
+            elif branch_image_payload is not None:
+                branch_images = [branch_image_payload]
+        images.extend(branch_images)
         videos = convert_nested_value_to_list_recursive(example[self.video_key]) if self.video_key in example else []
         if self.processor is None and (images or videos):
             raise ValueError("processor is required for multimodal RM rows with image/video payloads.")
-
+        
         image_offset, video_offset = 0, 0
         for message in messages:
             content = message.get("content")
@@ -410,8 +425,8 @@ if __name__ == "__main__":
     args = parse_args()
     cfg = OmegaConf.load(args.config) if Path(args.config).exists() else OmegaConf.create({})
     OmegaConf.resolve(cfg)
-    cfg.data.train_files = "data/unified_motion_rm_v1/parquet/train/train.parquet"
-    cfg.data.val_files = "data/unified_motion_rm_v1/parquet/val/val.parquet"
+    cfg.data.train_files = "data/unified_motion_rm_v2/parquet/train/train.parquet"
+    cfg.data.val_files = "data/unified_motion_rm_v2/parquet/val/val.parquet"
     data_cfg = cfg.get("data", {})
     
 
