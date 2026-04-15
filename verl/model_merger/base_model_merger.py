@@ -52,6 +52,11 @@ def parse_args():
         help="Whether the model is a value model (currently only Megatron supported)",
     )
     base_op_parser.add_argument(
+        "--is-token-classification-model",
+        action="store_true",
+        help="Force model merger to use AutoModelForTokenClassification.",
+    )
+    base_op_parser.add_argument(
         "--use_cpu_initialization",
         action="store_true",
         help="Whether to use CPU initialization for the model. This is useful for large models that cannot "
@@ -96,6 +101,8 @@ class ModelMergerConfig:
         trust_remote_code (bool): Whether to trust remote code. Defaults to False.
         is_value_model (bool): Whether the model is a value model (currently only Megatron
             supported). Defaults to False.
+        is_token_classification_model (bool): Whether to force AutoModelForTokenClassification
+            class selection. Defaults to False.
         local_dir (Optional[str]): Path to the saved model checkpoints. Defaults to None.
         hf_model_config_path (Optional[str]): Path to HuggingFace model configuration files. Defaults to None.
         hf_upload (bool): Whether to upload to HuggingFace (computed automatically). Not for initialization.
@@ -111,6 +118,7 @@ class ModelMergerConfig:
     tie_word_embedding: bool = False
     trust_remote_code: bool = False
     is_value_model: bool = False
+    is_token_classification_model: bool = False
     local_dir: Optional[str] = None
     hf_model_config_path: Optional[str] = None
     hf_upload: bool = field(init=False)
@@ -131,6 +139,7 @@ def generate_config_from_args(args: argparse.Namespace) -> ModelMergerConfig:
         "tie_word_embedding": args.tie_word_embedding,
         "trust_remote_code": args.trust_remote_code,
         "is_value_model": args.is_value_model,
+        "is_token_classification_model": args.is_token_classification_model,
         "local_dir": args.local_dir,
         "hf_model_config_path": os.path.join(args.local_dir, "huggingface"),
         "use_cpu_initialization": args.use_cpu_initialization,
@@ -189,12 +198,19 @@ class BaseModelMerger(ABC):
         )
 
     def get_transformers_auto_model_class(self):
-        has_remote_code = hasattr(self.model_config, "auto_map") and any(
-            self.model_config.architectures[0] in val for val in self.model_config.auto_map.values()
+        if self.config.is_token_classification_model:
+            print("Using AutoModelForTokenClassification due to --is-token-classification-model.")
+            return AutoModelForTokenClassification
+
+        architectures = getattr(self.model_config, "architectures", None) or []
+        primary_arch = architectures[0] if architectures else ""
+        auto_map = getattr(self.model_config, "auto_map", None) or {}
+        has_remote_code = isinstance(auto_map, dict) and bool(primary_arch) and any(
+            isinstance(val, str) and primary_arch in val for val in auto_map.values()
         )
         if has_remote_code:
             auto_class = next(
-                k for k, v in self.model_config.auto_map.items() if self.model_config.architectures[0] in v
+                k for k, v in auto_map.items() if isinstance(v, str) and primary_arch in v
             )
             match auto_class:
                 case "AutoModelForCausalLM":
@@ -206,14 +222,30 @@ class BaseModelMerger(ABC):
                 case _:
                     raise NotImplementedError(f"Unknown auto class {auto_class}")
         else:
-            if "ForTokenClassification" in self.model_config.architectures[0]:
+            if "ForTokenClassification" in primary_arch:
                 return AutoModelForTokenClassification
-            elif "ForCausalLM" in self.model_config.architectures[0]:
+            elif "ForCausalLM" in primary_arch:
                 return AutoModelForCausalLM
-            elif "ForConditionalGeneration" in self.model_config.architectures[0]:
+            elif "ForConditionalGeneration" in primary_arch:
                 return AutoModelForVision2Seq
 
-            raise NotImplementedError(f"Unknown architecture {self.model_config.architectures}")
+            raise NotImplementedError(f"Unknown architecture {architectures}")
+
+    @staticmethod
+    def _ensure_token_classification_registration():
+        try:
+            import verl.models.transformers.qwen3_vl_reward  # noqa: F401
+            return
+        except Exception:
+            pass
+
+        try:
+            from external.verl.verl.models.transformers import qwen3_vl_reward  # noqa: F401
+        except Exception as exc:
+            print(
+                "Warning: failed to import qwen3_vl_reward registration module before "
+                f"AutoModelForTokenClassification loading: {exc}"
+            )
 
     def patch_model_generation_config(self, model):
         """
@@ -291,6 +323,9 @@ class BaseModelMerger(ABC):
 
     def save_hf_model_and_tokenizer(self, state_dict: dict[str, torch.Tensor]):
         auto_model_class = self.get_transformers_auto_model_class()
+        if auto_model_class is AutoModelForTokenClassification:
+            self._ensure_token_classification_registration()
+
         with init_empty_weights():
             model = auto_model_class.from_config(
                 self.model_config, torch_dtype=torch.bfloat16, trust_remote_code=self.config.trust_remote_code
@@ -337,6 +372,8 @@ class BaseModelMerger(ABC):
             from peft import PeftModel
 
             print("Merging LoRA into base weights with PEFT...")
+            if auto_model_class is AutoModelForTokenClassification:
+                self._ensure_token_classification_registration()
             base_model = auto_model_class.from_pretrained(
                 self.config.target_dir, torch_dtype=torch.bfloat16, trust_remote_code=self.config.trust_remote_code
             )

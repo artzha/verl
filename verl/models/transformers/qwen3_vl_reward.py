@@ -95,7 +95,8 @@ class Qwen3VLRewardModel(Qwen3VLForConditionalGeneration):
         Calls the parent forward (which may be monkey-patched by verl for
         packed-sequence / remove-padding mode) with
         ``output_hidden_states=True``, then projects the last hidden state
-        through the reward head.
+        through the reward head and maps scores into ``[-1, 1]`` using
+        ``2 * sigmoid(x) - 1``.
 
         Args:
             input_ids:           (bsz, seq_len) or (1, total_nnz) for packed.
@@ -110,7 +111,7 @@ class Qwen3VLRewardModel(Qwen3VLForConditionalGeneration):
         Returns:
             ModelOutput with ``.logits`` of shape ``(..., num_labels)``.
         """
-        kwargs['output_hidden_states'] = True
+        kwargs["output_hidden_states"] = True
         outputs = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -125,7 +126,8 @@ class Qwen3VLRewardModel(Qwen3VLForConditionalGeneration):
         )
         # hidden_states[-1]: last transformer layer output
         last_hidden = outputs.hidden_states[-1]  # (..., hidden_size)
-        logits = self.score(last_hidden)          # (..., num_labels)
+        raw_scores = self.score(last_hidden)  # (..., num_labels)
+        logits = 2.0 * torch.sigmoid(raw_scores) - 1.0  # (..., num_labels), bounded in [-1, 1]
 
         return ModelOutput(logits=logits)
 
