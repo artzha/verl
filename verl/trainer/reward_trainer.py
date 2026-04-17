@@ -99,30 +99,31 @@ def rm_loss(config, model_output, data, dp_group=None):
     rejected_rewards = rewards[1::2] # (N,)
 
     pair_loss = -F.logsigmoid(chosen_rewards - rejected_rewards)
-    pair_loss_mask = data.get("pair_loss_mask", None)
-    if pair_loss_mask is None:
-        pair_mask = torch.ones_like(pair_loss, dtype=pair_loss.dtype, device=pair_loss.device)
+    pair_loss_weight = data.get("pair_loss_mask", None)
+    if pair_loss_weight is None:
+        pair_weight = torch.ones_like(pair_loss, dtype=pair_loss.dtype, device=pair_loss.device)
     else:
-        pair_loss_mask = pair_loss_mask.to(device=rewards.device, dtype=pair_loss.dtype)
-        assert pair_loss_mask.shape[0] == rewards.shape[0], (
+        pair_loss_weight = pair_loss_weight.to(device=rewards.device, dtype=pair_loss.dtype)
+        assert pair_loss_weight.shape[0] == rewards.shape[0], (
             "pair_loss_mask must have shape (2*N,) matching rewards. "
-            f"Got {tuple(pair_loss_mask.shape)} vs rewards {tuple(rewards.shape)}."
+            f"Got {tuple(pair_loss_weight.shape)} vs rewards {tuple(rewards.shape)}."
         )
-        pair_mask = torch.minimum(pair_loss_mask[::2], pair_loss_mask[1::2])
+        pair_weight = torch.minimum(pair_loss_weight[::2], pair_loss_weight[1::2])
 
-    denom = torch.clamp(pair_mask.sum(), min=1.0)
-    loss = (pair_loss * pair_mask).sum() / denom
+    denom = torch.clamp(pair_weight.sum(), min=1.0)
+    loss = (pair_loss * pair_weight).sum() / denom
 
     with torch.no_grad():
-        margin = ((chosen_rewards - rejected_rewards) * pair_mask).sum() / denom
-        accuracy = ((chosen_rewards > rejected_rewards).float() * pair_mask).sum() / denom
+        margin = ((chosen_rewards - rejected_rewards) * pair_weight).sum() / denom
+        accuracy = ((chosen_rewards > rejected_rewards).float() * pair_weight).sum() / denom
 
     metrics = {
         "rm/chosen_reward": chosen_rewards.detach().mean().item(),
         "rm/rejected_reward": rejected_rewards.detach().mean().item(),
         "rm/reward_margin": margin.item(),
         "rm/accuracy": accuracy.item(),
-        "rm/effective_pairs": pair_mask.detach().sum().item(),
+        "rm/effective_pairs": (pair_weight > 0).float().sum().item(),
+        "rm/effective_weight": pair_weight.detach().sum().item(),
     }
     return loss, metrics
 

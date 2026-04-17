@@ -114,6 +114,8 @@ class RMTensorCollator:
                 pair_valid_mask = item.get("pair_valid_mask", None)
                 if pair_valid_mask is None:
                     pair_valid_mask = torch.ones((len(pair_input_ids),), dtype=torch.float32)
+                num_valid_pairs = int(item.get("num_valid_pairs", int(pair_valid_mask.sum().item())))
+                num_valid_pairs = max(num_valid_pairs, 1)
                 chosen_mm_list = item.get("chosen_multi_modal_inputs", None)
                 rejected_mm_list = item.get("rejected_multi_modal_inputs", None)
 
@@ -121,13 +123,14 @@ class RMTensorCollator:
                     zip(pair_input_ids, pair_attention_mask, pair_position_ids, strict=True)
                 ):
                     mask_val = float(pair_valid_mask[pair_idx].item())
+                    weight_val = mask_val / float(num_valid_pairs)
                     all_input_ids.append(pair_ids[0])
                     all_input_ids.append(pair_ids[1])
                     all_attention_mask.append(pair_attn[0])
                     all_attention_mask.append(pair_attn[1])
                     all_position_ids.append(pair_pos[0])
                     all_position_ids.append(pair_pos[1])
-                    all_pair_loss_mask.extend([mask_val, mask_val])
+                    all_pair_loss_mask.extend([weight_val, weight_val])
                     if has_mm:
                         chosen_mm = None if chosen_mm_list is None else chosen_mm_list[pair_idx]
                         rejected_mm = None if rejected_mm_list is None else rejected_mm_list[pair_idx]
@@ -150,6 +153,8 @@ class RMTensorCollator:
             "input_ids": torch.nested.as_nested_tensor(all_input_ids, layout=torch.jagged),
             "attention_mask": torch.nested.as_nested_tensor(all_attention_mask, layout=torch.jagged),
             "position_ids": torch.nested.as_nested_tensor(all_position_ids, layout=torch.jagged),
+            # Per-sequence pair weight (duplicated for chosen/rejected). For grouped rows,
+            # each sample contributes total weight 1.0 across its valid pairs.
             "pair_loss_mask": torch.tensor(all_pair_loss_mask, dtype=torch.float32),
             # Synthetic loss_mask: engine uses data["loss_mask"].sum() for batch_num_tokens.
             # We use attention_mask (all valid tokens) as a proxy.
