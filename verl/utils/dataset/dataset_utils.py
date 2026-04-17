@@ -82,8 +82,10 @@ class SFTTensorCollator:
 class RMTensorCollator:
     """Collates RMDataset pairs into an interleaved flat batch for the engine.
 
-    Each item from RMDataset has:
+    Each item from RMDataset has either:
       - ``input_ids``:      (2, seq_len) — index 0 = chosen, 1 = rejected
+      - or grouped ``input_ids``: nested tensor over pairs, where each element
+        is (2, seq_len_pair)
       - ``attention_mask``: (2, seq_len)
       - ``position_ids``:   (2, seq_len) or (2, 4, seq_len) for Qwen3-VL
       - ``chosen_multi_modal_inputs``  (optional): dict[str, Tensor]
@@ -96,30 +98,59 @@ class RMTensorCollator:
     """
 
     def __call__(self, batch: list[dict]) -> dict:
-        N = len(batch)
         all_input_ids: list[torch.Tensor] = []
         all_attention_mask: list[torch.Tensor] = []
         all_position_ids: list[torch.Tensor] = []
+        all_pair_loss_mask: list[float] = []
         all_mm: list[NonTensorData] = []
 
         has_mm = "chosen_multi_modal_inputs" in batch[0]
 
         for item in batch:
-            # index 0 = chosen, index 1 = rejected
-            all_input_ids.append(item["input_ids"][0])
-            all_input_ids.append(item["input_ids"][1])
-            all_attention_mask.append(item["attention_mask"][0])
-            all_attention_mask.append(item["attention_mask"][1])
-            all_position_ids.append(item["position_ids"][0])
-            all_position_ids.append(item["position_ids"][1])
-            if has_mm:
-                all_mm.append(NonTensorData(item.get("chosen_multi_modal_inputs", None)))
-                all_mm.append(NonTensorData(item.get("rejected_multi_modal_inputs", None)))
+            if item["input_ids"].is_nested:
+                pair_input_ids = item["input_ids"].unbind()
+                pair_attention_mask = item["attention_mask"].unbind()
+                pair_position_ids = item["position_ids"].unbind()
+                pair_valid_mask = item.get("pair_valid_mask", None)
+                if pair_valid_mask is None:
+                    pair_valid_mask = torch.ones((len(pair_input_ids),), dtype=torch.float32)
+                chosen_mm_list = item.get("chosen_multi_modal_inputs", None)
+                rejected_mm_list = item.get("rejected_multi_modal_inputs", None)
+
+                for pair_idx, (pair_ids, pair_attn, pair_pos) in enumerate(
+                    zip(pair_input_ids, pair_attention_mask, pair_position_ids, strict=True)
+                ):
+                    mask_val = float(pair_valid_mask[pair_idx].item())
+                    all_input_ids.append(pair_ids[0])
+                    all_input_ids.append(pair_ids[1])
+                    all_attention_mask.append(pair_attn[0])
+                    all_attention_mask.append(pair_attn[1])
+                    all_position_ids.append(pair_pos[0])
+                    all_position_ids.append(pair_pos[1])
+                    all_pair_loss_mask.extend([mask_val, mask_val])
+                    if has_mm:
+                        chosen_mm = None if chosen_mm_list is None else chosen_mm_list[pair_idx]
+                        rejected_mm = None if rejected_mm_list is None else rejected_mm_list[pair_idx]
+                        all_mm.append(NonTensorData(chosen_mm))
+                        all_mm.append(NonTensorData(rejected_mm))
+            else:
+                # index 0 = chosen, index 1 = rejected
+                all_input_ids.append(item["input_ids"][0])
+                all_input_ids.append(item["input_ids"][1])
+                all_attention_mask.append(item["attention_mask"][0])
+                all_attention_mask.append(item["attention_mask"][1])
+                all_position_ids.append(item["position_ids"][0])
+                all_position_ids.append(item["position_ids"][1])
+                all_pair_loss_mask.extend([1.0, 1.0])
+                if has_mm:
+                    all_mm.append(NonTensorData(item.get("chosen_multi_modal_inputs", None)))
+                    all_mm.append(NonTensorData(item.get("rejected_multi_modal_inputs", None)))
 
         result = {
             "input_ids": torch.nested.as_nested_tensor(all_input_ids, layout=torch.jagged),
             "attention_mask": torch.nested.as_nested_tensor(all_attention_mask, layout=torch.jagged),
             "position_ids": torch.nested.as_nested_tensor(all_position_ids, layout=torch.jagged),
+            "pair_loss_mask": torch.tensor(all_pair_loss_mask, dtype=torch.float32),
             # Synthetic loss_mask: engine uses data["loss_mask"].sum() for batch_num_tokens.
             # We use attention_mask (all valid tokens) as a proxy.
             "loss_mask": torch.nested.as_nested_tensor(

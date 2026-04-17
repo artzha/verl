@@ -104,10 +104,24 @@ class RMDataset(Dataset):
         total = len(self.dataframe)
         print(f"dataset len: {total}")
 
-        required_cols = {self.prompt_key, self.chosen_key, self.rejected_key}
+        self.grouped_pairs = "pairs" in self.dataframe.columns
+        if self.grouped_pairs:
+            required_cols = {self.prompt_key, "pairs", "pair_valid_mask"}
+        else:
+            required_cols = {self.prompt_key, self.chosen_key, self.rejected_key}
         missing_cols = required_cols.difference(self.dataframe.columns)
         if missing_cols:
             raise ValueError(f"Missing required RM columns: {sorted(missing_cols)}")
+
+        self.max_pairs_per_sample = 1
+        if self.grouped_pairs and len(self.dataframe) > 0:
+            first_row = self.dataframe.iloc[0].to_dict()
+            pair_valid_mask = convert_nested_value_to_list_recursive(first_row.get("pair_valid_mask", []))
+            if isinstance(pair_valid_mask, np.ndarray):
+                pair_valid_mask = pair_valid_mask.tolist()
+            if not isinstance(pair_valid_mask, list):
+                raise ValueError("pair_valid_mask must be a list for grouped RM rows.")
+            self.max_pairs_per_sample = max(len(pair_valid_mask), 1)
 
         if self.max_samples > 0 and self.max_samples < total:
             if self.shuffle:
@@ -267,10 +281,7 @@ class RMDataset(Dataset):
             raise ValueError(f"Unknown pad mode {self.pad_mode}")
         return input_ids, attention_mask, position_ids, inputs
 
-    def __getitem__(self, item):
-        row_dict: dict[str, Any] = self.dataframe.iloc[item].to_dict()
-        tools, enable_thinking = None, None
-
+    def _build_pair_result(self, row_dict: dict[str, Any], tools: Any = None) -> dict[str, Any]:
         chosen_messages = self._build_messages(example=row_dict, branch_key=self.chosen_key)
         rejected_messages = self._build_messages(example=row_dict, branch_key=self.rejected_key)
 
@@ -291,9 +302,6 @@ class RMDataset(Dataset):
             tools,
         )
 
-        # Pairwise RM samples must stack chosen/rejected. Under no_padding mode, lengths
-        # can differ by one or more tokens (e.g., EOS/chat-template differences), so pad
-        # both branches to a shared per-sample length before stacking.
         chosen_len = int(chosen_input_ids.shape[-1])
         rejected_len = int(rejected_input_ids.shape[-1])
         pair_max_len = max(chosen_len, rejected_len)
@@ -330,8 +338,6 @@ class RMDataset(Dataset):
         if self.return_messages:
             result["messages"] = {"chosen": chosen_messages, "rejected": rejected_messages}
 
-        # Store chosen and rejected multi-modal inputs separately so that the reward
-        # trainer collator can interleave them correctly (chosen_0, rejected_0, ...).
         chosen_multi_modal_inputs: dict[str, torch.Tensor] = {}
         rejected_multi_modal_inputs: dict[str, torch.Tensor] = {}
         for key in set(chosen_mm.keys()).union(set(rejected_mm.keys())):
@@ -350,6 +356,72 @@ class RMDataset(Dataset):
         if len(chosen_multi_modal_inputs) > 0:
             result["chosen_multi_modal_inputs"] = chosen_multi_modal_inputs
             result["rejected_multi_modal_inputs"] = rejected_multi_modal_inputs
+        return result
+
+    def __getitem__(self, item):
+        row_dict: dict[str, Any] = self.dataframe.iloc[item].to_dict()
+        tools = None
+
+        if not self.grouped_pairs:
+            return self._build_pair_result(row_dict=row_dict, tools=tools)
+
+        prompt = row_dict[self.prompt_key]
+        videos = row_dict.get(self.video_key, [])
+        pair_entries = convert_nested_value_to_list_recursive(row_dict.get("pairs", []))
+        pair_valid_mask = convert_nested_value_to_list_recursive(row_dict.get("pair_valid_mask", []))
+   
+        if not isinstance(pair_entries, list) or not isinstance(pair_valid_mask, list):
+            raise ValueError("Grouped RM row requires list fields `pairs` and `pair_valid_mask`.")
+        if len(pair_entries) == 0:
+            raise ValueError("Grouped RM row must contain at least one pair entry.")
+        if len(pair_entries) != len(pair_valid_mask):
+            raise ValueError(
+                f"Grouped RM row has mismatched lengths: {len(pair_entries)=} vs {len(pair_valid_mask)=}."
+            )
+
+        pair_results: list[dict[str, Any]] = []
+        for pair_entry in pair_entries:
+            if not isinstance(pair_entry, dict):
+                raise ValueError(f"Grouped RM pair entry must be a dict, got {type(pair_entry)}")
+            pair_example = {
+                self.prompt_key: prompt,
+                self.chosen_key: pair_entry[self.chosen_key],
+                self.rejected_key: pair_entry[self.rejected_key],
+                self.video_key: videos,
+            }
+            if self.chosen_image_key in pair_entry:
+                pair_example[self.chosen_image_key] = pair_entry[self.chosen_image_key]
+            if self.rejected_image_key in pair_entry:
+                pair_example[self.rejected_image_key] = pair_entry[self.rejected_image_key]
+            pair_results.append(self._build_pair_result(row_dict=pair_example, tools=tools))
+
+        input_ids = torch.nested.as_nested_tensor(
+            [pair_result["input_ids"] for pair_result in pair_results], layout=torch.jagged
+        )
+        attention_mask = torch.nested.as_nested_tensor(
+            [pair_result["attention_mask"] for pair_result in pair_results], layout=torch.jagged
+        )
+        position_ids = torch.nested.as_nested_tensor(
+            [pair_result["position_ids"] for pair_result in pair_results], layout=torch.jagged
+        )
+        
+        result = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "pair_valid_mask": torch.tensor(pair_valid_mask, dtype=torch.float32),
+            "num_valid_pairs": int(row_dict['num_valid_pairs']),
+        }
+        if any("chosen_multi_modal_inputs" in pair_result for pair_result in pair_results):
+            result["chosen_multi_modal_inputs"] = [
+                pair_result.get("chosen_multi_modal_inputs", None) for pair_result in pair_results
+            ]
+            result["rejected_multi_modal_inputs"] = [
+                pair_result.get("rejected_multi_modal_inputs", None) for pair_result in pair_results
+            ]
+        if self.return_messages:
+            result["messages"] = [pair_result.get("messages", None) for pair_result in pair_results]
+
         return result
     
     def sanity_check(self, input_ids: torch.Tensor, messages: list[dict], tools: list[dict], enable_thinking: bool):
@@ -425,8 +497,8 @@ if __name__ == "__main__":
     args = parse_args()
     cfg = OmegaConf.load(args.config) if Path(args.config).exists() else OmegaConf.create({})
     OmegaConf.resolve(cfg)
-    cfg.data.train_files = "data/unified_motion_rm_v2/parquet/train/train.parquet"
-    cfg.data.val_files = "data/unified_motion_rm_v2/parquet/val/val.parquet"
+    cfg.data.train_files = "data/unified_motion_rm_v3/parquet/train/train.parquet"
+    cfg.data.val_files = "data/unified_motion_rm_v3/parquet/val/val.parquet"
     data_cfg = cfg.get("data", {})
     
 

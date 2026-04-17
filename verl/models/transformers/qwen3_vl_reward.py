@@ -127,9 +127,9 @@ class Qwen3VLRewardModel(Qwen3VLForConditionalGeneration):
         # hidden_states[-1]: last transformer layer output
         last_hidden = outputs.hidden_states[-1]  # (..., hidden_size)
         raw_scores = self.score(last_hidden)  # (..., num_labels)
-        logits = 2.0 * torch.sigmoid(raw_scores) - 1.0  # (..., num_labels), bounded in [-1, 1]
+        # logits = 2.0 * torch.sigmoid(raw_scores) - 1.0  # (..., num_labels), bounded in [-1, 1]
 
-        return ModelOutput(logits=logits)
+        return ModelOutput(logits=raw_scores)
 
 
 # Register so that AutoModelForTokenClassification.from_pretrained("Qwen/Qwen3-VL-*")

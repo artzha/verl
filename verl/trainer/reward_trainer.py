@@ -98,26 +98,31 @@ def rm_loss(config, model_output, data, dp_group=None):
     chosen_rewards = rewards[::2]    # (N,)
     rejected_rewards = rewards[1::2] # (N,)
 
-    # Bradley-Terry loss: -log sigmoid(r_chosen - r_rejected)
-    loss = -F.logsigmoid(chosen_rewards - rejected_rewards).mean()
-    # global_batch_size = tu.get_non_tensor_data(data=data, key="global_batch_size", default=None)
-    # if global_batch_size is not None:
-    #     # If microbatching, average loss after summing over all pairs.
-    #     # (a + b) / n = a/n + b/n
-    #     total_pairs = max(int(global_batch_size) // 2, 1)
-    #     loss = loss.sum() / total_pairs
-    # else:
-    #     loss = loss.mean()
+    pair_loss = -F.logsigmoid(chosen_rewards - rejected_rewards)
+    pair_loss_mask = data.get("pair_loss_mask", None)
+    if pair_loss_mask is None:
+        pair_mask = torch.ones_like(pair_loss, dtype=pair_loss.dtype, device=pair_loss.device)
+    else:
+        pair_loss_mask = pair_loss_mask.to(device=rewards.device, dtype=pair_loss.dtype)
+        assert pair_loss_mask.shape[0] == rewards.shape[0], (
+            "pair_loss_mask must have shape (2*N,) matching rewards. "
+            f"Got {tuple(pair_loss_mask.shape)} vs rewards {tuple(rewards.shape)}."
+        )
+        pair_mask = torch.minimum(pair_loss_mask[::2], pair_loss_mask[1::2])
+
+    denom = torch.clamp(pair_mask.sum(), min=1.0)
+    loss = (pair_loss * pair_mask).sum() / denom
 
     with torch.no_grad():
-        margin = (chosen_rewards - rejected_rewards).mean()
-        accuracy = (chosen_rewards > rejected_rewards).float().mean()
+        margin = ((chosen_rewards - rejected_rewards) * pair_mask).sum() / denom
+        accuracy = ((chosen_rewards > rejected_rewards).float() * pair_mask).sum() / denom
 
     metrics = {
         "rm/chosen_reward": chosen_rewards.detach().mean().item(),
         "rm/rejected_reward": rejected_rewards.detach().mean().item(),
         "rm/reward_margin": margin.item(),
         "rm/accuracy": accuracy.item(),
+        "rm/effective_pairs": pair_mask.detach().sum().item(),
     }
     return loss, metrics
 
@@ -178,6 +183,7 @@ class RewardTrainer(SFTTrainer):
             processor,
             max_samples=config.data.get("train_max_samples", -1),
         )
+        self.max_pairs_per_sample = int(getattr(self.train_dataset, "max_pairs_per_sample", 1))
         if config.data.val_files:
             self.val_dataset = create_rm_dataset(
                 config.data.val_files,
@@ -186,6 +192,12 @@ class RewardTrainer(SFTTrainer):
                 processor,
                 max_samples=config.data.get("val_max_samples", -1),
             )
+            val_max_pairs = int(getattr(self.val_dataset, "max_pairs_per_sample", self.max_pairs_per_sample))
+            if val_max_pairs != self.max_pairs_per_sample:
+                raise ValueError(
+                    f"Train/val max_pairs_per_sample mismatch: train={self.max_pairs_per_sample}, "
+                    f"val={val_max_pairs}. Re-pack datasets with a consistent max_pairs."
+                )
         else:
             self.val_dataset = None
 
@@ -227,9 +239,8 @@ class RewardTrainer(SFTTrainer):
             self.train_dataset, shuffle=True, num_replicas=dp_size, rank=dp_rank, drop_last=True
         )
 
-        # global_batch_size is the number of *pairs* per gradient step.
-        # RMTensorCollator converts each pair into 2 sequences, so the engine
-        # sees 2 * global_batch_size sequences per step.
+        # global_batch_size is the number of *samples* per gradient step.
+        # RMTensorCollator flattens each sample to 2 * max_pairs_per_sample sequences.
         self.global_batch_size = config.data.train_batch_size
         self.train_batch_size_per_dp = self.global_batch_size // dp_size
 
@@ -309,9 +320,9 @@ class RewardTrainer(SFTTrainer):
 
         start_epoch = global_step // self.steps_per_epoch
 
-        # Each dataloader item is one *pair*; the collator converts N pairs
-        # to 2*N sequences.  Pass the sequence count to the engine so that
-        # gradient-accumulation micro-batch sizes stay consistent.
+        # Each dataloader item is one sample; the collator converts it to
+        # 2 * max_pairs_per_sample sequences. Pass sequence counts to engine
+        # so gradient-accumulation micro-batch sizes stay consistent.
         micro_bsz = self.config.data.micro_batch_size_per_gpu
         assert micro_bsz % 2 == 0, (
             f"micro_batch_size_per_gpu must be even for RM training (got {micro_bsz}). "
@@ -322,11 +333,11 @@ class RewardTrainer(SFTTrainer):
             "use_remove_padding": self.config.model.use_remove_padding,
             "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
             "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
-            # micro_batch_size_per_gpu is in *sequences* (2 per pair)
+            # micro_batch_size_per_gpu is in *sequences*
             "micro_batch_size_per_gpu": micro_bsz,
             "temperature": 1.0,
             # global_batch_size in *sequences*
-            "global_batch_size": self.global_batch_size * 2,
+            "global_batch_size": self.global_batch_size * 2 * self.max_pairs_per_sample,
             "pad_mode": DatasetPadMode.NO_PADDING,
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
         }
