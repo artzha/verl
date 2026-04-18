@@ -136,40 +136,28 @@ class RMDataset(Dataset):
     def __len__(self):
         return len(self.dataframe)
 
-    def _build_messages(self, example: dict[str, Any], branch_key: str) -> list[dict[str, Any]]:
-        prompt = convert_nested_value_to_list_recursive(example[self.prompt_key])
-        if not isinstance(prompt, list) or len(prompt) == 0:
-            raise ValueError(f"{self.prompt_key} must be a non-empty list of messages.")
-        
-        branch_messages = convert_nested_value_to_list_recursive(example[branch_key])
-        if not isinstance(branch_messages, list) or len(branch_messages) == 0:
-            raise ValueError(f"{branch_key} must be a non-empty list of messages.")
+    def _expand_placeholders(
+        self,
+        messages: list[dict[str, Any]],
+        images: list[Any],
+        videos: list[Any],
+        context_label: str,
+    ) -> list[dict[str, Any]]:
+        """Walk ``messages`` in place and expand ``<image>``/``<video>`` tokens.
 
-        messages = copy.deepcopy(prompt)
-        messages.extend(copy.deepcopy(branch_messages))
+        Placeholders are consumed in order from ``images`` / ``videos`` and
+        both pools must be fully drained. Callers are responsible for
+        deep-copying ``messages`` beforehand if they need to preserve the
+        original message list.
 
-        images = []
-        if self.image_key in example:
-            images = convert_nested_value_to_list_recursive(example[self.image_key])
-            if not isinstance(images, list):
-                images = [images]
-        branch_image_key = self.chosen_image_key if branch_key == self.chosen_key else self.rejected_image_key
-        branch_images = []
-        if branch_image_key in example:
-            branch_image_payload = convert_nested_value_to_list_recursive(example[branch_image_key])
-            if isinstance(branch_image_payload, list) and len(branch_image_payload) > 0:
-                first_item = branch_image_payload[0]
-                if isinstance(first_item, dict) and "image" in first_item:
-                    branch_images = first_item["image"]
-                else:
-                    branch_images = branch_image_payload
-            elif branch_image_payload is not None:
-                branch_images = [branch_image_payload]
-        images.extend(branch_images)
-        videos = convert_nested_value_to_list_recursive(example[self.video_key]) if self.video_key in example else []
+        ``context_label`` is used only in error messages (e.g. ``"prompt"`` or
+        ``"chosen"``/``"rejected"``) to make mismatch errors self-describing.
+        """
         if self.processor is None and (images or videos):
-            raise ValueError("processor is required for multimodal RM rows with image/video payloads.")
-        
+            raise ValueError(
+                f"processor is required for multimodal {context_label} rows with image/video payloads."
+            )
+
         image_offset, video_offset = 0, 0
         for message in messages:
             content = message.get("content")
@@ -181,6 +169,11 @@ class RMDataset(Dataset):
                 if segment == "<image>":
                     if self.processor is None:
                         raise ValueError("processor is required to process <image> placeholders")
+                    if image_offset >= len(images):
+                        raise ValueError(
+                            f"{context_label} references more <image> placeholders than images "
+                            f"provided ({len(images)})."
+                        )
                     image = process_image(
                         images[image_offset],
                         image_patch_size=self.image_patch_size,
@@ -191,6 +184,11 @@ class RMDataset(Dataset):
                 elif segment == "<video>":
                     if self.processor is None:
                         raise ValueError("processor is required to process <video> placeholders")
+                    if video_offset >= len(videos):
+                        raise ValueError(
+                            f"{context_label} references more <video> placeholders than videos "
+                            f"provided ({len(videos)})."
+                        )
                     videos_item = videos[video_offset]
                     if isinstance(videos_item, np.ndarray):
                         videos_item = videos_item.tolist()
@@ -211,10 +209,85 @@ class RMDataset(Dataset):
             message["content"] = content_list
 
         if image_offset != len(images):
-            raise ValueError(f"image placeholders mismatch: used {image_offset}, provided {len(images)}.")
+            raise ValueError(
+                f"{context_label} image placeholders mismatch: used {image_offset}, "
+                f"provided {len(images)}."
+            )
         if video_offset != len(videos):
-            raise ValueError(f"video placeholders mismatch: used {video_offset}, provided {len(videos)}.")
+            raise ValueError(
+                f"{context_label} video placeholders mismatch: used {video_offset}, "
+                f"provided {len(videos)}."
+            )
         return messages
+
+    def _build_prompt_prefix(self, example: dict[str, Any]) -> list[dict[str, Any]]:
+        """Build the processed prompt messages once, branch-independent.
+
+        Under the strict placeholder split, prompt ``<image>`` placeholders
+        consume only shared media at ``self.image_key`` and ``<video>`` from
+        ``self.video_key``. Branch-specific images are resolved later in
+        :meth:`_build_branch_messages`.
+
+        The returned list contains ``content`` expanded into typed chunks
+        (``{"type": "image", "image": PIL.Image}`` / video tensor / text).
+        Callers may share the returned list across chosen and rejected full
+        message sequences; ``apply_chat_template`` is read-only w.r.t. media
+        so the expensive PIL / video tensors do not need to be duplicated.
+        """
+        prompt = convert_nested_value_to_list_recursive(example[self.prompt_key])
+        if not isinstance(prompt, list) or len(prompt) == 0:
+            raise ValueError(f"{self.prompt_key} must be a non-empty list of messages.")
+
+        images: list[Any] = []
+        if self.image_key in example:
+            images = convert_nested_value_to_list_recursive(example[self.image_key])
+            if not isinstance(images, list):
+                images = [images]
+        videos: list[Any] = (
+            convert_nested_value_to_list_recursive(example[self.video_key])
+            if self.video_key in example
+            else []
+        )
+
+        return self._expand_placeholders(
+            messages=copy.deepcopy(prompt),
+            images=images,
+            videos=videos,
+            context_label="prompt",
+        )
+
+    def _build_branch_messages(self, example: dict[str, Any], branch_key: str) -> list[dict[str, Any]]:
+        """Build the processed branch messages for either chosen or rejected.
+
+        Placeholders in the branch consume only branch-specific images
+        (``self.chosen_image_key`` / ``self.rejected_image_key``). ``<video>``
+        is effectively disallowed because the branch video pool is always
+        empty; any branch ``<video>`` will trip the shared
+        :meth:`_expand_placeholders` video-pool check.
+        """
+        branch_messages = convert_nested_value_to_list_recursive(example[branch_key])
+        if not isinstance(branch_messages, list) or len(branch_messages) == 0:
+            raise ValueError(f"{branch_key} must be a non-empty list of messages.")
+
+        branch_image_key = self.chosen_image_key if branch_key == self.chosen_key else self.rejected_image_key
+        branch_images: list[Any] = []
+        if branch_image_key in example:
+            branch_image_payload = convert_nested_value_to_list_recursive(example[branch_image_key])
+            if isinstance(branch_image_payload, list) and len(branch_image_payload) > 0:
+                first_item = branch_image_payload[0]
+                if isinstance(first_item, dict) and "image" in first_item:
+                    branch_images = first_item["image"]
+                else:
+                    branch_images = branch_image_payload
+            elif branch_image_payload is not None:
+                branch_images = [branch_image_payload]
+
+        return self._expand_placeholders(
+            messages=copy.deepcopy(branch_messages),
+            images=branch_images,
+            videos=[],
+            context_label=branch_key,
+        )
 
     def _process_single_message(
         self,
@@ -281,9 +354,27 @@ class RMDataset(Dataset):
             raise ValueError(f"Unknown pad mode {self.pad_mode}")
         return input_ids, attention_mask, position_ids, inputs
 
-    def _build_pair_result(self, row_dict: dict[str, Any], tools: Any = None) -> dict[str, Any]:
-        chosen_messages = self._build_messages(example=row_dict, branch_key=self.chosen_key)
-        rejected_messages = self._build_messages(example=row_dict, branch_key=self.rejected_key)
+    def _build_pair_result(
+        self,
+        row_dict: dict[str, Any],
+        tools: Any = None,
+        prompt_prefix: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        # Build (or reuse) the branch-independent prompt prefix once. Shared
+        # across chosen/rejected via reference; apply_chat_template is
+        # read-only w.r.t. message media so this is safe and avoids
+        # duplicating expensive PIL / video tensor objects.
+        if prompt_prefix is None:
+            prompt_prefix = self._build_prompt_prefix(example=row_dict)
+
+        chosen_branch = self._build_branch_messages(example=row_dict, branch_key=self.chosen_key)
+        rejected_branch = self._build_branch_messages(example=row_dict, branch_key=self.rejected_key)
+
+        # Compose full message lists. Outer list is a fresh concatenation so
+        # the two sequences are independent at the list level; inner message
+        # dicts from the prefix are shared by reference (intentional).
+        chosen_messages = list(prompt_prefix) + chosen_branch
+        rejected_messages = list(prompt_prefix) + rejected_branch
 
         chosen_input_ids, chosen_attention_mask, chosen_position_ids, chosen_mm = self._process_single_message(
             chosen_messages
@@ -379,6 +470,12 @@ class RMDataset(Dataset):
                 f"Grouped RM row has mismatched lengths: {len(pair_entries)=} vs {len(pair_valid_mask)=}."
             )
 
+        # Build the branch-independent prompt prefix ONCE per row and share it
+        # across every pair. The prefix is sourced from `row_dict` (not the
+        # per-pair example) so row-level `image_key` / `video_key` payloads are
+        # consumed exactly once, avoiding N duplicated placeholder walks.
+        prompt_prefix = self._build_prompt_prefix(example=row_dict)
+
         pair_results: list[dict[str, Any]] = []
         for pair_entry in pair_entries:
             if not isinstance(pair_entry, dict):
@@ -393,7 +490,13 @@ class RMDataset(Dataset):
                 pair_example[self.chosen_image_key] = pair_entry[self.chosen_image_key]
             if self.rejected_image_key in pair_entry:
                 pair_example[self.rejected_image_key] = pair_entry[self.rejected_image_key]
-            pair_results.append(self._build_pair_result(row_dict=pair_example, tools=tools))
+            pair_results.append(
+                self._build_pair_result(
+                    row_dict=pair_example,
+                    tools=tools,
+                    prompt_prefix=prompt_prefix,
+                )
+            )
 
         input_ids = torch.nested.as_nested_tensor(
             [pair_result["input_ids"] for pair_result in pair_results], layout=torch.jagged
@@ -462,6 +565,7 @@ class RMDataset(Dataset):
 
 if __name__ == "__main__":
     from pathlib import Path
+    import time
 
     from omegaconf import OmegaConf
     from transformers import AutoProcessor, AutoTokenizer
@@ -531,15 +635,66 @@ if __name__ == "__main__":
         config=data_cfg,
         max_samples=args.max_samples,
     )
-    print(f"dataset len: {len(dataset)}")
-    sample = dataset[0]
+    dataset_len = len(dataset)
+    print(f"dataset len: {dataset_len}")
+    if dataset_len == 0:
+        raise ValueError("Dataset is empty; cannot run smoke/perf checks.")
+
+    sample_times_ms = []
+    per_valid_pair_times_ms = []
+    total_valid_pairs = 0.0
+    first_sample = None
+    perf_start = time.perf_counter()
+    for idx in range(dataset_len):
+        t0 = time.perf_counter()
+        sample = dataset[idx]
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        sample_times_ms.append(elapsed_ms)
+
+        # Normalize timing by the effective number of valid pairs in this sample.
+        if "num_valid_pairs" in sample:
+            valid_pairs = float(sample["num_valid_pairs"])
+        elif "pair_valid_mask" in sample:
+            valid_pairs = float(sample["pair_valid_mask"].sum().item())
+        else:
+            valid_pairs = 1.0
+        valid_pairs = max(valid_pairs, 1.0)
+        total_valid_pairs += valid_pairs
+        per_valid_pair_times_ms.append(elapsed_ms / valid_pairs)
+        if first_sample is None:
+            first_sample = sample
+    perf_total_s = time.perf_counter() - perf_start
+
+    print(
+        "sample load time (ms): "
+        f"min={min(sample_times_ms):.2f}, "
+        f"max={max(sample_times_ms):.2f}, "
+        f"avg={sum(sample_times_ms) / len(sample_times_ms):.2f}"
+    )
+    print(
+        "valid-pair normalized load time (ms/pair): "
+        f"min={min(per_valid_pair_times_ms):.2f}, "
+        f"max={max(per_valid_pair_times_ms):.2f}, "
+        f"avg={sum(per_valid_pair_times_ms) / len(per_valid_pair_times_ms):.2f}"
+    )
+    print(
+        "sample load throughput: "
+        f"{dataset_len / max(perf_total_s, 1e-9):.2f} samples/s "
+        f"(total={perf_total_s:.2f}s)"
+    )
+    print(
+        "pair load throughput: "
+        f"{total_valid_pairs / max(perf_total_s, 1e-9):.2f} valid_pairs/s "
+        f"(total_valid_pairs={total_valid_pairs:.1f})"
+    )
+
+    sample = first_sample
     print("sample keys:", list(sample.keys()))
     print("input_ids shape:", tuple(sample["input_ids"].shape))
     print("attention_mask shape:", tuple(sample["attention_mask"].shape))
     print("position_ids shape:", tuple(sample["position_ids"].shape))
-    for mm_key in ("chosen_multi_modal_inputs", "rejected_multi_modal_inputs"):
-        if mm_key in sample:
-            print(f"{mm_key} keys:", list(sample[mm_key].keys()))
-            for k, v in sample[mm_key].items():
-                if isinstance(v, torch.Tensor):
-                    print(f"  {k}: {tuple(v.shape)}")
+    # for mm_key in ("chosen_multi_modal_inputs", "rejected_multi_modal_inputs"):
+    #     if mm_key in sample:
+    #         for k, v in sample[mm_key].items():
+    #             if isinstance(v, torch.Tensor):
+    #                 print(f"  {k}: {tuple(v.shape)}")
