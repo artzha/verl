@@ -110,12 +110,23 @@ def rm_loss(config, model_output, data, dp_group=None):
         )
         pair_weight = torch.minimum(pair_loss_weight[::2], pair_loss_weight[1::2])
 
-    denom = torch.clamp(pair_weight.sum(), min=1.0)
-    loss = (pair_loss * pair_weight).sum() / denom
+    local_pair_weight_sum = (pair_loss * pair_weight).sum()
+
+    batch_pair_weight = tu.get_non_tensor_data(data, "batch_pair_weight", None)
+    dp_size = tu.get_non_tensor_data(data, "dp_size", 1)
+
+    if batch_pair_weight is not None and float(batch_pair_weight) > 0.0:
+        denom, scale = float(batch_pair_weight), int(dp_size)
+        loss = local_pair_weight_sum / denom * scale
+    else:
+        # Fallback: legacy single-microbatch / no-DP-aggregate behaviour
+        denom, scale = pair_weight.sum().clamp(min=1e-8), 1.0
+        loss = local_pair_weight_sum / denom
 
     with torch.no_grad():
-        margin = ((chosen_rewards - rejected_rewards) * pair_weight).sum() / denom
-        accuracy = ((chosen_rewards > rejected_rewards).float() * pair_weight).sum() / denom
+        metric_denom = pair_weight.sum().clamp(min=1e-8)
+        margin = ((chosen_rewards - rejected_rewards) * pair_weight).sum() / metric_denom
+        accuracy = ((chosen_rewards > rejected_rewards).float() * pair_weight).sum() / metric_denom
 
     metrics = {
         "rm/chosen_reward": chosen_rewards.detach().mean().item(),
@@ -282,6 +293,21 @@ class RewardTrainer(SFTTrainer):
     # Training loop
     # ------------------------------------------------------------------
 
+    def _inject_batch_pair_weight(self, data):
+        pair_mask = data.get("pair_loss_mask", None)
+        if pair_mask is None:
+            # e.g., N pairs with uniform weight 1.0
+            local = torch.tensor(float(data.batch_size[0]) / 2.0, device=self.device_name)
+        else:
+            pm = pair_mask.to(self.device_name)
+            # chosen/rejected share weights; per-pair weight = every other element
+            local = pm[::2].sum()
+        torch.distributed.all_reduce(
+            local, op=torch.distributed.ReduceOp.SUM,
+            group=self.engine.get_data_parallel_group(),
+        )
+        tu.assign_non_tensor(data, batch_pair_weight=float(local.item()))
+
     def fit(self):
         is_logging = self.engine.is_mp_src_rank_with_outputs() and self.engine.get_data_parallel_rank() == 0
 
@@ -359,6 +385,7 @@ class RewardTrainer(SFTTrainer):
                 global_step += 1
 
                 data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
+                self._inject_batch_pair_weight(data=data)
                 batch_seqlens = self._get_batch_seqlens(data=data)
                 batch_seqlens_ntd = NonTensorData(batch_seqlens)
                 tu.assign_non_tensor(data, update_lr_scheduler=True, global_token_num=batch_seqlens_ntd)
@@ -407,6 +434,7 @@ class RewardTrainer(SFTTrainer):
                     val_accuracies = []
                     for val_data in self.val_dataloader:
                         val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
+                        self._inject_batch_pair_weight(data=val_data)
                         output = self.training_client.infer_batch(val_data)
 
                         if self.engine.is_mp_src_rank_with_outputs():
