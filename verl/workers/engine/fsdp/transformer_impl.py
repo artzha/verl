@@ -18,9 +18,10 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 import gc
 import logging
 import os
+import time
 import warnings
 from contextlib import nullcontext
-from typing import Callable, ContextManager, Optional
+from typing import Any, Callable, ContextManager, Optional
 
 import torch
 import torch.distributed
@@ -499,10 +500,14 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
 
         # compute num_tokens in global batch for loss normalization
+        torch.cuda.synchronize()
+        t_allreduce_start = time.perf_counter()
         batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
         torch.distributed.all_reduce(
             batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
         )
+        torch.cuda.synchronize()
+        t_allreduce_end = time.perf_counter()
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
@@ -511,6 +516,7 @@ class FSDPEngine(BaseEngine):
         )
 
         output_lst = []
+        total_backward_ms = 0.0
 
         ctx = torch.no_grad() if forward_only else nullcontext()
 
@@ -520,10 +526,20 @@ class FSDPEngine(BaseEngine):
 
                 if not forward_only:
                     # FSDP2 can keep params in float32; cast loss to float32 so gradients match param dtype and avoid assign error
+                    torch.cuda.synchronize()
+                    t_bwd_start = time.perf_counter()
                     loss = loss.float()
                     loss.backward()
+                    torch.cuda.synchronize()
+                    t_bwd_end = time.perf_counter()
+                    total_backward_ms += (t_bwd_end - t_bwd_start) * 1000
+                    meta_info["metrics"]["perf/backward_ms"] = (t_bwd_end - t_bwd_start) * 1000
 
             output_lst.append(meta_info)
+
+        if output_lst and not forward_only:
+            output_lst[-1]["metrics"]["perf/token_allreduce_ms"] = (t_allreduce_end - t_allreduce_start) * 1000
+            output_lst[-1]["metrics"]["perf/total_backward_ms"] = total_backward_ms
 
         # postprocess and return
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
@@ -546,6 +562,8 @@ class FSDPEngine(BaseEngine):
         """
         assert self.optimizer_config.clip_grad is not None
 
+        torch.cuda.synchronize()
+        t_clip_start = time.perf_counter()
         if isinstance(self.module, FSDP):
             grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)
         elif isinstance(self.module, FSDPModule):
@@ -554,17 +572,43 @@ class FSDPEngine(BaseEngine):
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.module.parameters(), max_norm=self.optimizer_config.clip_grad
             )
+        torch.cuda.synchronize()
+        t_clip_end = time.perf_counter()
 
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
-        # if grad_norm is not finite, skip the update
+        torch.cuda.synchronize()
+        t_optim_start = time.perf_counter()
         if not torch.isfinite(grad_norm):
             print(f"WARN: grad_norm is not finite: {grad_norm}")
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()
+        torch.cuda.synchronize()
+        t_optim_end = time.perf_counter()
+
+        self._last_optimizer_perf = {
+            "perf/grad_clip_ms": (t_clip_end - t_clip_start) * 1000,
+            "perf/optimizer_step_ms": (t_optim_end - t_optim_start) * 1000,
+        }
         return grad_norm.item()
+
+    def train_batch(self, data: TensorDict, loss_function: Callable) -> Any:
+        """Override to inject optimizer perf metrics into the output."""
+        from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
+
+        maybe_fix_3d_position_ids(data)
+
+        self.optimizer_zero_grad()
+        outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
+        grad_norm = self.optimizer_step()
+        if self.is_mp_src_rank_with_outputs():
+            assert "grad_norm" not in outputs["metrics"]
+            outputs["metrics"]["grad_norm"] = grad_norm
+            optimizer_perf = getattr(self, "_last_optimizer_perf", {})
+            outputs["metrics"].update(optimizer_perf)
+        return outputs
 
     def lr_scheduler_step(self):
         """
@@ -1222,26 +1266,50 @@ class FSDPEngineWithRewardHead(FSDPEngine):
 
     def forward_step(self, micro_batch: "TensorDict", loss_function, forward_only):
         device_name = get_device_name()
+
+        torch.cuda.synchronize()
+        t_h2d_start = time.perf_counter()
         micro_batch = micro_batch.to(get_device_id())
+        torch.cuda.synchronize()
+        t_h2d_end = time.perf_counter()
+
+        t_prep_start = time.perf_counter()
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+        t_prep_end = time.perf_counter()
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+            torch.cuda.synchronize()
+            t_fwd_start = time.perf_counter()
             raw_output = self.module(**model_inputs, use_cache=False)
+            torch.cuda.synchronize()
+            t_fwd_end = time.perf_counter()
 
+            t_post_start = time.perf_counter()
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch
             )
+            t_post_end = time.perf_counter()
 
             if loss_function is not None:
+                t_loss_start = time.perf_counter()
                 loss, metrics = loss_function(
                     model_output=model_output,
                     data=micro_batch,
                     dp_group=self.get_data_parallel_group(),
                 )
+                torch.cuda.synchronize()
+                t_loss_end = time.perf_counter()
             else:
                 assert forward_only
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
+                t_loss_start = t_loss_end = time.perf_counter()
+
+            metrics["perf/h2d_ms"] = (t_h2d_end - t_h2d_start) * 1000
+            metrics["perf/prepare_inputs_ms"] = (t_prep_end - t_prep_start) * 1000
+            metrics["perf/model_forward_ms"] = (t_fwd_end - t_fwd_start) * 1000
+            metrics["perf/prepare_outputs_ms"] = (t_post_end - t_post_start) * 1000
+            metrics["perf/loss_compute_ms"] = (t_loss_end - t_loss_start) * 1000
 
             output = {
                 "model_output": model_output,

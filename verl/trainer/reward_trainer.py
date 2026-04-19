@@ -52,6 +52,7 @@ from tqdm import tqdm
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode, RMTensorCollator
+from verl.utils.debug import marked_timer
 from verl.utils.device import auto_set_device, get_device_name
 from verl.utils.distributed import destroy_global_process_group
 from verl.utils.logger import log_with_rank
@@ -62,6 +63,25 @@ from verl.trainer.sft_trainer import SFTTrainer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_RM_LOGGING_LEVEL", "WARN"))
+
+
+def _flatten_numeric_values(value):
+    """Recursively flatten nested metric containers into numeric scalars."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return []
+        return value.detach().to(dtype=torch.float32).flatten().tolist()
+
+    if isinstance(value, (int, float, bool)):
+        return [float(value)]
+
+    if isinstance(value, (list, tuple)):
+        flattened = []
+        for item in value:
+            flattened.extend(_flatten_numeric_values(item))
+        return flattened
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +379,9 @@ class RewardTrainer(SFTTrainer):
         meta_info = {
             "use_remove_padding": self.config.model.use_remove_padding,
             "use_dynamic_bsz": self.config.data.use_dynamic_bsz,
+            # RM requires chosen/rejected to stay together under dynamic batching.
+            # Group size 2 enforces pair-aware micro-batch partitioning.
+            "dynamic_group_size": 2,
             "max_token_len_per_gpu": self.config.data.max_token_len_per_gpu,
             # micro_batch_size_per_gpu is in *sequences*
             "micro_batch_size_per_gpu": micro_bsz,
@@ -369,11 +392,14 @@ class RewardTrainer(SFTTrainer):
             "pad_token_id": self.model_config.tokenizer.pad_token_id,
         }
 
+        dp_size = self.engine.get_data_parallel_size()
+        n_gpus = dp_size
+        memory_snapshot_step = int(getattr(self.config.trainer, "memory_snapshot_step", 0) or 0)
+
         total_tokens = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
-
-            for _step_in_epoch, data in enumerate(
+            data_iter = iter(
                 tqdm(
                     self.train_dataloader,
                     initial=global_step % self.steps_per_epoch if epoch == start_epoch else 0,
@@ -381,23 +407,54 @@ class RewardTrainer(SFTTrainer):
                     desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
                     disable=not is_logging,
                 )
-            ):
+            )
+
+            for _step_in_epoch in range(self.steps_per_epoch):
+                timing_raw: dict[str, float] = {}
+
+                # ---- Zone 1: DataLoader iteration (CPU-bound) ----
+                with marked_timer("data_loading", timing_raw, color="green"):
+                    data = next(data_iter, None)
+                if data is None:
+                    break
+
                 global_step += 1
 
-                data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
-                self._inject_batch_pair_weight(data=data)
-                batch_seqlens = self._get_batch_seqlens(data=data)
-                batch_seqlens_ntd = NonTensorData(batch_seqlens)
-                tu.assign_non_tensor(data, update_lr_scheduler=True, global_token_num=batch_seqlens_ntd)
+                with marked_timer("step", timing_raw, color="white"):
+                    # ---- Zone 2: Batch preparation (CPU -> metadata) ----
+                    with marked_timer("batch_prep", timing_raw, color="cyan"):
+                        data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
+                        self._inject_batch_pair_weight(data=data)
+                        batch_seqlens = self._get_batch_seqlens(data=data)
+                        batch_seqlens_ntd = NonTensorData(batch_seqlens)
+                        tu.assign_non_tensor(data, update_lr_scheduler=True, global_token_num=batch_seqlens_ntd)
 
-                if global_step == self.start_profile_step:
-                    self.training_client.start_profile()
+                    if global_step == self.start_profile_step:
+                        self.training_client.start_profile()
 
-                output = self.training_client.train_batch(data=data)
+                    # ---- Optional: CUDA memory snapshot ----
+                    if memory_snapshot_step > 0 and global_step == memory_snapshot_step:
+                        torch.cuda.memory._record_memory_history(max_entries=100000)
 
-                if global_step == self.end_profile_step:
-                    self.training_client.stop_profile()
+                    # ---- Zone 3+4+5: Forward + Backward + Optimizer (via engine) ----
+                    with marked_timer("train_batch", timing_raw, color="red"):
+                        output = self.training_client.train_batch(data=data)
 
+                    # ---- Dump memory snapshot if requested ----
+                    if memory_snapshot_step > 0 and global_step == memory_snapshot_step:
+                        snapshot_path = os.path.join(
+                            self.config.trainer.default_local_dir,
+                            f"memory_snapshot_step{global_step}_rank{torch.distributed.get_rank()}.pickle",
+                        )
+                        torch.cuda.memory._dump_snapshot(snapshot_path)
+                        torch.cuda.memory._record_memory_history(enabled=None)
+                        if is_logging:
+                            print(f"CUDA memory snapshot saved to {snapshot_path}")
+
+                    if global_step == self.end_profile_step:
+                        self.training_client.stop_profile()
+
+                # ---- Compute and log perf + training metrics ----
                 if self.engine.is_mp_src_rank_with_outputs():
                     metrics = tu.get(output, "metrics")
 
@@ -420,7 +477,31 @@ class RewardTrainer(SFTTrainer):
                                     val = torch.as_tensor(val, dtype=torch.float32).flatten()
                                     val = val.mean().item()
                             metrics[f"train/{key[3:]}"] = val
-                    
+
+                    # Forward engine-level perf sub-timings if present
+                    for key in list(metrics.keys()):
+                        if key.startswith("perf/"):
+                            val = metrics[key]
+                            flattened_vals = _flatten_numeric_values(val)
+                            if flattened_vals:
+                                metrics[key] = sum(flattened_vals) / len(flattened_vals)
+
+                    # ---- Throughput & timing breakdown ----
+                    data_load_time = timing_raw.get("data_loading", 0.0)
+                    step_compute_time = timing_raw.get("step", 1e-9)
+                    wall_time = data_load_time + step_compute_time
+                    step_tokens = metrics["train/global_tokens"]
+
+                    metrics["perf/wall_time_per_step_s"] = wall_time
+                    metrics["perf/compute_time_per_step_s"] = step_compute_time
+                    metrics["perf/throughput_tok_per_sec_per_gpu"] = step_tokens / (wall_time * n_gpus)
+                    metrics["perf/data_loading_s"] = data_load_time
+                    metrics["perf/batch_prep_s"] = timing_raw.get("batch_prep", 0.0)
+                    metrics["perf/train_batch_s"] = timing_raw.get("train_batch", 0.0)
+                    metrics["perf/data_loading_pct"] = data_load_time / wall_time * 100
+                    metrics["perf/batch_prep_pct"] = timing_raw.get("batch_prep", 0.0) / wall_time * 100
+                    metrics["perf/train_batch_pct"] = timing_raw.get("train_batch", 0.0) / wall_time * 100
+
                     if self.engine.get_data_parallel_rank() == 0:
                         tracking.log(data=metrics, step=global_step)
 

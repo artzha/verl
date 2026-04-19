@@ -422,6 +422,103 @@ def rearrange_micro_batches(
     return micro_batches, micro_bsz_idx
 
 
+def rearrange_micro_batches_grouped(
+    batch,
+    max_token_len,
+    group_size,
+    dp_group=None,
+    num_batches_divided_by=None,
+    same_micro_num_in_dp=True,
+    min_num_micro_batch=None,
+    use_dynamic_bsz_balance=True,
+):
+    """
+    Split a batch into micro-batches while preserving fixed-size contiguous groups.
+
+    This is used by RM training where each logical item is a (chosen, rejected)
+    pair and dynamic batching must never split pair members across micro-batches.
+    """
+    if group_size <= 1:
+        return rearrange_micro_batches(
+            batch=batch,
+            max_token_len=max_token_len,
+            dp_group=dp_group,
+            num_batches_divided_by=num_batches_divided_by,
+            same_micro_num_in_dp=same_micro_num_in_dp,
+            min_num_micro_batch=min_num_micro_batch,
+            use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+        )
+
+    input_ids = batch["input_ids"]
+    if input_ids.is_nested:
+        seq_len_effective: torch.Tensor = input_ids.offsets().diff()
+        max_seq_len = int(seq_len_effective.max().item())
+    else:
+        max_seq_len = batch["attention_mask"].shape[-1]
+        seq_len_effective = batch["attention_mask"].sum(dim=1)
+
+    assert len(seq_len_effective) % group_size == 0, (
+        f"grouped dynamic batching requires batch size divisible by group_size, "
+        f"got len={len(seq_len_effective)} and group_size={group_size}"
+    )
+    assert max_token_len >= max_seq_len, (
+        f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
+    )
+
+    seq_workloads = calculate_workload(seq_len_effective).cpu().tolist()
+    group_indices = [list(range(i, i + group_size)) for i in range(0, len(seq_len_effective), group_size)]
+    group_workloads = [sum(seq_workloads[idx] for idx in indices) for indices in group_indices]
+    group_token_sums = [int(seq_len_effective[indices].sum().item()) for indices in group_indices]
+
+    max_group_token_len = max(group_token_sums)
+    assert max_token_len >= max_group_token_len, (
+        f"max_token_len must fit at least one complete group. "
+        f"Got {max_token_len=} and max_group_token_len={max_group_token_len}"
+    )
+
+    num_groups = len(group_indices)
+    total_group_tokens = sum(group_token_sums)
+    num_micro_batches = min(num_groups, ceildiv(total_group_tokens, max_token_len))
+    if min_num_micro_batch is not None:
+        num_micro_batches = max(min_num_micro_batch, num_micro_batches)
+    if dist.is_initialized() and same_micro_num_in_dp:
+        num_micro_batches = torch.tensor([num_micro_batches], device=get_device_name())
+        dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
+        num_micro_batches = num_micro_batches.cpu().item()
+    if num_batches_divided_by is not None:
+        num_micro_batches = roundup_divisible(num_micro_batches, num_batches_divided_by)
+
+    assert num_micro_batches <= num_groups
+
+    micro_group_idx = get_seqlen_balanced_partitions(group_workloads, num_micro_batches, equal_size=False)
+    if use_dynamic_bsz_balance:
+        micro_group_idx.sort(
+            key=lambda partition: (
+                sum(group_workloads[idx] for idx in partition),
+                partition[0] if partition else 0,
+            ),
+            reverse=True,
+        )
+        micro_group_idx = micro_group_idx[::2][::-1] + micro_group_idx[1::2]
+
+    micro_batches = []
+    micro_bsz_idx = []
+    for group_partition in micro_group_idx:
+        expanded_indices = []
+        for group_idx in group_partition:
+            expanded_indices.extend(group_indices[group_idx])
+        expanded_indices = sorted(expanded_indices)
+        assert len(expanded_indices) % group_size == 0, (
+            f"expanded group partition must be divisible by group_size, "
+            f"got len={len(expanded_indices)} and group_size={group_size}"
+        )
+        curr_micro_batch = tu.index_select_tensor_dict(batch, expanded_indices)
+        micro_batches.append(curr_micro_batch)
+        micro_bsz_idx.append(expanded_indices)
+
+    return micro_batches, micro_bsz_idx
+
+
 def get_reverse_idx(idx_map):
     """
     Build the inverse of an index mapping.

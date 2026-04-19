@@ -23,7 +23,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import is_npu_available
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
+from verl.utils.seqlen_balancing import rearrange_micro_batches, rearrange_micro_batches_grouped, restore_dynamic_batch
 
 
 def enable_full_determinism(seed: int):
@@ -68,25 +68,45 @@ def prepare_micro_batches(
     Prepare micro batches from data.
     """
     use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
+    dynamic_group_size = int(tu.get_non_tensor_data(data=data, key="dynamic_group_size", default=1) or 1)
     sp_size = tu.get_non_tensor_data(data=data, key="sp_size", default=1)
 
     if use_dynamic_bsz:
         assert "max_token_len_per_gpu" in data.keys(), "max_token_len_per_gpu must be set when use_dynamic_bsz is True"
         max_token_len_per_gpu = data["max_token_len_per_gpu"]
         max_token_len = max_token_len_per_gpu * sp_size
-        micro_batches, batch_idx_list = rearrange_micro_batches(
-            data,
-            max_token_len=max_token_len,
-            dp_group=dp_group,
-            num_batches_divided_by=num_batches_divided_by,
-            same_micro_num_in_dp=same_micro_num_in_dp,
-            min_num_micro_batch=min_num_micro_batch,
-            use_dynamic_bsz_balance=use_dynamic_bsz_balance,
-        )
+        if dynamic_group_size > 1:
+            micro_batches, batch_idx_list = rearrange_micro_batches_grouped(
+                data,
+                max_token_len=max_token_len,
+                group_size=dynamic_group_size,
+                dp_group=dp_group,
+                num_batches_divided_by=num_batches_divided_by,
+                same_micro_num_in_dp=same_micro_num_in_dp,
+                min_num_micro_batch=min_num_micro_batch,
+                use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+            )
+        else:
+            micro_batches, batch_idx_list = rearrange_micro_batches(
+                data,
+                max_token_len=max_token_len,
+                dp_group=dp_group,
+                num_batches_divided_by=num_batches_divided_by,
+                same_micro_num_in_dp=same_micro_num_in_dp,
+                min_num_micro_batch=min_num_micro_batch,
+                use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+            )
     else:
         micro_batch_size_per_gpu = data["micro_batch_size_per_gpu"]
         micro_batches = tu.chunk_tensordict(data, len(data) // micro_batch_size_per_gpu)
         batch_idx_list = None
+
+    if dynamic_group_size > 1:
+        for micro_batch in micro_batches:
+            assert len(micro_batch) % dynamic_group_size == 0, (
+                f"micro-batch size must be divisible by dynamic_group_size. "
+                f"Got len={len(micro_batch)} and dynamic_group_size={dynamic_group_size}"
+            )
     return micro_batches, batch_idx_list
 
 
