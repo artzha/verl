@@ -386,11 +386,13 @@ class RMDataset(Dataset):
         # Debug print once (function is once-decorated in multiturn_sft_dataset.py).
         print_assembled_message(
             self.tokenizer,
+            self.processor,
             chosen_messages,
             chosen_input_ids,
             chosen_attention_mask,
             chosen_attention_mask,
             tools,
+            self.apply_chat_template_kwargs,
         )
 
         chosen_len = int(chosen_input_ids.shape[-1])
