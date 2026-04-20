@@ -128,6 +128,10 @@ trainer:
 
   profile_interval: [-1, -1]
 
+  # Freeze LoRA adapters for this many steps so the randomly-initialised score
+  # head can stabilise before the backbone adapts. Set to 0 to disable.
+  score_head_warmup_steps: 0
+
 optim:
   lr_scheduler_type: cosine
   lr_warmup_steps_ratio: 0.05
