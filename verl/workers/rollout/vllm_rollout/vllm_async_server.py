@@ -476,6 +476,7 @@ class vLLMHttpServer:
         request_id: str,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
         priority: int = 0,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
@@ -514,7 +515,13 @@ class vLLMHttpServer:
         if video_data is not None:
             multi_modal_data["video"] = video_data
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        prompt_kwargs: dict[str, Any] = {
+            "prompt_token_ids": prompt_ids,
+            "multi_modal_data": multi_modal_data,
+        }
+        if mm_processor_kwargs is not None:
+            prompt_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+        prompt = TokensPrompt(**prompt_kwargs)
 
         # Add lora request
         lora_request = None

@@ -620,6 +620,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         sampling_params: dict[str, Any],
         request_id: str,
         image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
     ) -> list[int]:
-        ret = await self.rollout.generate(prompt_ids, sampling_params, request_id, image_data=image_data)
+        ret = await self.rollout.generate(
+            prompt_ids,
+            sampling_params,
+            request_id,
+            image_data=image_data,
+            video_data=video_data,
+        )
         return ret

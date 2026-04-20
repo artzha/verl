@@ -69,17 +69,39 @@ def once(func):
 
 
 @once
-def print_assembled_message(tokenizer, message_list, input_ids, loss_mask, attn_mask, tools):
+def print_assembled_message(tokenizer, processor, message_list, input_ids, loss_mask, attn_mask, tools, apply_kwargs):
     """
     Print the message after applying the chat template
     """
+    chat_formatter = processor if processor is not None else tokenizer
+    tokenized = chat_formatter.apply_chat_template(
+        message_list,
+        add_generation_prompt=False,
+        tokenize=False,
+        tools=tools,
+        **apply_kwargs,
+    )
+    per_message_token_counts = []
+    for idx, message in enumerate(message_list):
+        message_inputs = chat_formatter.apply_chat_template(
+            [message],
+            add_generation_prompt=False,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            tools=tools if idx == 0 else None,
+            **apply_kwargs,
+        )
+        per_message_token_counts.append(int(message_inputs["input_ids"].shape[-1]))
 
-    tokenized = tokenizer.apply_chat_template(message_list, add_generation_prompt=False, tokenize=False, tools=tools)
     sep = "\n\n"
     str = f"tokenized entire message:\n{tokenized}"
     str += sep
     decoded_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
     str += f"tokenized seperately    :\n{tokenizer.decode(decoded_ids)}"
+    str += sep
+    str += "token count per message:\n"
+    str += "\n".join([f"message[{idx}]: {count}" for idx, count in enumerate(per_message_token_counts)])
 
     logger.debug(str)
 
@@ -337,7 +359,7 @@ class MultiTurnSFTDataset(Dataset):
 
         assert image_offset == len(images), f"image_offset {image_offset} != len(images) {len(images)}"
         assert video_offset == len(videos), f"video_offset {video_offset} != len(videos) {len(videos)}"
-       
+
         return messages
 
     def __getitem__(self, item):
@@ -372,7 +394,21 @@ class MultiTurnSFTDataset(Dataset):
         assert input_ids.shape == loss_mask.shape == attention_mask.shape, (
             f"Shape mismatch: {input_ids.shape}, {loss_mask.shape}, {attention_mask.shape}"
         )
-        print_assembled_message(self.tokenizer, messages, input_ids, loss_mask, attention_mask, tools)
+        debug_apply_kwargs = {**self.apply_chat_template_kwargs}
+        if enable_thinking is not None:
+            debug_apply_kwargs["enable_thinking"] = enable_thinking
+        if self.processor is not None and self.processor.__class__.__name__ == "Qwen3VLProcessor":
+            debug_apply_kwargs.setdefault("do_sample_frames", False)
+        print_assembled_message(
+            self.tokenizer,
+            self.processor,
+            messages,
+            input_ids,
+            loss_mask,
+            attention_mask,
+            tools,
+            debug_apply_kwargs,
+        )
         self.sanity_check(input_ids, messages, tools, enable_thinking)
 
         # Since the tokenizer may return user-customized results, we need to filter out inconsistent tensor shapes
@@ -528,16 +564,40 @@ class MultiTurnSFTDataset(Dataset):
                 raise AssertionError(error_message)
 
 if __name__ == "__main__":
+    import argparse
+    import random
+
     from transformers import AutoTokenizer, AutoProcessor
+
+    parser = argparse.ArgumentParser(description="Inspect sampled token lengths for MultiTurnSFTDataset.")
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=10,
+        help="Number of random dataset items to inspect.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible sampling.",
+    )
+    args = parser.parse_args()
+
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-VL-2B-Instruct", trust_remote_code=True)
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
 
     from omegaconf import OmegaConf
-    config_path = "external/verl/verl/trainer/config/motion_sft_trainer_engine.yaml"
+    # config_path = "external/verl/verl/trainer/config/motion_sft_trainer_engine.yaml"
+    # config = OmegaConf.load(config_path)
+    # OmegaConf.resolve(config)
+    # config.data.train_files = "data/unified_motion_sft_v3/parquet/train/train.parquet"
+    # config.data.val_files = "data/unified_motion_sft_v3/parquet/val/val.parquet"
+    config_path = "external/verl/verl/trainer/config/critic_sft_trainer_engine.yaml"
     config = OmegaConf.load(config_path)
     OmegaConf.resolve(config)
-    config.data.train_files = "data/unified_motion_sft_v3/parquet/train/train.parquet"
-    config.data.val_files = "data/unified_motion_sft_v3/parquet/val/val.parquet"
+    config.data.train_files = "data/unified_critic_sft_v2/parquet/train/train.parquet"
+    config.data.val_files = "data/unified_critic_sft_v2/parquet/val/val.parquet"
 
     parquet_files = ListConfig([
         config.data.train_files,
@@ -551,13 +611,23 @@ if __name__ == "__main__":
         max_samples=-1,
     )
     print(f"dataset len: {len(dataset)}")
-    for i in range(3):
-        sample = dataset[i]
-        print(sample.keys())
-        print(sample["input_ids"].shape)
-        print(sample["loss_mask"].shape)
-        if "multi_modal_inputs" in sample:
-            for k, v in sample["multi_modal_inputs"].items():
-                print(f"multi_modal_inputs[{k}]: {v.shape}")
+    rng = random.Random(args.seed)
+    sample_count = min(args.num_samples, len(dataset))
+    sampled_indices = rng.sample(range(len(dataset)), sample_count)
 
-        print("="*50)
+    token_lengths = []
+    print(f"sampled indices ({sample_count}): {sampled_indices}")
+    for index in sampled_indices:
+        sample = dataset[index]
+        if "attention_mask" in sample:
+            # Count only non-padding tokens; includes multimodal placeholder tokens.
+            token_length = int(sample["attention_mask"].sum().item())
+        else:
+            token_length = int(sample["input_ids"].shape[0])
+        token_lengths.append(token_length)
+        print(f"sample index={index}, token_length={token_length}, input_shape={tuple(sample['input_ids'].shape)}")
+
+    if token_lengths:
+        print(f"max sampled token length: {max(token_lengths)}")
+        print(f"min sampled token length: {min(token_lengths)}")
+        print(f"avg sampled token length: {sum(token_lengths) / len(token_lengths):.2f}")

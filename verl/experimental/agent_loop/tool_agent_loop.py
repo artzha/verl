@@ -136,8 +136,8 @@ class ToolAgentLoop(AgentLoopBase):
 
         # extract images and videos from messages
         multi_modal_data = await self.process_vision_info(messages)
-        images = multi_modal_data.get("images")
-        videos = multi_modal_data.get("videos")
+        images = multi_modal_data.get("image")
+        videos = multi_modal_data.get("video")
 
         metrics = {}
         request_id = uuid4().hex
@@ -190,9 +190,9 @@ class ToolAgentLoop(AgentLoopBase):
         prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
         multi_modal_data = {}
         if agent_data.image_data is not None:
-            multi_modal_data["images"] = agent_data.image_data
+            multi_modal_data["image"] = agent_data.image_data
         if agent_data.video_data is not None:
-            multi_modal_data["videos"] = agent_data.video_data
+            multi_modal_data["video"] = agent_data.video_data
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],

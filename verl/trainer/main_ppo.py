@@ -238,22 +238,26 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         if config.reward_model.enable:
-            use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-            if use_legacy_worker_impl in ["auto", "enable", "disable"]:
-                if config.reward_model.strategy in {"fsdp", "fsdp2"}:
-                    from verl.workers.fsdp_workers import RewardModelWorker
-                elif config.reward_model.strategy == "megatron":
-                    from verl.workers.megatron_workers import RewardModelWorker
-                else:
-                    raise NotImplementedError
-            # elif use_legacy_worker_impl == "disable":
-            #     from verl.workers.engine_workers import RewardModelWorker
-            #
-            #     print("Using new worker implementation")
+            ext = config.reward_model.get("external_worker", None)
+            if ext is not None and ext.get("path", None) is not None:
+                reward_model_cls = load_extern_object(ext.path, ext.name)
             else:
-                raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
+                use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+                if use_legacy_worker_impl in ["auto", "enable", "disable"]:
+                    if config.reward_model.strategy in {"fsdp", "fsdp2"}:
+                        from verl.workers.fsdp_workers import RewardModelWorker as reward_model_cls
+                    elif config.reward_model.strategy == "megatron":
+                        from verl.workers.megatron_workers import RewardModelWorker as reward_model_cls
+                    else:
+                        raise NotImplementedError
+                # elif use_legacy_worker_impl == "disable":
+                #     from verl.workers.engine_workers import RewardModelWorker
+                #
+                #     print("Using new worker implementation")
+                else:
+                    raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
 
-            self.role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
+            self.role_worker_mapping[Role.RewardModel] = ray.remote(reward_model_cls)
             if config.reward_model.enable_resource_pool:
                 self.mapping[Role.RewardModel] = "reward_pool"
             else:

@@ -24,6 +24,8 @@ import copy
 from typing import Any, Callable, Optional
 
 import numpy as np
+import torch
+from torchvision.transforms.functional import to_pil_image
 from PIL import Image
 from qwen_vl_utils import process_vision_info
 
@@ -58,12 +60,60 @@ def prepare_inputs_for_vllm(
         tokenize=False,
         add_generation_prompt=True,
     )
-    image_inputs, video_inputs, _ = process_vision_info(
-        messages,
+    # qwen_vl_utils.process_vision_info expects video payloads to be either
+    # string paths or frame lists. RLHFDataset may already have tensorized
+    # videos in raw_prompt; keep those out of process_vision_info and append
+    # them back in original video order.
+    sanitized_messages = copy.deepcopy(messages)
+    tensor_video_inputs: list[Any] = []
+    video_is_tensor_slots: list[bool] = []
+
+    for msg_idx, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        sanitized_content = sanitized_messages[msg_idx].get("content")
+        if not isinstance(sanitized_content, list):
+            continue
+        for item_idx, item in enumerate(content):
+            if not isinstance(item, dict) or "video" not in item:
+                continue
+            is_tensor_video = isinstance(item["video"], torch.Tensor)
+            video_is_tensor_slots.append(is_tensor_video)
+            if not is_tensor_video:
+                continue
+            video_tensor = item["video"]
+            video_metadata = item.get("video_metadata")
+            tensor_video_inputs.append((video_tensor, video_metadata))
+            sanitized_item = sanitized_content[item_idx]
+            if isinstance(sanitized_item, dict):
+                sanitized_item.pop("video", None)
+                if sanitized_item.get("type") == "video":
+                    sanitized_item["type"] = "text"
+
+    image_inputs, processed_video_inputs, _ = process_vision_info(
+        sanitized_messages,
         image_patch_size=processor.image_processor.patch_size,
         return_video_kwargs=True,
         return_video_metadata=True,
     )
+    video_inputs = processed_video_inputs
+    if video_is_tensor_slots:
+        merged_video_inputs: list[Any] = []
+        processed_video_inputs = [] if processed_video_inputs is None else list(processed_video_inputs)
+        tensor_idx = 0
+        processed_idx = 0
+        for is_tensor_video in video_is_tensor_slots:
+            if is_tensor_video:
+                merged_video_inputs.append(tensor_video_inputs[tensor_idx])
+                tensor_idx += 1
+            elif processed_idx < len(processed_video_inputs):
+                merged_video_inputs.append(processed_video_inputs[processed_idx])
+                processed_idx += 1
+        if processed_idx < len(processed_video_inputs):
+            merged_video_inputs.extend(processed_video_inputs[processed_idx:])
+        video_inputs = merged_video_inputs or None
+
     mm_data: dict[str, Any] = {}
     if image_inputs is not None:
         mm_data["image"] = image_inputs
@@ -190,10 +240,98 @@ def update_prompt_after_response(
     non_tensor_dict["raw_prompt"][i] = messages
     non_tensor_dict["full_prompts"][i] = new_full_prompt
     if ann is not None and "multi_modal_data" in non_tensor_dict:
+        if 'image' not in non_tensor_dict["multi_modal_data"][i]:
+            non_tensor_dict["multi_modal_data"][i]["image"] = []
         non_tensor_dict["multi_modal_data"][i]["image"].append(ann)
 
 
-def draw_path(new_non_tensor: dict, cur_idx: int = 0) -> dict[str, Any]:
+def build_rm_raw_prompt(
+    non_tensor_dict: dict,
+    critic_prompt_msg: dict,
+) -> np.ndarray:
+    """Construct the 4-turn RM scoring chat per sample.
+
+    Walks ``raw_prompt[i]`` up to (but not including) the first assistant turn
+    to capture the initial ``system + motion_prompt+video`` context, then
+    appends the latest motion response (as an assistant turn) and a user turn
+    with a freshly drawn annotated image plus the critic_prompt template. This
+    mirrors the chat structure the Qwen3-VL RM was trained on
+    (see ``motion_reward_trainer.yaml``).
+
+    Expects:
+        non_tensor_dict["raw_prompt"]: list of chats (list of dicts)
+        non_tensor_dict["motion_response"]: list of motion response histories
+            (list of lists of str); the last entry is scored
+        non_tensor_dict["multi_modal_data"][i]["image"][0]: original view image
+
+    Returns:
+        Object-dtype numpy array of length B, each element a list of chat dicts.
+    """
+    raw_prompts = non_tensor_dict["raw_prompt"]
+    motion_responses = non_tensor_dict["motion_response"]
+    mm_data = non_tensor_dict["multi_modal_data"]
+
+    rm_chats: list[list[dict]] = []
+    for i in range(len(raw_prompts)):
+        initial_turns: list[dict] = []
+        for turn in raw_prompts[i]:
+            if turn.get("role") == "assistant":
+                break
+            initial_turns.append(copy.deepcopy(turn))
+
+        resp_list = motion_responses[i]
+        response_text = (
+            resp_list[-1]
+            if isinstance(resp_list, (list, tuple, np.ndarray))
+            else resp_list
+        )
+
+        try:
+            payload = parse_and_unify(response_text, OutputFormat.TRAJECTORY_V1)
+        except (ValueError, TypeError):
+            payload = None
+        trace = (
+            payload.unified.get("trajectory")
+            if hasattr(payload, "unified")
+            else None
+        )
+
+        if "video" in mm_data[i]:
+            video_entry = mm_data[i]["video"][0]
+            video_tensor = video_entry[0] if isinstance(video_entry, tuple) else video_entry
+            last_frame = video_tensor[-1]
+            last_frame = last_frame / 255.0 if last_frame.max() > 1.0 else last_frame
+            base_img = to_pil_image(last_frame)
+        else:
+            base_img = mm_data[i]["image"][0]
+        if trace is not None:
+            ann_arr = draw_polyline(
+                trace, np.array(base_img), line_thickness=2, dot_radius=3, color=(255, 255, 51)
+            )
+            ann_img = Image.fromarray(ann_arr)
+            motion_str = "[" + ", ".join(f"[{pt[0]:.3f}, {pt[1]:.3f}]" for pt in trace) + "]"
+        else:
+            ann_img = base_img
+            motion_str = "[]"
+
+        critic_msg = copy.deepcopy(critic_prompt_msg)
+        critic_msg["content"][0]["text"] = format_prompt_cotnav(
+            critic_msg["content"][0]["text"], motion_str=motion_str
+        )
+        critic_msg["content"].insert(0, {"type": "image", "image": ann_img})
+
+        rm_chats.append(
+            initial_turns
+            + [text_to_llava(response_text, role="assistant"), critic_msg]
+        )
+
+    out = np.empty(len(rm_chats), dtype=object)
+    for idx, chat in enumerate(rm_chats):
+        out[idx] = chat
+    return out
+
+
+def draw_path(new_non_tensor: dict, cur_idx: int = -1) -> dict[str, Any]:
     """Parse motion response strings and draw polylines on the source image.
 
     Expects new_non_tensor["motion_response"] (list of lists or list of strings).
@@ -221,7 +359,17 @@ def draw_path(new_non_tensor: dict, cur_idx: int = 0) -> dict[str, Any]:
         else:
             trace = None
         traces.append(trace)
-        cur_img = new_non_tensor["multi_modal_data"][i]["image"][cur_idx]
+
+        # Convert last tensor to PIL Image using efficient torchvision ops
+        if 'video' in new_non_tensor["multi_modal_data"][i]:
+            video_entry = new_non_tensor["multi_modal_data"][i]["video"][0]
+            video_tensor = video_entry[0] if isinstance(video_entry, tuple) else video_entry
+            cur_img_th = video_tensor[cur_idx]
+            cur_img_th = cur_img_th / 255.0 if cur_img_th.max() > 1.0 else cur_img_th
+            cur_img = to_pil_image(cur_img_th)
+        else:
+            cur_img = new_non_tensor["multi_modal_data"][i]["image"][cur_idx]
+        
         if trace is None:
             images.append(cur_img)
             continue

@@ -9,7 +9,7 @@ defaults:
   # actor_rollout_ref.actor: trainer/config/actor/dp_actor.yaml
   - actor@actor_rollout_ref.actor: dp_actor
 
-  - data@data: motion_grandtour
+  - data@data: motion_foresight
 
   # (Rule-based) Reward manager config.
   - reward_manager@reward_manager
@@ -30,7 +30,7 @@ defaults:
   - critic@critic: dp_critic
 
   # Reward model config.
-  - reward_model@reward_model: reward_model
+  - reward_model@reward_model: dp_reward_model
 
   # Rollout correction config.
   - algorithm@algorithm.rollout_correction: rollout_correction
@@ -39,11 +39,10 @@ defaults:
   # self config override anything above
   - _self_
 
-critic:
-  strategy: fsdp2
-  fsdp_config:
-    model_dtype: bf16
-    strategy: fsdp2
+# prompts
+motion_prompt_path: 'cotnav/prompts/datagen/plan_v3/motion_prompt_startgoal.txt'
+motion_refine_prompt_path: 'cotnav/prompts/datagen/plan_v3/motion_refine_prompt.txt'
+critic_prompt_path: 'cotnav/prompts/datagen/plan_v3/critic_prompt.txt'
 
   # model:
   #   # Use remove padding optimization (saves compute)
@@ -61,7 +60,7 @@ critic:
 actor_rollout_ref:
   hybrid_engine: true
   critic_output_format: verdict:v1
-  critic_prompt_path: 'cotnav/prompts/datagen/critic_sft/novgoal/critic_prompt.txt'
+  critic_prompt_path: ${critic_prompt_path}
 
   external_worker:
     path: cotnav/verl_adapters/workers/hybrid_motion_actor.py
@@ -111,8 +110,8 @@ actor_rollout_ref:
     lora_rank: 0.0
     lora_alpha: 0.0
     target_modules: all-linear
-    # exclude_modules: '.*visual.*'
-    exclude_modules: null
+    exclude_modules: '.*visual.*'
+    # exclude_modules: null
 
 
   rollout:
@@ -122,16 +121,16 @@ actor_rollout_ref:
     calculate_log_probs: true
     temperature: 1.0
     top_p: 0.95
-    prompt_length: 2560
-    response_length: 512
+    prompt_length: 1680
+    response_length: 256
     # If set to "critic" or "motion", the actor's generated response is stored in that key and merged into extra_info for reward.
     response_role: motion
 
     engine_kwargs:
       vllm:
-        max_model_len: 4096
+        max_model_len: 2048
         max_num_seqs: 64
-        max_num_batched_tokens: 4096
+        max_num_batched_tokens: 8192
         gpu_memory_utilization: 0.9
 
     # Required: Allows vllm to load base model
@@ -162,21 +161,21 @@ actor_rollout_ref:
     # Sampling parameters
     temperature: 1.0
     top_p: 0.95
-    prompt_length: 2560
-    response_length: 512
+    # prompt_length: 2560
+    prompt_length: 1680
+    response_length: 256
 
-    tensor_model_parallel_size: 4
-
+    tensor_model_parallel_size: 2
     enable_chunked_prefill: true
     enable_prefix_caching: true
 
     engine_kwargs:
       vllm:
-        max_model_len: 4096
+        max_model_len: 2048
         max_num_seqs: 64
         gpu_memory_utilization: 0.9           
         dtype: bfloat16
-        max_num_batched_tokens: 4096
+        max_num_batched_tokens: 8192
         swap_space: 0
 
   # Extra rollout servers (motion, critic). Replaces deprecated motion + motion_rollout.
@@ -190,8 +189,8 @@ actor_rollout_ref:
       rollout: ${actor_rollout_ref.extra_rollout_rollout}
       sync_with_actor: true
       prompt_paths:
-        critic: ${actor_rollout_ref.critic_prompt_path}
-        motion: 'cotnav/prompts/datagen/critic_sft/novgoal/motion_refine_prompt.txt'
+        critic: ${critic_prompt_path}
+        motion: ${motion_refine_prompt_path}
     - name: critic
       model:
         path: Qwen/Qwen3-VL-8B-Instruct
@@ -199,19 +198,29 @@ actor_rollout_ref:
       rollout: ${actor_rollout_ref.extra_rollout_rollout}
       sync_with_actor: false
       prompt_paths:
-        critic: ${actor_rollout_ref.critic_prompt_path}
-        motion: 'cotnav/prompts/datagen/critic_sft/novgoal/motion_refine_prompt.txt'
+        critic: ${critic_prompt_path}
+        motion: ${motion_refine_prompt_path}
 
 reward_model:
   use_reward_loop: false
   strategy: fsdp2
+  external_worker:
+    path: cotnav/verl_adapters/workers/qwen3vl_reward_worker.py
+    name: Qwen3VLMotionRewardWorker
   model:
     path: null
     external_lib: null
     trust_remote_code: true
-    input_tokenizer: null
     use_remove_padding: true
-    use_dynamic_bsz: true
+    apply_chat_template_kwargs: {
+      do_sample_frames: false,
+      video_metadata: {
+        fps: 0.5,
+        frames_indices: [0, 1, 2, 3],
+        total_num_frames: 4
+      }
+    }
+  use_dynamic_bsz: true
 
 reward_manager:
   name: naive

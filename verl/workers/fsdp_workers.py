@@ -19,7 +19,9 @@ import datetime
 import json
 import logging
 import os
+import time
 import warnings
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -1825,7 +1827,12 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 prepared_kwargs[key] = value
         return prepared_kwargs
 
-    def _forward_micro_batch(self, micro_batch, multi_modal_inputs: Optional[list[Any]] = None):
+    def _forward_micro_batch(
+        self,
+        micro_batch,
+        multi_modal_inputs: Optional[list[Any]] = None,
+        timing_raw: Optional[dict[str, float]] = None,
+    ):
         from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
         from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 
@@ -1834,7 +1841,18 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
+            # H2D cost here is dominated by multimodal tensors (images/videos) that
+            # still live on CPU at this point. Dense input_ids/masks were moved to
+            # device in compute_rm_score before splitting.
+            if timing_raw is not None:
+                torch.cuda.synchronize()
+                t_h2d_start = time.perf_counter()
             model_kwargs = self._prepare_multimodal_kwargs(micro_batch, multi_modal_inputs=multi_modal_inputs)
+            if timing_raw is not None:
+                torch.cuda.synchronize()
+                timing_raw["rm_mm_h2d_ms"] = (
+                    timing_raw.get("rm_mm_h2d_ms", 0.0) + (time.perf_counter() - t_h2d_start) * 1000
+                )
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
 
@@ -1865,6 +1883,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     )
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
+                if timing_raw is not None:
+                    torch.cuda.synchronize()
+                    t_fwd_start = time.perf_counter()
                 output = self.reward_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -1872,6 +1893,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     use_cache=False,
                     **model_kwargs,
                 )
+                if timing_raw is not None:
+                    torch.cuda.synchronize()
+                    timing_raw["rm_forward_ms"] = (
+                        timing_raw.get("rm_forward_ms", 0.0) + (time.perf_counter() - t_fwd_start) * 1000
+                    )
                 reward_rmpad = output.logits
                 reward_rmpad = reward_rmpad.squeeze(0)  # (total_nnz)
 
@@ -1884,6 +1910,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 # pad it back
                 rm_score = pad_input(reward_rmpad, indices=indices, batch=batch_size, seqlen=seqlen).squeeze(-1)
             else:
+                if timing_raw is not None:
+                    torch.cuda.synchronize()
+                    t_fwd_start = time.perf_counter()
                 output = self.reward_module(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -1891,6 +1920,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     use_cache=False,
                     **model_kwargs,
                 )
+                if timing_raw is not None:
+                    torch.cuda.synchronize()
+                    timing_raw["rm_forward_ms"] = (
+                        timing_raw.get("rm_forward_ms", 0.0) + (time.perf_counter() - t_fwd_start) * 1000
+                    )
                 rm_score = output.logits  # (batch_size, seq_len, 1)
                 rm_score = rm_score.squeeze(-1)
 
@@ -2023,54 +2057,59 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
-        # Support all hardwares
-        data = data.to(get_device_id())
-        if self._do_switch_chat_template:
-            breakpoint()
-            rm_data = self._switch_chat_template(data)
-            all_multi_modal_inputs = rm_data.non_tensor_batch.get("multi_modal_inputs", None)
-            breakpoint()
-        else:
-            rm_input_ids = data.batch["input_ids"]
-            rm_attention_mask = data.batch["attention_mask"]
-            rm_position_ids = data.batch["position_ids"]
-            rm_inputs = {
-                "input_ids": rm_input_ids,
-                "attention_mask": rm_attention_mask,
-                "position_ids": rm_position_ids,
-            }
-            rm_data = DataProto.from_dict(rm_inputs)
-            all_multi_modal_inputs = data.non_tensor_batch.get("multi_modal_inputs", None)
+        profiler_cfg = self.config.get("profiler", None)
+        enable_rm_timing = bool(profiler_cfg is not None and profiler_cfg.get("enable", False))
+        timing_raw: Optional[dict[str, float]] = {} if enable_rm_timing else None
 
         # Support all hardwares
-        rm_data = rm_data.to(get_device_id())
-        if all_multi_modal_inputs is not None and hasattr(all_multi_modal_inputs, "tolist"):
-            all_multi_modal_inputs = all_multi_modal_inputs.tolist()
+        data = data.to(get_device_id())
+        with simple_timer("rm_prepare", timing_raw) if enable_rm_timing else nullcontext():
+            if self._do_switch_chat_template:
+                rm_data = self._switch_chat_template(data)
+                all_multi_modal_inputs = rm_data.non_tensor_batch.get("multi_modal_inputs", None)
+            else:
+                rm_inputs = {
+                    "input_ids": data.batch["input_ids"],
+                    "attention_mask": data.batch["attention_mask"],
+                    "position_ids": data.batch["position_ids"],
+                }
+                rm_data = DataProto.from_dict(rm_inputs)
+                all_multi_modal_inputs = data.non_tensor_batch.get("multi_modal_inputs", None)
+
+            rm_data = rm_data.to(get_device_id())
+            if all_multi_modal_inputs is not None and hasattr(all_multi_modal_inputs, "tolist"):
+                all_multi_modal_inputs = all_multi_modal_inputs.tolist()
 
         # perform forward computation
         with self.ulysses_sharding_manager:
             use_dynamic_bsz = self.config.use_dynamic_bsz
-            if use_dynamic_bsz:
-                max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                micro_batches, indices = rearrange_micro_batches(batch=rm_data.batch, max_token_len=max_token_len)
-            else:
-                micro_batches = rm_data.batch.split(self.config.micro_batch_size_per_gpu)
-                # optimize this later
-                indices = []
-                offset = 0
-                for micro_batch in micro_batches:
-                    batch_size = int(micro_batch.batch_size[0]) if hasattr(micro_batch, "batch_size") else len(micro_batch)
-                    indices.append(list(range(offset, offset + batch_size)))
-                    offset += batch_size
-            
-            output = []
-            for micro_batch, micro_indices in zip(micro_batches, indices, strict=True):
-                mm_inputs = None
-                if all_multi_modal_inputs is not None:
-                    mm_inputs = [all_multi_modal_inputs[idx] for idx in micro_indices]
-                rm_score = self._forward_micro_batch(micro_batch, multi_modal_inputs=mm_inputs)
-                output.append(rm_score)
-            scores = torch.cat(output, dim=0)  # (batch_size)
+            with simple_timer("rm_micro_batch_split", timing_raw) if enable_rm_timing else nullcontext():
+                if use_dynamic_bsz:
+                    max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                    micro_batches, indices = rearrange_micro_batches(batch=rm_data.batch, max_token_len=max_token_len)
+                else:
+                    micro_batches = rm_data.batch.split(self.config.micro_batch_size_per_gpu)
+                    indices = []
+                    offset = 0
+                    for micro_batch in micro_batches:
+                        mb_size = int(micro_batch.batch_size[0]) if hasattr(micro_batch, "batch_size") else len(micro_batch)
+                        indices.append(list(range(offset, offset + mb_size)))
+                        offset += mb_size
+
+            if enable_rm_timing and timing_raw is not None:
+                timing_raw["rm_num_micro_batches"] = float(len(micro_batches))
+
+            with simple_timer("rm_forward_total", timing_raw) if enable_rm_timing else nullcontext():
+                output = []
+                for micro_batch, micro_indices in zip(micro_batches, indices, strict=True):
+                    mm_inputs = None
+                    if all_multi_modal_inputs is not None:
+                        mm_inputs = [all_multi_modal_inputs[idx] for idx in micro_indices]
+                    rm_score = self._forward_micro_batch(
+                        micro_batch, multi_modal_inputs=mm_inputs, timing_raw=timing_raw
+                    )
+                    output.append(rm_score)
+                scores = torch.cat(output, dim=0)  # (batch_size)
 
             if use_dynamic_bsz:
                 indices = list(itertools.chain.from_iterable(indices))
@@ -2086,6 +2125,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         # unshard the root FSDP module
         if self.world_size > 1 and fsdp_version(self.reward_module) == 1:
             self.reward_module._handle.reshard(True)
+
+        if enable_rm_timing and timing_raw is not None:
+            # Reduce across DP so ray_trainer logs consistent per-step RM timings.
+            output.meta_info["timing"] = reduce_timing(timing_raw)
 
         output = output.to("cpu")
         return output
@@ -2123,6 +2166,13 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
         sampling_params: dict[str, Any],
         request_id: str,
         image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
     ) -> list[int]:
-        ret = await self.rollout.generate(prompt_ids, sampling_params, request_id, image_data=image_data)
+        ret = await self.rollout.generate(
+            prompt_ids,
+            sampling_params,
+            request_id,
+            image_data=image_data,
+            video_data=video_data,
+        )
         return ret

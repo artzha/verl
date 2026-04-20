@@ -20,13 +20,13 @@ import os
 import re
 import traceback
 from collections import defaultdict
-from io import BytesIO
 from typing import Optional
 
+from omegaconf import OmegaConf
 import datasets
 import numpy as np
 import torch
-from omegaconf import DictConfig, ListConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
@@ -107,12 +107,19 @@ class RLHFDataset(Dataset):
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
         self.image_patch_size = config.get("image_patch_size", 14)
+        self.resize_mode = config.get("resize_mode", "auto")
+        self.resize_height = config.get("resize_height", None)
+        self.resize_width = config.get("resize_width", None)
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
-        self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        self.apply_chat_template_kwargs = {}
+        for k, v in config.get("apply_chat_template_kwargs", {}).items():
+            self.apply_chat_template_kwargs[k] = v
+            if OmegaConf.is_config(v):
+                self.apply_chat_template_kwargs[k] = OmegaConf.to_container(v, resolve=True)
 
         self.tool_config_path = config.get("tool_config_path", None)
         self.tool_schemas = None
@@ -139,9 +146,26 @@ class RLHFDataset(Dataset):
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
+        assert self.resize_mode in ["auto", "original"], (
+            f"Expect resize_mode to be 'auto' or 'original'. Got {self.resize_mode}"
+        )
+        if self.resize_height is not None or self.resize_width is not None:
+            raise ValueError(
+                "resize_height/resize_width are not supported yet. "
+                "Use resize_mode='auto' or resize_mode='original'."
+            )
 
         self._download()
         self._read_files_and_tokenize()
+
+    def _build_apply_chat_template_kwargs(self) -> dict:
+        apply_kwargs = dict(self.apply_chat_template_kwargs)
+        if self.tool_schemas is not None:
+            apply_kwargs["tools"] = self.tool_schemas
+        # IMPORTANT! Keep all frames for Qwen3-VL-style keyframe observations.
+        if self.processor is not None and self.processor.__class__.__name__ == "Qwen3VLProcessor":
+            apply_kwargs.setdefault("do_sample_frames", False)
+        return apply_kwargs
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -184,52 +208,21 @@ class RLHFDataset(Dataset):
             tokenizer = self.tokenizer
             processor = self.processor
             prompt_key = self.prompt_key
-            image_key = self.image_key
-            video_key = self.video_key
 
             if processor is not None:
-                from verl.utils.dataset.vision_utils import process_image, process_video
-
                 def doc2len(doc) -> int:
                     try:
-                        messages = self._build_messages(doc)
-                        # pass tool schemas if available so the processor can format prompts
-                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
-
-                        raw_prompt = self.processor.apply_chat_template(
-                            messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
+                        messages = self._build_messages(copy.deepcopy(doc))
+                        apply_kwargs = self._build_apply_chat_template_kwargs()
+                        inputs = processor.apply_chat_template(
+                            messages,
+                            add_generation_prompt=True,
+                            tokenize=True,
+                            return_dict=True,
+                            return_tensors="pt",
+                            **apply_kwargs,
                         )
-                        if image_key in doc and doc[image_key]:
-                            images = [
-                                process_image(image, image_patch_size=self.image_patch_size) for image in doc[image_key]
-                            ]
-                        else:
-                            images = None
-
-                        if video_key in doc and doc[video_key]:
-                            videos, video_metadata = zip(
-                                *[
-                                    process_video(
-                                        video, image_patch_size=self.image_patch_size, return_video_metadata=True
-                                    )
-                                    for video in doc[video_key]
-                                ],
-                                strict=True,
-                            )
-                            videos = list(videos)
-                            video_metadata = list(video_metadata)
-                            videos_kwargs = {"video_metadata": video_metadata, "do_sample_frames": False}
-                        else:
-                            videos = None
-                            videos_kwargs = {}
-
-                        return len(
-                            processor(text=[raw_prompt], images=images, videos=videos, videos_kwargs=videos_kwargs)[
-                                "input_ids"
-                            ][0]
-                        )
+                        return int(inputs["input_ids"].shape[-1])
                     except Exception:
                         print("Error processing one of the samples, skipping...")
                         traceback.print_exc()
@@ -239,10 +232,7 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
-                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
-
+                        apply_kwargs = self._build_apply_chat_template_kwargs()
                         return len(
                             tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True, **apply_kwargs)
                         )
@@ -312,23 +302,40 @@ class RLHFDataset(Dataset):
             for segment in segments:
                 if segment == "<image>":
                     assert image_offset < len(images), f"image_offset {image_offset} >= len(images) {len(images)}"
-                    image = images[image_offset]
-                    if isinstance(image, Image.Image):
-                        image = image.convert("RGB")
-                        content_list.append({"type": "image", "image": image})
-                    elif isinstance(image, dict):
-                        if "bytes" in image:
-                            image["image"] = Image.open(BytesIO(image["bytes"]))
-                        content_list.append({"type": "image", **image})
-                    elif isinstance(image, str):
-                        image_pil = Image.open(image).convert("RGB")
-                        content_list.append({"type": "image", "image": image_pil})
-                    else:
-                        raise TypeError(f"image must be dict or PIL.Image, unsupported image type: {type(image)}")
+                    from verl.utils.dataset.vision_utils import process_image
+
+                    image = process_image(
+                        images[image_offset],
+                        image_patch_size=self.image_patch_size,
+                        resize_mode=self.resize_mode,
+                    )
+                    content_list.append({"type": "image", "image": image})
                     image_offset += 1
                 elif segment == "<video>":
                     assert video_offset < len(videos), f"video_offset {video_offset} >= len(videos) {len(videos)}"
-                    content_list.append({"type": "video", **videos[video_offset]})
+                    from verl.utils.dataset.vision_utils import process_video
+
+                    videos_item = videos[video_offset]
+                    if isinstance(videos_item, np.ndarray):
+                        videos_item = videos_item.tolist()
+                    if not isinstance(videos_item, dict) or "video" not in videos_item:
+                        raise ValueError(f"video input must be dict containing 'video', got {type(videos_item)}")
+                    videos_item = dict(videos_item)
+                    if isinstance(videos_item["video"], np.ndarray):
+                        videos_item["video"] = videos_item["video"].tolist()
+                    video = process_video(
+                        videos_item,
+                        image_patch_size=self.image_patch_size,
+                        resize_mode=self.resize_mode,
+                    )
+                    video_item: dict = {"type": "video", "video": video}
+                    video_metadata_cfg = self.apply_chat_template_kwargs.get("video_metadata")
+                    if video_metadata_cfg is not None:
+                        if OmegaConf.is_config(video_metadata_cfg):
+                            video_metadata_cfg = OmegaConf.to_container(video_metadata_cfg, resolve=True)
+                        do_sample_frames = self.apply_chat_template_kwargs.get("do_sample_frames", False)
+                        video_item["video_metadata"] = {**video_metadata_cfg, "do_sample_frames": do_sample_frames}
+                    content_list.append(video_item)
                     video_offset += 1
                 else:
                     content_list.append({"type": "text", "text": segment})
@@ -336,6 +343,7 @@ class RLHFDataset(Dataset):
 
         assert image_offset == len(images), f"image_offset {image_offset} != len(images) {len(images)}"
         assert video_offset == len(videos), f"video_offset {video_offset} != len(videos) {len(videos)}"
+
         return messages
     
     def __getitem__(self, item):
@@ -362,7 +370,7 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
-        # import pdb; pdb.set_trace()
+
         return row_dict
 
     @classmethod
@@ -394,10 +402,70 @@ class RLHFDataset(Dataset):
             images: List of images.
             videos: List of videos, each video is a tuple of (video_tensor, video_metadata).
         """
-        from qwen_vl_utils import process_vision_info
+        from verl.utils.dataset.vision_utils import process_image, process_video
 
-        images, videos = process_vision_info(messages, image_patch_size=image_patch_size, return_video_metadata=True)
-        return images, videos
+        resize_mode = config.get("resize_mode", "auto")
+        apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        video_metadata_cfg = apply_chat_template_kwargs.get("video_metadata")
+        if OmegaConf.is_config(video_metadata_cfg):
+            video_metadata_cfg = OmegaConf.to_container(video_metadata_cfg, resolve=True)
+
+        images: list[Image.Image] = []
+        videos: list[tuple[torch.Tensor, dict | None]] = []
+        video_idx = 0
+
+        for message in messages:
+            content = message.get("content", [])
+            if isinstance(content, str):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "image":
+                    image_payload = item.get("image", None)
+                    if image_payload is None and "bytes" in item:
+                        image_payload = {"bytes": item["bytes"]}
+                    if image_payload is None and "image_url" in item:
+                        image_payload = {"image_url": item["image_url"]}
+                    if image_payload is None:
+                        continue
+                    images.append(
+                        process_image(
+                            image_payload,
+                            image_patch_size=image_patch_size,
+                            resize_mode=resize_mode,
+                        )
+                    )
+                elif item.get("type") == "video" and "video" in item:
+                    video_value = item["video"]
+                    if isinstance(video_value, torch.Tensor):
+                        video_tensor = video_value
+                        if isinstance(video_metadata_cfg, list):
+                            video_metadata = video_metadata_cfg[video_idx] if video_idx < len(video_metadata_cfg) else None
+                        elif isinstance(video_metadata_cfg, dict):
+                            video_metadata = video_metadata_cfg
+                        else:
+                            video_metadata = None
+                    else:
+                        video_dict = {k: v for k, v in item.items() if k != "type"}
+                        if isinstance(video_dict["video"], np.ndarray):
+                            video_dict["video"] = video_dict["video"].tolist()
+                        video_tensor, fetched_metadata = process_video(
+                            video_dict,
+                            image_patch_size=image_patch_size,
+                            resize_mode=resize_mode,
+                            return_video_metadata=True,
+                        )
+                        if isinstance(video_metadata_cfg, list):
+                            video_metadata = video_metadata_cfg[video_idx] if video_idx < len(video_metadata_cfg) else None
+                        elif isinstance(video_metadata_cfg, dict):
+                            video_metadata = video_metadata_cfg
+                        else:
+                            video_metadata = fetched_metadata
+                    videos.append((video_tensor, video_metadata))
+                    video_idx += 1
+
+        return (images or None), (videos or None)
 
     def split(self, num_splits: int):
         """
@@ -480,15 +548,143 @@ def get_dataset_class(data_config: DictConfig):
     return dataset_cls
 
 if __name__ == "__main__":
-    from transformers import AutoTokenizer, AutoProcessor
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-VL-2B-Instruct", trust_remote_code=True)
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
+    import argparse
+    import time
+    from pathlib import Path
 
     from omegaconf import OmegaConf
-    config_path = "external/verl/verl/trainer/config/data/motion_grandtour.yaml"
-    config = OmegaConf.load(config_path)
-    OmegaConf.resolve(config)
+    from transformers import AutoProcessor, AutoTokenizer
 
-    
-    dataset = RLHFDataset(data_files=config.train_files, tokenizer=tokenizer, processor=processor, config=config)
-    print(dataset[0])
+    def parse_args():
+        ap = argparse.ArgumentParser(description="Perf benchmark for multimodal RLHFDataset.")
+        ap.add_argument(
+            "--data-config",
+            type=str,
+            default="external/verl/verl/trainer/config/data/motion_foresight.yaml",
+            help="YAML config path for dataset settings.",
+        )
+        ap.add_argument(
+            "--model-path",
+            type=str,
+            default=None,
+            help="Tokenizer/processor model path override.",
+        )
+        ap.add_argument(
+            "--max-samples",
+            type=int,
+            default=-1,
+            help="Optional cap when constructing dataset (-1 uses all samples).",
+        )
+        ap.add_argument(
+            "--benchmark-samples",
+            type=int,
+            default=10,
+            help="Number of samples to benchmark for timing/token stats.",
+        )
+        return ap.parse_args()
+
+    def _resolve_model_path(model_path_arg, cfg):
+        if model_path_arg:
+            return model_path_arg
+        cfg_tokenizer = cfg.get("tokenizer", None)
+        if cfg_tokenizer:
+            return cfg_tokenizer
+        return "Qwen/Qwen3-VL-2B-Instruct"
+
+    args = parse_args()
+    cfg = OmegaConf.load(args.data_config) if Path(args.data_config).exists() else OmegaConf.create({})
+    OmegaConf.resolve(cfg)
+    data_cfg = cfg.get("data", cfg)
+
+    train_files = data_cfg.get("train_files", "")
+    if isinstance(train_files, str):
+        if not train_files:
+            raise ValueError("No train_files found in data config.")
+        data_files = train_files
+    elif isinstance(train_files, (list, ListConfig)):
+        if len(train_files) == 0:
+            raise ValueError("train_files list is empty in data config.")
+        data_files = list(train_files)
+    else:
+        raise ValueError("Unsupported train_files type in data config.")
+
+    model_path = _resolve_model_path(args.model_path, data_cfg)
+    trust_remote_code = bool(data_cfg.get("trust_remote_code", False))
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+
+    dataset = RLHFDataset(
+        data_files=data_files,
+        tokenizer=tokenizer,
+        processor=processor,
+        config=data_cfg,
+        max_samples=args.max_samples,
+    )
+
+    dataset_len = len(dataset)
+    print(f"dataset len: {dataset_len}")
+    if dataset_len == 0:
+        raise ValueError("Dataset is empty; cannot run benchmark.")
+
+    benchmark_count = min(max(args.benchmark_samples, 1), dataset_len)
+    print(f"benchmarking first {benchmark_count} samples")
+
+    sample_times_ms = []
+    input_token_counts = []
+    perf_start = time.perf_counter()
+
+    for idx in range(benchmark_count):
+        t0 = time.perf_counter()
+        sample = dataset[idx]
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        sample_times_ms.append(elapsed_ms)
+
+        messages = sample["raw_prompt"]
+        apply_kwargs = dict(dataset.apply_chat_template_kwargs)
+        if dataset.tool_schemas is not None:
+            apply_kwargs["tools"] = dataset.tool_schemas
+
+        if dataset.processor is not None:
+            chat_inputs = dataset.processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                **apply_kwargs,
+            )
+            token_count = int(chat_inputs["input_ids"].shape[-1])
+        else:
+            chat_input_ids = dataset.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_tensors="pt",
+                **apply_kwargs,
+            )
+            token_count = int(chat_input_ids.shape[-1])
+        input_token_counts.append(token_count)
+
+    perf_total_s = time.perf_counter() - perf_start
+
+    print(
+        "input tokens per sample: "
+        f"min={min(input_token_counts)}, "
+        f"max={max(input_token_counts)}, "
+        f"avg={sum(input_token_counts) / len(input_token_counts):.2f}"
+    )
+    print(
+        "sample load time (ms): "
+        f"min={min(sample_times_ms):.2f}, "
+        f"max={max(sample_times_ms):.2f}, "
+        f"avg={sum(sample_times_ms) / len(sample_times_ms):.2f}"
+    )
+    print(
+        f"average time to load {benchmark_count} samples (ms): "
+        f"{sum(sample_times_ms) / len(sample_times_ms):.2f}"
+    )
+    print(
+        "sample load throughput: "
+        f"{benchmark_count / max(perf_total_s, 1e-9):.2f} samples/s "
+        f"(total={perf_total_s:.2f}s)"
+    )

@@ -42,8 +42,8 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         # 1. extract images and videos from messages
         multi_modal_data = await self.process_vision_info(messages)
-        images = multi_modal_data.get("images")
-        videos = multi_modal_data.get("videos")
+        images = multi_modal_data.get("image")
+        videos = multi_modal_data.get("video")
 
         # 2. apply chat template and tokenize
         prompt_ids = await self.apply_chat_template(

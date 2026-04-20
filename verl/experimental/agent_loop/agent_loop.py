@@ -104,6 +104,7 @@ class AsyncLLMServerManager:
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
@@ -122,6 +123,7 @@ class AsyncLLMServerManager:
             sampling_params=sampling_params,
             image_data=image_data,
             video_data=video_data,
+            mm_processor_kwargs=mm_processor_kwargs,
         )
         return output
 
@@ -233,7 +235,7 @@ class AgentLoopBase(ABC):
             messages (list[dict]): Input messages.
 
         Returns:
-            dict: Multi-modal data with keys "images" and "videos".
+            dict: Multi-modal data with keys "image" and "video".
         """
         multi_modal_data = {}
         if self.processor is not None:
@@ -241,9 +243,9 @@ class AgentLoopBase(ABC):
                 messages, image_patch_size=self.processor.image_processor.patch_size, config=self.dataset_config
             )
             if images is not None:
-                multi_modal_data["images"] = images
+                multi_modal_data["image"] = images
             if videos is not None:
-                multi_modal_data["videos"] = videos
+                multi_modal_data["video"] = videos
 
         return multi_modal_data
 
@@ -283,6 +285,12 @@ class AgentLoopBase(ABC):
             if videos is not None:
                 videos, video_metadatas = zip(*videos, strict=False)
                 videos, video_metadatas = list(videos), list(video_metadatas)
+                # Strip keys not accepted by VideoMetadata dataclass (e.g. do_sample_frames)
+                _valid_video_metadata_keys = {"total_num_frames", "fps", "width", "height", "duration", "video_backend", "frames_indices"}
+                video_metadatas = [
+                    {k: v for k, v in m.items() if k in _valid_video_metadata_keys} if isinstance(m, dict) else m
+                    for m in video_metadatas
+                ]
             else:
                 video_metadatas = None
 
@@ -290,7 +298,7 @@ class AgentLoopBase(ABC):
                 text=[raw_prompt],
                 images=images,
                 videos=videos,
-                video_metadatas=video_metadatas,
+                video_metadata=video_metadatas,
                 return_tensors="pt",
                 do_sample_frames=False,
             )
@@ -438,7 +446,7 @@ class AgentLoopWorker:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
-    def draw_path(self, new_non_tensor: dict, cur_idx: int = 0) -> dict:
+    def draw_path(self, new_non_tensor: dict, cur_idx: int = -1) -> dict:
         """Parse motion response strings and draw polylines on the source image."""
         return prompt_utils_ppo.draw_path(new_non_tensor, cur_idx=cur_idx)
 
@@ -624,10 +632,12 @@ class AgentLoopWorker:
         for i in range(len(batch)):
             prompt_ids = prompt_ids_batch[i]
             image_data = None
+            video_data = None
             if multi_modal_data is not None:
                 item = multi_modal_data[i]
                 if isinstance(item, dict):
                     image_data = item.get("image")
+                    video_data = item.get("video")
             request_id = uid[i] if uid is not None else uuid4().hex
             tasks.append(
                 asyncio.create_task(
@@ -636,6 +646,7 @@ class AgentLoopWorker:
                         prompt_ids=prompt_ids,
                         sampling_params=dict(sampling_params),
                         image_data=image_data,
+                        video_data=video_data,
                     )
                 )
             )
@@ -663,7 +674,7 @@ class AgentLoopWorker:
         if isinstance(new_non_tensor.get("multi_modal_data"), np.ndarray):
             new_non_tensor["multi_modal_data"] = new_non_tensor["multi_modal_data"].tolist()
 
-        ann_payload = self.draw_path(new_non_tensor, cur_idx=0)
+        ann_payload = self.draw_path(new_non_tensor, cur_idx=-1)
         for i in range(len(responses)):
             ann_img = ann_payload["image"][i]
             prompt_utils_ppo.update_prompt_after_response(
@@ -725,10 +736,12 @@ class AgentLoopWorker:
         tasks = []
         for i in range(len(batch)):
             image_data = None
+            video_data = None
             if multi_modal_data is not None:
                 item = multi_modal_data[i].item() if hasattr(multi_modal_data[i], "item") else multi_modal_data[i]
                 if isinstance(item, dict):
                     image_data = item.get("image")
+                    video_data = item.get("video")
             request_id = uid[i] if uid is not None else uuid4().hex
             tasks.append(
                 asyncio.create_task(
@@ -737,6 +750,7 @@ class AgentLoopWorker:
                         prompt_ids=prompt_ids_batch[i],
                         sampling_params=dict(sampling_params),
                         image_data=image_data,
+                        video_data=video_data,
                     )
                 )
             )
@@ -803,10 +817,12 @@ class AgentLoopWorker:
         tasks = []
         for i in range(len(chunk)):
             image_data = None
+            video_data = None
             if multi_modal_data is not None:
                 item = multi_modal_data[i]
                 if isinstance(item, dict):
                     image_data = item.get("image")
+                    video_data = item.get("video")
             request_id = uid[i] if uid is not None else uuid4().hex
             tasks.append(
                 asyncio.create_task(
@@ -815,6 +831,7 @@ class AgentLoopWorker:
                         prompt_ids=prompt_ids_batch[i],
                         sampling_params=dict(sampling_params),
                         image_data=image_data,
+                        video_data=video_data,
                     )
                 )
             )
@@ -1051,8 +1068,8 @@ class AgentLoopWorker:
         if self.processor is None:
             return multi_modal_inputs
 
-        images = output.multi_modal_data.get("images")
-        videos = output.multi_modal_data.get("videos")
+        images = output.multi_modal_data.get("image")
+        videos = output.multi_modal_data.get("video")
         # split the videos and according metadatas
         if videos is not None:
             videos, video_metadatas = zip(*videos, strict=False)
@@ -1078,6 +1095,10 @@ class AgentLoopWorker:
         if image_grid_thw is not None:
             images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
             multi_modal_inputs["images_seqlens"] = images_seqlens
+        video_grid_thw = multi_modal_inputs.get("video_grid_thw")
+        if video_grid_thw is not None:
+            videos_seqlens = torch.repeat_interleave(video_grid_thw[:, 1] * video_grid_thw[:, 2], video_grid_thw[:, 0])
+            multi_modal_inputs["videos_seqlens"] = videos_seqlens
         return multi_modal_inputs
 
     def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:

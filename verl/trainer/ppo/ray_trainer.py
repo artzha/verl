@@ -42,6 +42,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo import prompt_utils as prompt_utils_ppo
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
@@ -381,6 +382,16 @@ class RayPPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+
+        # RM critic prompt template (for building rm_raw_prompt each step)
+        self._rm_critic_prompt_msg = None
+        if self.use_rm and not self.use_reward_loop:
+            critic_prompt_path = self.config.actor_rollout_ref.get("critic_prompt_path", None)
+            if critic_prompt_path:
+                from cotnav.core.format import text_to_llava
+
+                with open(critic_prompt_path, "r") as handle:
+                    self._rm_critic_prompt_msg = text_to_llava(handle.read(), role="user")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -949,7 +960,7 @@ class RayPPOTrainer:
                         test_output_gen_batch.non_tensor_batch[key] = motion_batch.non_tensor_batch[key]
                 if "extra_info" in motion_batch.non_tensor_batch:
                     test_output_gen_batch.non_tensor_batch["extra_info"] = motion_batch.non_tensor_batch["extra_info"]
-            
+
             dup_report = tu.drop_dupe_keys(
                 test_batch,
                 test_output_gen_batch,
@@ -975,7 +986,7 @@ class RayPPOTrainer:
             # Ensure motion_response/critic_response are in extra_info for reward_fn (reward_kwargs)
             self._merge_rollout_responses_into_extra_info(test_batch)
             # evaluate using reward_function
-
+            breakpoint()
             result = self._compute_or_extract_reward(test_batch, reward_fn=self.val_reward_fn, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -1933,6 +1944,12 @@ class RayPPOTrainer:
                             rm_scores = None
                             if self.use_rm and "rm_scores" not in batch.batch.keys():
                                 if not self.use_reward_loop:
+                                    if self._rm_critic_prompt_msg is not None:
+                                        batch.non_tensor_batch["rm_raw_prompt"] = (
+                                            prompt_utils_ppo.build_rm_raw_prompt(
+                                                batch.non_tensor_batch, self._rm_critic_prompt_msg
+                                            )
+                                        )
                                     rm_scores = self.rm_wg.compute_rm_score(batch)
                                 else:
                                     assert self.reward_loop_manager is not None, "RewardLoopManager is None"
@@ -1983,12 +2000,13 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    # get images_seqlens
+                    # get images_seqlens (aggregate both image and video ViT patches for FLOPS)
                     images_seqlens_all = []
                     for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
-                        if "image_grid_thw" not in multi_modal_input.keys():
-                            continue
-                        images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
+                        if "image_grid_thw" in multi_modal_input.keys():
+                            images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
+                        if "video_grid_thw" in multi_modal_input.keys():
+                            images_seqlens_all.extend(multi_modal_input["videos_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
 
                     with marked_timer("reward", timing_raw, color="yellow"):
@@ -1997,6 +2015,10 @@ class RayPPOTrainer:
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             if not self.use_reward_loop:
+                                if self._rm_critic_prompt_msg is not None:
+                                    batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
+                                        batch.non_tensor_batch, self._rm_critic_prompt_msg
+                                    )
                                 reward_tensor = self.rm_wg.compute_rm_score(batch)
                             else:
                                 assert self.reward_loop_manager is not None, "RewardLoopManager is None"
