@@ -1261,6 +1261,54 @@ class FSDPEngineWithRewardHead(FSDPEngine):
         return {"rewards": rewards}
 
     # ------------------------------------------------------------------
+    # Optimizer (two param groups: score head + LoRA)
+    # ------------------------------------------------------------------
+
+    def _build_optimizer(self, module):
+        """Build optimizer with two param groups.
+
+        Group 0 ("score"): score head — trains from step 0 at full LR.
+        Group 1 ("lora"):  LoRA adapters — starts frozen (lr=0), unfrozen
+                           externally once the score head is warm.
+        """
+        from verl.workers.config.optimizer import build_optimizer
+
+        score_params, lora_params = [], []
+        for name, param in module.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "score" in name:
+                score_params.append(param)
+            else:
+                lora_params.append(param)
+
+        if torch.distributed.get_rank() == 0:
+            print(f"[RewardHead] score-head params: {len(score_params)}, lora params: {len(lora_params)}")
+
+        param_groups = [
+            {"params": score_params, "group_name": "score"},
+            {"params": lora_params,  "group_name": "lora", "lr": 0.0},
+        ]
+        # build_optimizer sets the default lr from config; the lora group
+        # overrides it to 0.0 so LoRA stays frozen during score-head warmup.
+        optimizer = build_optimizer(param_groups, self.optimizer_config)
+        return optimizer
+
+    def set_lora_lr(self, lr: float) -> None:
+        """Unfreeze LoRA by setting its LR in both the optimizer and the scheduler.
+
+        Must update lr_scheduler.base_lrs as well; otherwise the scheduler
+        overwrites group["lr"] back to 0 * multiplier = 0 on its next step().
+        """
+        for i, group in enumerate(self.optimizer.param_groups):
+            if group.get("group_name") == "lora":
+                group["lr"] = lr
+                if self.lr_scheduler is not None and hasattr(self.lr_scheduler, "base_lrs"):
+                    self.lr_scheduler.base_lrs[i] = lr
+                return
+        raise RuntimeError("No 'lora' param group found in optimizer.")
+
+    # ------------------------------------------------------------------
     # Forward step
     # ------------------------------------------------------------------
 

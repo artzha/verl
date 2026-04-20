@@ -396,6 +396,11 @@ class RewardTrainer(SFTTrainer):
         n_gpus = dp_size
         memory_snapshot_step = int(getattr(self.config.trainer, "memory_snapshot_step", 0) or 0)
 
+        # Two-phase training: freeze LoRA for the first N steps so only the
+        # randomly-initialised score head warms up, then unfreeze everything.
+        score_head_warmup_steps = int(getattr(self.config.trainer, "score_head_warmup_steps", 0) or 0)
+        lora_unfrozen = score_head_warmup_steps == 0  # already unfrozen if no warmup requested
+
         total_tokens = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
@@ -419,6 +424,16 @@ class RewardTrainer(SFTTrainer):
                     break
 
                 global_step += 1
+
+                if not lora_unfrozen and global_step >= score_head_warmup_steps:
+                    target_lr = self.optimizer_config.lr
+                    if hasattr(self.engine, "set_lora_lr"):
+                        self.engine.set_lora_lr(target_lr)
+                    lora_unfrozen = True
+                    log_with_rank(
+                        f"Step {global_step}: LoRA unfrozen, lr set to {target_lr}",
+                        logger=logger, rank=0, log_only_rank_0=True,
+                    )
 
                 with marked_timer("step", timing_raw, color="white"):
                     # ---- Zone 2: Batch preparation (CPU -> metadata) ----
