@@ -1,0 +1,52 @@
+train_batch_size: 256 # global batch size
+val_batch_size: 32
+micro_batch_size_per_gpu: 4  # this is also val batch size
+dataloader_num_workers: 8
+pin_memory: False # for some reason this raises an iterable error
+max_token_len_per_gpu: 8192
+use_dynamic_bsz: True
+train_files: ''
+val_files: ''
+train_max_samples: -1  # set to -1 to use full dataset
+val_max_samples: -1  # set to -1 to use full dataset
+# RM dataset keys
+prompt_key: prompt
+chosen_key: chosen
+rejected_key: rejected
+image_key: image
+video_key: video
+pad_mode: no_padding
+
+# Vision resize mode for image/video processing.
+# - auto: use qwen_vl_utils default smart resize
+# - original: preserve original image/frame resolution
+resize_mode: original
+
+# Reserved fields for future fixed-size resize mode support.
+resize_height: null
+resize_width: null
+
+# For DPO
+shuffle: true
+seed: 42
+
+reward_fn_key: null
+sampler:
+  class_path: null
+  class_name: null
+
+# for right padding
+max_length: 2048
+truncation: error
+balance_dp_token: False # to be implement
+custom_cls:
+  path: external/verl/verl/utils/dataset/rm_dataset.py
+  name: RMDataset
+use_shm: False
+apply_chat_template_kwargs: {
+  video_metadata: {
+    fps: 0.5,
+    frames_indices: [0, 1, 2, 3], # Frames to use
+    total_num_frames: 4           # Observation history
+  }
+}

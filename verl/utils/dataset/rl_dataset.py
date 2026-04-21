@@ -110,7 +110,7 @@ class RLHFDataset(Dataset):
         self.resize_mode = config.get("resize_mode", "auto")
         self.resize_height = config.get("resize_height", None)
         self.resize_width = config.get("resize_width", None)
-        self.max_prompt_length = config.get("max_prompt_length", 1024)
+        self.max_prompt_length = config.get("max_prompt_length", 1280)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
         self.truncation = config.get("truncation", "error")

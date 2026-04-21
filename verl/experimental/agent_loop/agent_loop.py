@@ -1209,6 +1209,12 @@ class AgentLoopWorker:
         if any(mmi is not None for mmi in multi_modal_inputs_list):
             non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
+        # Also preserve raw multi_modal_data (PIL images / video tuples) so downstream
+        # consumers (e.g. build_rm_raw_prompt) can rebuild chat payloads with real media.
+        multi_modal_data_list = [input.multi_modal_data for input in inputs]
+        if any(mmd is not None for mmd in multi_modal_data_list):
+            non_tensor_batch["multi_modal_data"] = np.array(multi_modal_data_list, dtype=object)
+
         metrics = [input.metrics.model_dump() for input in inputs]
         # Collect extra fields from all inputs and convert them to np.ndarray
         extra_fields = {}

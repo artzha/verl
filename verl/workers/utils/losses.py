@@ -160,6 +160,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     if loss_mode == "topk_ce":
         policy_loss_kwargs["topk_ce_mask"] = data.get("topk_ce_mask", None)
         policy_loss_kwargs["token_level_rewards"] = data.get("token_level_rewards", None)
+    elif loss_mode == "dpo":
+        policy_loss_kwargs["ref_log_prob"] = data.get("ref_log_prob", None)
+        policy_loss_kwargs["pair_loss_mask"] = data.get("pair_loss_mask", None)
     pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kwargs)
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens

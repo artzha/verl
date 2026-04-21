@@ -7,6 +7,7 @@
 # <folder_name>@<field_name>.<field_name>: <yaml_file_name>
 
 defaults:
+  - data@data: motion_reward_foresight
   - model@model: hf_model
   - engine@engine: fsdp
   - optim@optim: fsdp
@@ -19,49 +20,49 @@ defaults:
 # Run dataset smoke test only:
 # python -m verl.utils.dataset.rm_dataset --config external/verl/verl/trainer/motion_reward_trainer.yaml --parquet data/unified_motion_rm_v1/parquet/train/train.parquet --model-path Qwen/Qwen3-VL-2B-Instruct
 
-data:
-  train_batch_size: 256 # global batch size
-  micro_batch_size_per_gpu: 4  # this is also val batch size
-  dataloader_num_workers: 8
-  pin_memory: False # for some reason this raises an iterable error
-  max_token_len_per_gpu: 8192
-  use_dynamic_bsz: True
-  train_files: ''
-  val_files: ''
-  train_max_samples: -1  # set to -1 to use full dataset
-  val_max_samples: -1  # set to -1 to use full dataset
-  # RM dataset keys
-  prompt_key: prompt
-  chosen_key: chosen
-  rejected_key: rejected
-  image_key: image
-  video_key: video
-  pad_mode: no_padding
+# data:
+#   train_batch_size: 256 # global batch size
+#   micro_batch_size_per_gpu: 4  # this is also val batch size
+#   dataloader_num_workers: 8
+#   pin_memory: False # for some reason this raises an iterable error
+#   max_token_len_per_gpu: 8192
+#   use_dynamic_bsz: True
+#   train_files: ''
+#   val_files: ''
+#   train_max_samples: -1  # set to -1 to use full dataset
+#   val_max_samples: -1  # set to -1 to use full dataset
+#   # RM dataset keys
+#   prompt_key: prompt
+#   chosen_key: chosen
+#   rejected_key: rejected
+#   image_key: image
+#   video_key: video
+#   pad_mode: no_padding
 
-  # Vision resize mode for image/video processing.
-  # - auto: use qwen_vl_utils default smart resize
-  # - original: preserve original image/frame resolution
-  resize_mode: original
+#   # Vision resize mode for image/video processing.
+#   # - auto: use qwen_vl_utils default smart resize
+#   # - original: preserve original image/frame resolution
+#   resize_mode: original
 
-  # Reserved fields for future fixed-size resize mode support.
-  resize_height: null
-  resize_width: null
+#   # Reserved fields for future fixed-size resize mode support.
+#   resize_height: null
+#   resize_width: null
 
-  # for right padding
-  max_length: 2048
-  truncation: error
-  balance_dp_token: False # to be implement
-  custom_cls:
-    path: external/verl/verl/utils/dataset/rm_dataset.py
-    name: RMDataset
-  use_shm: False
-  apply_chat_template_kwargs: {
-    video_metadata: {
-      fps: 0.5,
-      frames_indices: [0, 1, 2, 3], # Frames to use
-      total_num_frames: 4           # Observation history
-    }
-  }
+#   # for right padding
+#   max_length: 2048
+#   truncation: error
+#   balance_dp_token: False # to be implement
+#   custom_cls:
+#     path: external/verl/verl/utils/dataset/rm_dataset.py
+#     name: RMDataset
+#   use_shm: False
+#   apply_chat_template_kwargs: {
+#     video_metadata: {
+#       fps: 0.5,
+#       frames_indices: [0, 1, 2, 3], # Frames to use
+#       total_num_frames: 4           # Observation history
+#     }
+#   }
 
 model:
   path: Qwen/Qwen3-VL-2B-Instruct
@@ -69,6 +70,7 @@ model:
   trust_remote_code: True
   lora_rank: 32
   lora_alpha: 32
+  lora_dropout: 0.05
   target_modules: 'all-linear'
     # - linear_fc1
     # - linear_fc2
@@ -127,6 +129,10 @@ trainer:
   n_gpus_per_node: 1
 
   profile_interval: [-1, -1]
+
+  # Freeze LoRA adapters for this many steps so the randomly-initialised score
+  # head can stabilise before the backbone adapts. Set to 0 to disable.
+  score_head_warmup_steps: 0
 
 optim:
   lr_scheduler_type: cosine

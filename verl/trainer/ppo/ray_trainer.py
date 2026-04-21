@@ -911,9 +911,12 @@ class RayPPOTrainer:
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
-            # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
+            # When reward_model.style == "model", we run the RM worker to score validation
+            # rollouts (populated into rm_scores below, just before _compute_or_extract_reward).
+            use_rm_for_validation = (
+                self.config.reward_model.enable
+                and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model"
+            )
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -985,8 +988,22 @@ class RayPPOTrainer:
 
             # Ensure motion_response/critic_response are in extra_info for reward_fn (reward_kwargs)
             self._merge_rollout_responses_into_extra_info(test_batch)
-            # evaluate using reward_function
             breakpoint()
+            # Run the RM worker on validation rollouts when reward style is "model" so
+            # _compute_or_extract_reward finds rm_scores and returns them directly.
+            if use_rm_for_validation and self.use_rm and "rm_scores" not in test_batch.batch.keys():
+                if not self.use_reward_loop:
+                    if self._rm_critic_prompt_msg is not None:
+                        test_batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
+                            test_batch.non_tensor_batch, self._rm_critic_prompt_msg
+                        )
+                    rm_tensor = self.rm_wg.compute_rm_score(test_batch)
+                else:
+                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                    rm_tensor = self.reward_loop_manager.compute_rm_score(test_batch)
+                test_batch = test_batch.union(rm_tensor)
+
+            # evaluate using reward_function
             result = self._compute_or_extract_reward(test_batch, reward_fn=self.val_reward_fn, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -1811,6 +1828,224 @@ class RayPPOTrainer:
             critic_output = self.critic_wg.update_critic(batch)
         return critic_output
 
+    # ------------------------------------------------------------------
+    # DPO training loop
+    # ------------------------------------------------------------------
+
+    def _fit_dpo(self):
+        """Online DPO training loop (B3 sequence ordering).
+
+        Per step:
+          Stage A  – generate initial motion plan from current policy.
+          Stage B  – render annotated image, then generate critique.
+          Splice   – build full chosen/rejected sequences with shared prefix.
+          Logprob  – compute logπθ and logπref over the final motion tokens only.
+          Update   – actor gradient step with DPO loss.
+
+        The GRPO fit() body is untouched; this method is dispatched from
+        fit() when config.algorithm.objective == "dpo".
+        """
+        from omegaconf import OmegaConf
+        from verl.utils.tracking import Tracking
+        from verl.trainer.ppo.dpo_utils import build_dpo_batch
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+        self._load_checkpoint()
+        current_epoch = self.global_steps // len(self.train_dataloader)
+
+        # Pre-load static prompt messages (same config paths used by GRPO)
+        from cotnav.core.format import text_to_llava
+        critic_prompt_path = self.config.actor_rollout_ref.get("critic_prompt_path", None)
+        assert critic_prompt_path, "actor_rollout_ref.critic_prompt_path must be set for DPO"
+        with open(critic_prompt_path, "r") as fh:
+            critic_prompt_msg = text_to_llava(fh.read(), role="user")
+
+        refine_prompt_path = self.config.actor_rollout_ref.get("motion_refine_prompt_path", None)
+        assert refine_prompt_path, "actor_rollout_ref.motion_refine_prompt_path must be set for DPO"
+        with open(refine_prompt_path, "r") as fh:
+            refine_prompt_msg = text_to_llava(fh.read(), role="user")
+
+        dpo_beta = float(OmegaConf.select(self.config, "algorithm.dpo.beta", default=0.1))
+        apply_chat_template_kwargs = dict(
+            self.config.data.get("apply_chat_template_kwargs", {})
+        )
+        max_length = int(self.config.data.get("max_length", 4096))
+
+        progress_bar = tqdm(
+            total=self.total_training_steps,
+            initial=self.global_steps,
+            desc="DPO Training",
+        )
+        self.global_steps += 1
+
+        for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                metrics: dict = {}
+                timing_raw: dict = {}
+                is_last_step = self.global_steps >= self.total_training_steps
+                # ---- Staged rollout generation from config ----
+                # Use rollout_generations.before_actor to run motion -> critic
+                # (or any configured sequence) and read both responses from the
+                # merged non_tensor keys.
+                with marked_timer("dpo/gen_rollouts", timing_raw, color="red"):
+                    gen_batch = self._build_dpo_gen_batch(
+                        batch_dict,
+                        prompt_key="motion",
+                        prompts_registry={},  # raw_prompt already formatted by dataset
+                    )
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+                    breakpoint()
+                    before_steps = self._get_rollout_generation_steps("before_actor")
+                    assert before_steps, (
+                        "DPO requires actor_rollout_ref.rollout_generations.before_actor "
+                        "to produce motion and critique rollouts."
+                    )
+                    gen_batch = self._run_rollout_generations(
+                        gen_batch, before_steps, timing_raw=timing_raw
+                    )
+                    motion_rows = gen_batch.non_tensor_batch.get("motion_response")
+                    critic_rows = gen_batch.non_tensor_batch.get("critic_response")
+                    assert motion_rows is not None, (
+                        "DPO rollout_generations.before_actor must produce 'motion_response'."
+                    )
+                    assert critic_rows is not None, (
+                        "DPO rollout_generations.before_actor must produce 'critic_response'."
+                    )
+                    motion_rows = motion_rows.tolist() if hasattr(motion_rows, "tolist") else motion_rows
+                    critic_rows = critic_rows.tolist() if hasattr(critic_rows, "tolist") else critic_rows
+                    motion_responses = [row[-1] if isinstance(row, list) and row else row for row in motion_rows]
+                    critique_responses = [row[-1] if isinstance(row, list) and row else row for row in critic_rows]
+                breakpoint()
+                # ---- Splice: tokenize full DPO sequences ----
+                with marked_timer("dpo/splice", timing_raw, color="cyan"):
+                    extra_infos = None
+                    if "extra_info" in gen_batch.non_tensor_batch:
+                        extra_infos = list(
+                            gen_batch.non_tensor_batch["extra_info"].tolist()
+                        )
+                    dpo_batch = build_dpo_batch(
+                        batch_components=batch_dict,
+                        motion_responses=motion_responses,
+                        critique_responses=critique_responses,
+                        critic_prompt_msg=critic_prompt_msg,
+                        refine_prompt_msg=refine_prompt_msg,
+                        processor=self.processor,
+                        tokenizer=self.tokenizer,
+                        max_length=max_length,
+                        apply_chat_template_kwargs=apply_chat_template_kwargs,
+                        extra_infos=extra_infos,
+                    )
+
+                # ---- Logπθ and logπref ----
+                with marked_timer("dpo/log_prob", timing_raw, color="blue"):
+                    pi_out = self.actor_rollout_wg.compute_log_prob(dpo_batch)
+                    dpo_batch = dpo_batch.union(pi_out)
+
+                with marked_timer("dpo/ref_log_prob", timing_raw, color="olive"):
+                    ref_out = self._compute_ref_log_prob(dpo_batch)
+                    dpo_batch = dpo_batch.union(ref_out)
+
+                # ---- Actor update (DPO loss via loss_mode=dpo) ----
+                # losses.py reads data["advantages"]; supply zeros as a no-op placeholder.
+                dpo_batch.batch["advantages"] = torch.zeros_like(
+                    dpo_batch.batch["response_mask"], dtype=torch.float32
+                )
+                dpo_batch.meta_info["dpo_beta"] = dpo_beta
+                with marked_timer("dpo/update_actor", timing_raw, color="red"):
+                    actor_output = self._update_actor(dpo_batch)
+                actor_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                metrics.update(actor_metrics)
+
+                # ---- Logging ----
+                metrics["perf/dpo_step_s"] = sum(timing_raw.values())
+                logger.log(data=metrics, step=self.global_steps)
+
+                if is_last_step or (
+                    self.config.trainer.save_freq > 0
+                    and self.global_steps % self.config.trainer.save_freq == 0
+                ):
+                    self._save_checkpoint()
+
+                if is_last_step:
+                    return
+
+                self.global_steps += 1
+                progress_bar.update(1)
+
+    def _build_dpo_gen_batch(
+        self,
+        batch_dict: dict,
+        prompt_key: str,
+        prompts_registry: dict,
+    ) -> "DataProto":
+        """Wrap dataset components into a DataProto suitable for generate_sequences.
+
+        Expects batch_dict to contain raw_prompt and multi_modal_data lists from
+        DPODataCollator.  Converts them to the full_prompts / multi_modal_data
+        format consumed by the async rollout server.
+        """
+        raw_prompts = batch_dict["raw_prompt"]  # list[list[dict]]
+        mm_data_list = batch_dict["multi_modal_data"]  # list[dict]
+
+        full_prompts = np.array(
+            self.processor.apply_chat_template(
+                raw_prompts,
+                tokenize=False,
+                add_generation_prompt=True,
+            ),
+            dtype=object,
+        )
+
+        non_tensor = {
+            "raw_prompt": np.array(raw_prompts, dtype=object),
+            "full_prompts": full_prompts,
+            "multi_modal_data": np.array(mm_data_list, dtype=object),
+            "extra_info": np.array(
+                batch_dict.get("extra_info", [{} for _ in raw_prompts]), dtype=object
+            ),
+        }
+        return DataProto.from_dict(tensors={}, non_tensors=non_tensor)
+
+    def _build_dpo_critique_batch(
+        self,
+        motion_batch: "DataProto",
+        critic_raw_prompts: np.ndarray,
+    ) -> "DataProto":
+        """Build the critique generation batch from critic_raw_prompts.
+
+        critic_raw_prompts comes from build_rm_raw_prompt — it is an object array
+        of per-sample chat message lists (4 turns: sys, motion_prompt, motion_response,
+        annotated_obs+critic_prompt).
+        """
+        full_prompts = np.array(
+            self.processor.apply_chat_template(
+                critic_raw_prompts.tolist(),
+                tokenize=False,
+                add_generation_prompt=True,
+            ),
+            dtype=object,
+        )
+        non_tensor = {
+            "raw_prompt": critic_raw_prompts,
+            "full_prompts": full_prompts,
+            "multi_modal_data": motion_batch.non_tensor_batch.get(
+                "multi_modal_data",
+                np.array([{} for _ in range(len(critic_raw_prompts))], dtype=object),
+            ),
+            "extra_info": motion_batch.non_tensor_batch.get(
+                "extra_info",
+                np.array([{} for _ in range(len(critic_raw_prompts))], dtype=object),
+            ),
+        }
+        return DataProto.from_dict(tensors={}, non_tensors=non_tensor)
+
     def _assert_finite(self, name: str, t: torch.Tensor, *, throw=True):
         if t is None:
             return
@@ -1834,6 +2069,9 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        if self.config.algorithm.get("objective", "ppo") == "dpo":
+            return self._fit_dpo()
+
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking

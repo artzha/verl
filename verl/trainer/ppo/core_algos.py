@@ -2303,3 +2303,81 @@ def compute_policy_loss_bypass_mode(
     pg_metrics.update(rollout_metrics)
 
     return pg_loss, pg_metrics
+
+
+# ---------------------------------------------------------------------------
+# DPO policy loss
+# ---------------------------------------------------------------------------
+
+@register_policy_loss("dpo")
+def compute_policy_loss_dpo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config=None,
+    rollout_is_weights=None,
+    ref_log_prob: Optional[torch.Tensor] = None,
+    pair_loss_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict]:
+    """DPO (Direct Preference Optimization) loss for online preference training.
+
+    Sequences must be interleaved [chosen_0, rejected_0, chosen_1, rejected_1, ...]
+    in the batch (same convention as RMTensorCollator / rm_loss).
+
+    response_mask covers only the final motion tokens — critique and initial motion
+    plan tokens are context and excluded from the logp sum.
+
+    Args:
+        log_prob:       (2N, T) per-token log-probs from the current policy forward pass.
+        ref_log_prob:   (2N, T) per-token log-probs from the frozen reference policy.
+        response_mask:  (2N, T) float mask — 1 for scored motion tokens, 0 elsewhere.
+        pair_loss_mask: (2N,)  validity flag per sequence (1=valid, 0=skip).
+        config:         ActorConfig; reads policy_loss.dpo_beta (default 0.1).
+        old_log_prob, advantages, rollout_is_weights: unused, present for interface parity.
+
+    Returns:
+        (loss, metrics)
+    """
+    assert ref_log_prob is not None, "ref_log_prob must be provided for DPO loss"
+
+    beta = 0.1
+    if config is not None and hasattr(config, "policy_loss"):
+        beta = float(config.policy_loss.get("dpo_beta", 0.1))
+
+    resp_mask = response_mask.float()
+
+    # Sum token-level log-probs over response tokens → per-sequence scalar (2N,)
+    pi_logps  = (log_prob   * resp_mask).sum(-1)
+    ref_logps = (ref_log_prob * resp_mask).sum(-1)
+
+    # DPO: logits = beta * ((logπ_chosen - logπref_chosen) - (logπ_rejected - logπref_rejected))
+    pi_c,  pi_r  = pi_logps[::2],  pi_logps[1::2]
+    ref_c, ref_r = ref_logps[::2], ref_logps[1::2]
+    logits = beta * ((pi_c - ref_c) - (pi_r - ref_r))          # (N,)
+    pair_loss = -F.logsigmoid(logits)                           # (N,)
+
+    # Per-pair validity weighting
+    if pair_loss_mask is not None:
+        weights = torch.minimum(pair_loss_mask[::2], pair_loss_mask[1::2]).to(pair_loss.device)
+        denom = weights.sum().clamp(min=1e-8)
+        loss = (pair_loss * weights).sum() / denom
+    else:
+        loss = pair_loss.mean()
+
+    with torch.no_grad():
+        denom_m = weights.sum().clamp(min=1e-8) if pair_loss_mask is not None else torch.tensor(float(len(logits)))
+        margin   = logits.mean().item()
+        accuracy = (logits > 0).float().mean().item()
+
+    metrics = {
+        "dpo/loss":         loss.detach().item(),
+        "dpo/margin":       margin,
+        "dpo/accuracy":     accuracy,
+        "dpo/pi_chosen":    pi_c.detach().mean().item(),
+        "dpo/pi_rejected":  pi_r.detach().mean().item(),
+        "dpo/ref_chosen":   ref_c.detach().mean().item(),
+        "dpo/ref_rejected": ref_r.detach().mean().item(),
+    }
+    return loss, metrics

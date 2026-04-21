@@ -88,6 +88,12 @@ class RMDataset(Dataset):
             if OmegaConf.is_config(v):
                 self.apply_chat_template_kwargs[k] = OmegaConf.to_container(v, resolve=True)
 
+        # When True, __getitem__ returns raw components (prompt_messages, multi_modal_data,
+        # chosen/rejected motion text) instead of pre-tokenized pair tensors.  Used by the
+        # DPO training path where critique generation happens online and tokenization is
+        # deferred to build_dpo_batch after the two rollout stages.
+        self.emit_components = bool(config.get("emit_components", False))
+
         self._download()
         self._read_files_and_process()
 
@@ -451,11 +457,66 @@ class RMDataset(Dataset):
             result["rejected_multi_modal_inputs"] = rejected_multi_modal_inputs
         return result
 
+    def _build_components(self, row_dict: dict[str, Any]) -> dict[str, Any]:
+        """Return raw DPO components without tokenizing the full pair.
+
+        Calls _build_prompt_prefix once (expanding multimodal placeholders), then
+        parses the resulting messages to extract processed video/image tensors into
+        multi_modal_data — the same format expected by build_rm_raw_prompt.
+
+        Returns:
+            raw_prompt:          expanded sys + motion_prompt message list
+            multi_modal_data:    {"video": [(tensor, None), ...]} or {"image": [...]}
+            chosen_motion_text:  text of the assistant turn in the chosen branch
+            rejected_motion_text: text of the assistant turn in the rejected branch
+        """
+        prompt_messages = self._build_prompt_prefix(row_dict)
+
+        # Parse already-expanded messages to build multi_modal_data for annotation.
+        videos: list = []
+        images: list = []
+        for msg in prompt_messages:
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "video" and "video" in c:
+                    # populate with video_metadata from the chat template kwargs
+                    video_metadata = self.apply_chat_template_kwargs.get("video_metadata", None)
+                    videos.append((c["video"], video_metadata))
+                elif c.get("type") == "image" and "image" in c:
+                    images.append(c["image"])
+        multi_modal_data = {"video": videos} if videos else {"image": images}
+        breakpoint()
+        def _branch_text(branch_key: str) -> str:
+            branch = convert_nested_value_to_list_recursive(row_dict[branch_key])
+            for msg in branch:
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        return content
+                    if isinstance(content, list):
+                        return "".join(c.get("text", "") for c in content if isinstance(c, dict))
+            return ""
+        
+        payload =  {
+            "raw_prompt": prompt_messages,
+            "multi_modal_data": multi_modal_data,
+            "chosen_motion_text": _branch_text(self.chosen_key),
+            "rejected_motion_text": _branch_text(self.rejected_key),
+        }
+
+        return payload
+    
     def __getitem__(self, item):
         row_dict: dict[str, Any] = self.dataframe.iloc[item].to_dict()
         tools = None
 
         if not self.grouped_pairs:
+            if self.emit_components:
+                return self._build_components(row_dict)
             return self._build_pair_result(row_dict=row_dict, tools=tools)
 
         prompt = row_dict[self.prompt_key]

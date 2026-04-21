@@ -346,23 +346,31 @@ class TaskRunner:
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
-        train_dataset = create_rl_dataset(
-            config.data.train_files,
-            config.data,
-            tokenizer,
-            processor,
-            is_train=True,
-            max_samples=config.data.get("train_max_samples", -1),
-        )
-        val_dataset = create_rl_dataset(
-            config.data.val_files,
-            config.data,
-            tokenizer,
-            processor,
-            is_train=False,
-            max_samples=config.data.get("val_max_samples", -1),
-        )
-        train_sampler = create_rl_sampler(config.data, train_dataset)
+        # DPO uses RMDataset in emit_components mode; GRPO uses the standard RL dataset.
+        is_dpo = config.algorithm.get("objective", "ppo") == "dpo"
+        if is_dpo:
+            train_dataset, val_dataset, collate_fn = create_dpo_dataset(
+                config, tokenizer, processor
+            )
+            train_sampler = create_rl_sampler(config.data, train_dataset)
+        else:
+            train_dataset = create_rl_dataset(
+                config.data.train_files,
+                config.data,
+                tokenizer,
+                processor,
+                is_train=True,
+                max_samples=config.data.get("train_max_samples", -1),
+            )
+            val_dataset = create_rl_dataset(
+                config.data.val_files,
+                config.data,
+                tokenizer,
+                processor,
+                is_train=False,
+                max_samples=config.data.get("val_max_samples", -1),
+            )
+            train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(
@@ -461,6 +469,47 @@ def create_rl_sampler(data_config, dataset):
         sampler = SequentialSampler(data_source=dataset)
 
     return sampler
+
+
+def create_dpo_dataset(config, tokenizer, processor):
+    """Create RMDataset in emit_components mode and return (train, val, collate_fn).
+
+    Used when config.algorithm.objective == "dpo".  The dataset emits raw prompt
+    messages and chosen/rejected motion texts; full tokenization is deferred to
+    build_dpo_batch after both online rollout stages.
+    """
+    from omegaconf import OmegaConf, DictConfig
+    from verl.utils.dataset.rm_dataset import RMDataset
+    from verl.trainer.ppo.dpo_utils import DPODataCollator
+
+    data_cfg = config.data
+    # Force emit_components mode without mutating the shared config object.
+    # `data_cfg` may be struct-locked, so clone to a plain mutable config first.
+    dpo_data_cfg = OmegaConf.create(OmegaConf.to_container(data_cfg, resolve=False))
+    dpo_data_cfg.emit_components = True
+
+    def _make(files, max_samples):
+        from omegaconf import ListConfig
+        if not isinstance(files, (list, ListConfig)):
+            files = [files]
+        return RMDataset(
+            parquet_files=list(files),
+            tokenizer=tokenizer,
+            processor=processor,
+            config=dpo_data_cfg,
+            max_samples=max_samples,
+        )
+
+    train_ds = _make(
+        data_cfg.train_files,
+        max_samples=data_cfg.get("train_max_samples", -1),
+    )
+    val_ds = _make(
+        data_cfg.val_files,
+        max_samples=data_cfg.get("val_max_samples", -1),
+    ) if data_cfg.get("val_files") else None
+
+    return train_ds, val_ds, DPODataCollator()
 
 
 if __name__ == "__main__":

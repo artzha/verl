@@ -280,12 +280,15 @@ class FSDPEngine(BaseEngine):
                 "bias": "none",
             }
             module = get_peft_model(module, LoraConfig(**lora_config))
-
         # Debug: print trainable module names (rank 0 only)
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             trainable = [
                 name for name, param in module.named_parameters() if param.requires_grad
             ]
+            for n, p in module.named_parameters():
+                if "lora_" in n:
+                    print(n, p.dtype, p.requires_grad, p.device)
+            # these are fp32 by default, intentional for training stability
             print(f"[LoRA] Trainable parameters ({len(trainable)}):")
             for name in trainable:
                 print(f"  {name}")
@@ -304,10 +307,12 @@ class FSDPEngine(BaseEngine):
             param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
             reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
             buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
+            output_dtype = PrecisionType.to_dtype(mixed_precision_config.get("output_dtype", "fp32"))
         else:
             param_dtype = torch.bfloat16
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
+            output_dtype = torch.float32
 
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
@@ -354,7 +359,7 @@ class FSDPEngine(BaseEngine):
             # - ref: CPUOffloadPolicy(pin_memory=True)
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
             mp_policy = MixedPrecisionPolicy(
-                param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
+                param_dtype=param_dtype, reduce_dtype=reduce_dtype, output_dtype=output_dtype, cast_forward_inputs=True
             )
             offload_policy = None
             if self.engine_config.offload_policy or self.engine_config.forward_only:

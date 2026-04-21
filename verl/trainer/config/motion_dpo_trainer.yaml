@@ -1,110 +1,93 @@
-# Format checks enforced on CI:
-# 1. Comments must appear above each field.
-# 2. There must be a blank line between each field.
-# 3. Inline comments (after a field on the same line) are not allowed.
-# 4. Indentation level is respected for nested fields.
+# DPO trainer config — online iterative DPO with on-policy critique generation.
+#
+# Inherits the motion_trainer defaults and overrides only DPO-specific fields.
+# Sequence ordering (B3):
+#   [sys][motion_prompt+obs] -> [motion_gen] -> [annotated_obs+critic_prompt]
+#   -> [critique_gen] -> [refine_prompt] -> [chosen | rejected motion]
+#
+# response_mask covers only the final motion tokens; all upstream context is
+# excluded from the DPO logp sum.
 defaults:
 
-  # <folder_name>@<field_name>.<field_name>: <yaml_file_name>
-  # actor_rollout_ref.actor: trainer/config/actor/dp_actor.yaml
+  - data@data: motion_reward_foresight
+
   - actor@actor_rollout_ref.actor: dp_actor
 
-  - data@data: motion_foresight
-
-  # (Rule-based) Reward manager config.
   - reward_manager@reward_manager
 
-  # Reference model config.
+  # DPO always needs a reference policy
   - ref@actor_rollout_ref.ref: dp_ref
 
-  # Rollout model config.
   - rollout@actor_rollout_ref.rollout: rollout
 
-  # Shared rollout config for all extra rollouts (motion, critic). Replaces deprecated motion_rollout.
   - rollout@actor_rollout_ref.extra_rollout_rollout: rollout
 
-  # Model config.
   - model@actor_rollout_ref.model: hf_model
 
-  # Critic model config.
+  # Critic and reward model are disabled for DPO; still include defaults so
+  # Hydra schema validation passes, but need_critic() / add_reward_model_worker()
+  # short-circuit on algorithm.objective=dpo.
   - critic@critic: dp_critic
 
-  # Reward model config.
   - reward_model@reward_model: dp_reward_model
 
-  # Rollout correction config.
-  - algorithm@algorithm.rollout_correction: rollout_correction
-
-  # load the reference default config, then apply the fields in the current yaml
-  # self config override anything above
   - _self_
 
-# prompts
+# Prompt paths (same as motion_trainer)
 motion_prompt_path: 'cotnav/prompts/datagen/plan_v3/motion_prompt_startgoal.txt'
 motion_refine_prompt_path: 'cotnav/prompts/datagen/plan_v3/motion_refine_prompt.txt'
 critic_prompt_path: 'cotnav/prompts/datagen/plan_v3/critic_prompt.txt'
 
-  # model:
-  #   # Use remove padding optimization (saves compute)
-  #   use_remove_padding: True
+# data:
+#   shuffle: true
+#   seed: 42
+#   train_files: null
+#   val_files: null
+#   train_batch_size: 64
+#   val_batch_size: 32
+#   max_length: 4096
+#   # Passed to processor.apply_chat_template
+#   apply_chat_template_kwargs:
+#     do_sample_frames: false
+#     video_metadata:
+#       fps: 0.5
+#       frames_indices: [0, 1, 2, 3]
+#       total_num_frames: 4
 
-  #   # LoRA knobs (VeRL infra) See model/hf_model.yaml for definitions
-  #   lora_rank: 0.0
-  #   lora_alpha: 0.0
-  #   target_modules: all-linear
-  #   # exclude_modules: '.*visual.*'
-  #   exclude_modules: null
-
-  #   freeze_vision_tower: False
+# mandatory for bypassing reward model
+reward_model:
+  use_reward_loop: false
 
 actor_rollout_ref:
   hybrid_engine: true
-  critic_output_format: verdict:v1
   critic_prompt_path: ${critic_prompt_path}
+  motion_refine_prompt_path: ${motion_refine_prompt_path}
 
   external_worker:
     path: cotnav/verl_adapters/workers/hybrid_motion_actor.py
     name: HybridMotionActorRolloutRefWorker
 
-  actor:
-    strategy: fsdp2
-    fsdp_config:
-      model_dtype: bf16
-      strategy: fsdp2
-      # param_dtype=bf16: forward pass in bf16 (base + LoRA all-gathered and cast to bf16)
-      # reduce_dtype=fp32: gradient reduction in fp32 for numerical stability
-      # output_dtype=fp32: sharded gradient cast to fp32 before assignment to fp32 LoRA master weights
-      # LoRA A/B params remain fp32 (PEFT default); optimizer states remain fp32
-      mixed_precision:
-        param_dtype: fp32
-        reduce_dtype: fp32
-        output_dtype: fp32
-        buffer_dtype: fp32
-
-    freeze_vision_tower: False
-
-  # Ref policy: forward-only, no gradients — bf16 throughout, no output_dtype needed
   ref:
-    strategy: fsdp2
     fsdp_config:
       model_dtype: bf16
-      strategy: fsdp2
       mixed_precision:
         param_dtype: bf16
         reduce_dtype: fp32
         buffer_dtype: fp32
 
-    freeze_vision_tower: False
+  actor:
+    strategy: fsdp2
+
+    # DPO objective: set loss_mode=dpo so the registered compute_policy_loss_dpo
+    # function is dispatched in losses.py / dp_actor.py.
+    policy_loss:
+      loss_mode: dpo
+      # Beta controls the KL-divergence strength in the DPO loss.
+      # Higher beta = stay closer to reference policy.
+      dpo_beta: 0.1
 
   model:
-    # override_config:
-      # model_config: {}
-      # moe_config:
-      #   freeze_moe_router: True
-
-    # Preloads model weights to /dev/shm to improve model loading speed
-    # Do not use is RAM is limited (causes OOM)
-    use_shm: False
+    use_shm: True
 
     # Whether to use custom fused kernels (PostProcessing, for memory efficiency)
     use_fused_kernels: False
@@ -118,9 +101,11 @@ actor_rollout_ref:
     lora_rank: 0.0
     lora_alpha: 0.0
     target_modules: all-linear
-    # exclude_modules: '.*visual.*'
-    exclude_modules: null
+    exclude_modules: '.*visual.*'
+    # exclude_modules: '.*\(vision_tower\|mm_projector\|vision_model\|multi_modal_projector\|visual\)\(\..*\)\?.*'
 
+    lora:
+      merge: True
 
   rollout:
     name: vllm
@@ -147,19 +132,13 @@ actor_rollout_ref:
     # Reduces peak GPU memory usage
     # layered_summon: True
 
-  # Which extra rollouts to run before and after the actor rollout.
-  # Each step can be a string (rollout name) or a dict: rollout, postfill? (before), prefill? (after), response_key? (after).
-  # Example: before_actor runs in order and each output updates prompts for the next; after_actor runs after actor and can store responses (e.g. motion_responses).
   rollout_generations:
+    # Stage A: generate initial motion plan (motion rollout + critic postfill)
     before_actor:
       - rollout: motion
         postfill: critic
       - rollout: critic
         postfill: motion
-    # after_actor:
-    #   - rollout: motion
-    #     prefill: motion
-    #     response_key: motion_responses
 
   # Shared rollout config for all extra rollouts (replaces deprecated motion_rollout).
   extra_rollout_rollout:
@@ -183,12 +162,9 @@ actor_rollout_ref:
         max_num_seqs: 64
         gpu_memory_utilization: 0.9           
         dtype: bfloat16
-        max_num_batched_tokens: 8192
+        max_num_batched_tokens: 16384
         swap_space: 0
 
-  # Extra rollout servers (motion, critic). Replaces deprecated motion + motion_rollout.
-  # motion: sync_with_actor true so the motion planner uses the same trainable policy weights
-  # for rollouts (e.g. sampling initial motion prompts) and stays updated.
   extra_rollouts:
     - name: motion
       model:
@@ -209,99 +185,35 @@ actor_rollout_ref:
         critic: ${critic_prompt_path}
         motion: ${motion_refine_prompt_path}
 
-reward_model:
-  use_reward_loop: false
-  strategy: fsdp2
-  external_worker:
-    path: cotnav/verl_adapters/workers/qwen3vl_reward_worker.py
-    name: Qwen3VLMotionRewardWorker
-  model:
-    path: null
-    external_lib: null
-    trust_remote_code: true
-    use_remove_padding: true
-    apply_chat_template_kwargs: {
-      do_sample_frames: false,
-      video_metadata: {
-        fps: 0.5,
-        frames_indices: [0, 1, 2, 3],
-        total_num_frames: 4
-      }
-    }
-  use_dynamic_bsz: true
-
-reward_manager:
-  name: naive
-
-# custom reward function definition
-custom_reward_function:
-
-  # The path to the file containing your customized reward function.
-  # If not specified, pre-implemented reward functions will be used.
-  # path: /work/09156/arthurz/stampede3/research/cotnav/cotnav/verl_adapters/rewards/sparse_judge_refine.py
-  path: null
-
-  # The name of the reward function within the specified file. Default is 'compute_score'.
-  # name: compute_sparse_judge_reward
-  name: null
-
-# config for the algorithm
+# DPO algorithm settings
 algorithm:
-
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.trainer.config.AlgoConfig
 
-  # Discount factor for future rewards
+  # Signals fit() to dispatch to _fit_dpo() instead of the GRPO loop.
+  objective: dpo
+
+  # DPO-specific hyperparameters
+  dpo:
+    # KL-divergence regularisation strength (must match actor.policy_loss.dpo_beta)
+    beta: ${actor_rollout_ref.actor.policy_loss.dpo_beta}
+
+  # The following GRPO fields are unused by DPO but kept so AlgoConfig validates.
   gamma: 1.0
-
-  # Trade-off between bias and variance in the GAE estimator
   lam: 1.0
-
-  # Rollout correction: bypass_mode uses rollout_log_probs as old_log_probs (skips ~425s actor forward).
-  rollout_correction:
-    bypass_mode: true
-
-  # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
   adv_estimator: grpo
-
-  # Whether to normalize advantages by std (specific to GRPO)
-  norm_adv_by_std_in_grpo: True
-
-  # Whether to enable in-reward KL penalty
-  use_kl_in_reward: False
-
-  # How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full"
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
   kl_penalty: kl
-
-  # KL control configuration
   kl_ctrl:
-
-    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
     _target_: verl.trainer.config.KLControlConfig
-
-    # KL control type: "fixed" or "adaptive"
     type: fixed
-
-    # Initial coefficient for KL penalty
     kl_coef: 0.001
-
-    # Horizon value for adaptive controller (if enabled)
     horizon: 10000
-
-    # Target KL divergence (used for adaptive controller)
     target_kl: 0.1
 
-  # Whether to enable preference feedback PPO
-  use_pf_ppo: False
-
-  # Preference feedback PPO settings
-  pf_ppo:
-
-    # Method for reweighting samples: "pow", "max_min", or "max_random"
-    reweight_method: pow
-
-    # Power used for weight scaling in "pow" method
-    weight_pow: 2.0
+# Critic disabled for DPO
+critic:
+  enable: false
 
 trainer:
   # Whether to balance batch sizes across distributed workers
@@ -311,7 +223,7 @@ trainer:
   # Total training steps (can be set explicitly or derived from epochs)
   total_training_steps: null
   # Project name for experiment tracking (e.g., wandb)
-  project_name: autorefine-critic
+  project_name: verl_motion_dpo
   # Experiment name for run identification in tracking tools
   experiment_name: qwen3_vl_2b_fsdp
   # Logging backends to use: "console", "wandb", etc.
@@ -421,7 +333,7 @@ global_profiler:
       worker_nsight_options:
 
         # Select the API(s) to be traced.
-        trace: "cuda,nvtx,cublas,ucx,nccl"
+        trace: "cuda,nvtx,cublas,ucx"
 
         # Track the GPU memory usage by CUDA kernels. Must be string type "true" or "false".
         cuda-memory-usage: "true"
@@ -472,11 +384,11 @@ ray_kwargs:
 
   # configs related to ray initialization
   ray_init:
-    num_cpus: 32 # Number of CPUs for Ray. Use a fixed number instead of null when using SLURM.
+    num_cpus: 16 # Number of CPUs for Ray. Use a fixed number instead of null when using SLURM.
     # object_store_memory: 21474836480 # 20 * 1024^3
     include_dashboard: True
     dashboard_host: 127.0.0.1
     dashboard_port: 8265
 
   # Path to save Ray timeline JSON for performance profiling
-  timeline_json_file: null
+  timeline_json_file: "outputs/ray_timeline.json"

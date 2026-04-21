@@ -72,10 +72,16 @@ class Role(Enum):
         return role
 
 
+def _is_dpo(config: DictConfig) -> bool:
+    return config.algorithm.get("objective", "ppo") == "dpo"
+
+
 def need_reference_policy(
     config: DictConfig,
 ) -> bool:
     """Given the config, do we need ref policy."""
+    if _is_dpo(config):
+        return True
     return config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss
 
 
@@ -88,6 +94,8 @@ def need_reward_model(
 
 def need_critic(config: DictConfig) -> bool:
     """Given a config, do we need critic."""
+    if _is_dpo(config):
+        return False
     if config.critic.enable is not None:
         return bool(config.critic.enable)
     elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:

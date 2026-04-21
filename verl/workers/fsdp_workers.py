@@ -1929,7 +1929,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 rm_score = rm_score.squeeze(-1)
 
             # extract the result of the last valid token
-            eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)  # (bsz,)
+            # position_ids may have been transposed to (3, bsz, seqlen) above for mrope;
+            # reduce to a single (bsz, seqlen) tensor so eos_mask_idx is (bsz,) not (3, bsz).
+            if position_ids.dim() == 3:
+                pos_for_eos = position_ids[0]  # (bsz, seqlen)
+            else:
+                pos_for_eos = position_ids
+            eos_mask_idx = torch.argmax(pos_for_eos * attention_mask, dim=-1)  # (bsz,)
             rm_score = rm_score[torch.arange(batch_size), eos_mask_idx]
             return rm_score
 
