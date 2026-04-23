@@ -77,8 +77,10 @@ actor_rollout_ref:
       # LoRA A/B params remain fp32 (PEFT default); optimizer states remain fp32
       mixed_precision:
         param_dtype: fp32
-        reduce_dtype: fp32
         output_dtype: fp32
+        # param_dtype: bf16 # base + LoRA all-gathered and cast to bf16 for forward pass
+        # output_dtype: bf16 # sharded gradient must match fp32 sharded param dtype to avoid FSDP2 assign error
+        reduce_dtype: fp32
         buffer_dtype: fp32
 
     freeze_vision_tower: False
@@ -91,6 +93,7 @@ actor_rollout_ref:
       strategy: fsdp2
       mixed_precision:
         param_dtype: bf16
+        output_dtype: bf16
         reduce_dtype: fp32
         buffer_dtype: fp32
 
@@ -210,6 +213,7 @@ actor_rollout_ref:
         motion: ${motion_refine_prompt_path}
 
 reward_model:
+  enable: true
   use_reward_loop: false
   strategy: fsdp2
   external_worker:
@@ -217,7 +221,7 @@ reward_model:
     name: Qwen3VLMotionRewardWorker
   model:
     path: null
-    external_lib: null
+    external_lib: verl.models.transformers.qwen3_vl_reward
     trust_remote_code: true
     use_remove_padding: true
     apply_chat_template_kwargs: {
@@ -421,7 +425,7 @@ global_profiler:
       worker_nsight_options:
 
         # Select the API(s) to be traced.
-        trace: "cuda,nvtx,cublas,ucx,nccl"
+        trace: "cuda,nvtx,cublas,ucx"
 
         # Track the GPU memory usage by CUDA kernels. Must be string type "true" or "false".
         cuda-memory-usage: "true"

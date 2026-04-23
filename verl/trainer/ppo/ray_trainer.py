@@ -988,7 +988,7 @@ class RayPPOTrainer:
 
             # Ensure motion_response/critic_response are in extra_info for reward_fn (reward_kwargs)
             self._merge_rollout_responses_into_extra_info(test_batch)
-            breakpoint()
+
             # Run the RM worker on validation rollouts when reward style is "model" so
             # _compute_or_extract_reward finds rm_scores and returns them directly.
             if use_rm_for_validation and self.use_rm and "rm_scores" not in test_batch.batch.keys():
@@ -997,7 +997,10 @@ class RayPPOTrainer:
                         test_batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
                             test_batch.non_tensor_batch, self._rm_critic_prompt_msg
                         )
-                    rm_tensor = self.rm_wg.compute_rm_score(test_batch)
+                    rm_dp_size = self._get_dp_size(self.rm_wg, "reward")
+                    test_batch_padded, rm_pad_size = pad_dataproto_to_divisor(test_batch, rm_dp_size)
+                    rm_tensor_padded = self.rm_wg.compute_rm_score(test_batch_padded)
+                    rm_tensor = unpad_dataproto(rm_tensor_padded, rm_pad_size)
                 else:
                     assert self.reward_loop_manager is not None, "RewardLoopManager is None"
                     rm_tensor = self.reward_loop_manager.compute_rm_score(test_batch)
@@ -2246,7 +2249,8 @@ class RayPPOTrainer:
                         if "video_grid_thw" in multi_modal_input.keys():
                             images_seqlens_all.extend(multi_modal_input["videos_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
-
+                    # breakpoint()
+                    # import pdb; pdb.set_trace()
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # Ensure motion_response/critic_response are in extra_info for reward_fn (reward_kwargs)
                         self._merge_rollout_responses_into_extra_info(batch)
@@ -2257,6 +2261,7 @@ class RayPPOTrainer:
                                     batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
                                         batch.non_tensor_batch, self._rm_critic_prompt_msg
                                     )
+                                # breakpoint()
                                 reward_tensor = self.rm_wg.compute_rm_score(batch)
                             else:
                                 assert self.reward_loop_manager is not None, "RewardLoopManager is None"

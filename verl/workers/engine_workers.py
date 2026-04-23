@@ -247,11 +247,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 metrics = {}
                 for output in actor_output:
                     for key, val in output.items():
-                        # flattn dp and micro batch
+                            # flatten dp and micro batch
                         if isinstance(val, list):
-                            output[key] = (
-                                Metric.chain(val) if isinstance(val[0], Metric) else list(chain.from_iterable(val))
-                            )
+                            if isinstance(val[0], Metric):
+                                output[key] = Metric.chain(val)
+                            elif isinstance(val[0], list):
+                                output[key] = list(chain.from_iterable(val))
+                            # else: flat list of scalars (e.g. perf/grad_clip_ms), leave as-is
                     append_to_dict(metrics, output)
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()

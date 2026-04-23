@@ -817,7 +817,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
             if pad_mode == DatasetPadMode.NO_PADDING:
                 input_ids_rmpad = input_ids.values().unsqueeze(0)  # (1, total_nnz)
                 if position_ids.dim() == 3:
-                    position_ids_rmpad = position_ids.values().unsqueeze(1)  # (4, 1, total_nnz)
+                    # .values() layout varies when all sequences have equal length
+                    # (e.g., equal-length batches may expose shape (bsz*4, seqlen)).
+                    # Re-pack from per-sequence tensors to enforce canonical channel-first layout.
+                    position_ids_rows = position_ids.unbind()
+                    position_ids_packed = torch.cat(position_ids_rows, dim=-1)
+                    position_ids_rmpad = position_ids_packed.unsqueeze(1)  # (4, 1, total_nnz)
                 else:
                     position_ids_rmpad = position_ids.values().unsqueeze(0)  # (1, total_nnz)
             else:
