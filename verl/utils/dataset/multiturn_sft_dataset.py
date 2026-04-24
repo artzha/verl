@@ -588,16 +588,27 @@ if __name__ == "__main__":
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
 
     from omegaconf import OmegaConf
+
+    # motion
     # config_path = "external/verl/verl/trainer/config/motion_sft_trainer_engine.yaml"
     # config = OmegaConf.load(config_path)
     # OmegaConf.resolve(config)
     # config.data.train_files = "data/unified_motion_sft_v3/parquet/train/train.parquet"
     # config.data.val_files = "data/unified_motion_sft_v3/parquet/val/val.parquet"
+
+    # critic
+    # config_path = "external/verl/verl/trainer/config/critic_sft_trainer_engine.yaml"
+    # config = OmegaConf.load(config_path)
+    # OmegaConf.resolve(config)
+    # config.data.train_files = "data/unified_critic_sft_v2/parquet/train/train.parquet"
+    # config.data.val_files = "data/unified_critic_sft_v2/parquet/val/val.parquet"
+
+    # cotrain
     config_path = "external/verl/verl/trainer/config/critic_sft_trainer_engine.yaml"
     config = OmegaConf.load(config_path)
     OmegaConf.resolve(config)
-    config.data.train_files = "data/unified_critic_sft_v2/parquet/train/train.parquet"
-    config.data.val_files = "data/unified_critic_sft_v2/parquet/val/val.parquet"
+    config.data.train_files = "data/unified_cotrain_sft_v1/parquet/train/train.parquet"
+    config.data.val_files = "data/unified_cotrain_sft_v1/parquet/val/val.parquet"
 
     parquet_files = ListConfig([
         config.data.train_files,

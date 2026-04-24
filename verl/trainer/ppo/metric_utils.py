@@ -580,11 +580,25 @@ def compute_validation_rollout_panels(
     return panel_row_list
 
 
+def _panel_table_key(base_key: str, step_tag: str | None) -> str:
+    """Return the wandb log key for a rollout-panel table.
+
+    When ``step_tag`` is provided, the key is suffixed as
+    ``<base_key>/<step_tag>`` so that each logging event creates a
+    distinct wandb table/section instead of overwriting the previous one.
+    """
+    if step_tag is None:
+        return base_key
+    return f"{base_key}/{step_tag}"
+
+
 def compute_data_metrics(
     batch: DataProto,
     use_critic: bool = True,
     config: Any = None,
     metrics_from_actor: dict[str, Any] | None = None,
+    log_tables: bool = True,
+    step_tag: str | None = None,
 ) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -733,14 +747,15 @@ def compute_data_metrics(
         metrics['critic/vgoal_score/min'] = float(np.min(vgoal_scores))
         metrics['critic/vgoal_score/std'] = float(np.std(vgoal_scores))
 
-        # Log annotated images
-        panel_items = _compute_rollout_panels(batch, max_images=64, config=config)
+        # Log annotated images (only on table-logging steps to avoid per-step overwrite)
+        if log_tables:
+            panel_items = _compute_rollout_panels(batch, max_images=64, config=config)
 
-        import wandb
-        table = wandb.Table(columns=["ride_name", "semantic_goal", "panel"])
-        for (ride_name, semantic_goal, panel_img) in panel_items:  # you can return tuples instead
-            table.add_data(ride_name, semantic_goal, wandb.Image(panel_img))
-        metrics["critic/rollout_panels"] = table
+            import wandb
+            table = wandb.Table(columns=["ride_name", "semantic_goal", "panel"])
+            for (ride_name, semantic_goal, panel_img) in panel_items:  # you can return tuples instead
+                table.add_data(ride_name, semantic_goal, wandb.Image(panel_img))
+            metrics[_panel_table_key("critic/rollout_panels", step_tag)] = table
 
     if 'vdist_score' in batch.non_tensor_batch:
         vdist_scores = batch.non_tensor_batch['vdist_score']
@@ -750,15 +765,15 @@ def compute_data_metrics(
         metrics['critic/vdist_score/std'] = float(np.std(vdist_scores))
 
     score_keys = _panel_score_keys(batch.non_tensor_batch)
-    if len(score_keys) > 0:
+    if log_tables and len(score_keys) > 0:
         panel_items = compute_motion_rollout_panels(batch, max_groups=64, config=config)
         import wandb
         table = wandb.Table(columns=["ride_name", "semantic_goal", "panel"])
         for (ride_name, semantic_goal, panel_img) in panel_items:  # you can return tuples instead
             table.add_data(ride_name, semantic_goal, wandb.Image(panel_img))
-        metrics["critic/rollout_panels"] = table
+        metrics[_panel_table_key("critic/rollout_panels", step_tag)] = table
 
-    if "uid" in batch.non_tensor_batch:
+    if log_tables and "uid" in batch.non_tensor_batch:
         reward_scores = sequence_reward.detach().cpu().numpy()
         val_panel_items = compute_validation_rollout_panels(batch, reward_scores, max_groups=32, config=config)
         if val_panel_items:
@@ -766,7 +781,7 @@ def compute_data_metrics(
             val_table = wandb.Table(columns=["ride_name", "semantic_goal", "mean_reward", "panel"])
             for (ride_name, semantic_goal, panel_img, mean_reward) in val_panel_items:
                 val_table.add_data(ride_name, semantic_goal, mean_reward, wandb.Image(panel_img))
-            metrics["critic/validation_rollout_panels"] = val_table
+            metrics[_panel_table_key("critic/validation_rollout_panels", step_tag)] = val_table
 
     for score_key in ['goal_align_score', 'start_align_score', 'improvement_score', 'smoothness_score']:
         if score_key in batch.non_tensor_batch:

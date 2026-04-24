@@ -2492,12 +2492,23 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
+                # Gate wandb panel tables to the same cadence as test_freq, and
+                # suffix each table's log key with the current step so wandb
+                # shows a separate table per logged epoch instead of
+                # overwriting one shared table.
+                test_freq = self.config.trainer.get("test_freq", 0) or 0
+                log_tables = test_freq > 0 and (
+                    is_last_step or self.global_steps % test_freq == 0
+                )
+                step_tag = f"step_{self.global_steps:07d}" if log_tables else None
                 metrics.update(
                     compute_data_metrics(
                         batch=batch,
                         use_critic=self.use_critic,
                         config=self.config,
                         metrics_from_actor=metrics,
+                        log_tables=log_tables,
+                        step_tag=step_tag,
                     )
                 )
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
