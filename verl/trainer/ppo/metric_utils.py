@@ -755,7 +755,7 @@ def compute_data_metrics(
             table = wandb.Table(columns=["ride_name", "semantic_goal", "panel"])
             for (ride_name, semantic_goal, panel_img) in panel_items:  # you can return tuples instead
                 table.add_data(ride_name, semantic_goal, wandb.Image(panel_img))
-            metrics[_panel_table_key("critic/rollout_panels", step_tag)] = table
+            metrics[_panel_table_key("visual/rollout_panels", step_tag)] = table
 
     if 'vdist_score' in batch.non_tensor_batch:
         vdist_scores = batch.non_tensor_batch['vdist_score']
@@ -771,7 +771,7 @@ def compute_data_metrics(
         table = wandb.Table(columns=["ride_name", "semantic_goal", "panel"])
         for (ride_name, semantic_goal, panel_img) in panel_items:  # you can return tuples instead
             table.add_data(ride_name, semantic_goal, wandb.Image(panel_img))
-        metrics[_panel_table_key("critic/rollout_panels", step_tag)] = table
+        metrics[_panel_table_key("visual/rollout_panels", step_tag)] = table
 
     if log_tables and "uid" in batch.non_tensor_batch:
         reward_scores = sequence_reward.detach().cpu().numpy()
@@ -781,7 +781,7 @@ def compute_data_metrics(
             val_table = wandb.Table(columns=["ride_name", "semantic_goal", "mean_reward", "panel"])
             for (ride_name, semantic_goal, panel_img, mean_reward) in val_panel_items:
                 val_table.add_data(ride_name, semantic_goal, mean_reward, wandb.Image(panel_img))
-            metrics[_panel_table_key("critic/validation_rollout_panels", step_tag)] = val_table
+            metrics[_panel_table_key("visual/validation_rollout_panels", step_tag)] = val_table
 
     for score_key in ['goal_align_score', 'start_align_score', 'improvement_score', 'smoothness_score']:
         if score_key in batch.non_tensor_batch:
