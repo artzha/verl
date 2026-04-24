@@ -137,6 +137,10 @@ class RolloutConfig(BaseConfig):
 
     prompt_length: int = 512
     response_length: int = 512
+    # Per-turn response length caps for agent loops with multiple generations (e.g. cotrain_refine).
+    # Falls back to response_length if not set.
+    critique_response_length: Optional[int] = None
+    motion_response_length: Optional[int] = None
     # If "critic" or "motion", actor output is stored in that key and merged into extra_info for reward.
     response_role: Optional[str] = None
 

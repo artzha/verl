@@ -118,8 +118,11 @@ actor_rollout_ref:
     temperature: 1.0
     top_p: 0.95
     prompt_length: 1680
-    # Budget covers critique JSON (~150 tok) + refine prompt injection (~120 tok) + refined motion (~256 tok).
+    # Budget covers critique (~256 tok) + refine prompt injection (~120 tok) + refined motion (~192 tok).
     response_length: 768
+    # Per-turn response length caps for the two shared-actor generations.
+    critique_response_length: 256
+    motion_response_length: 192
     # If set to "critic" or "motion", the actor's generated response is stored in that key and merged into extra_info for reward.
     response_role: motion
 
@@ -172,6 +175,47 @@ actor_rollout_ref:
         max_num_batched_tokens: 8192
         swap_space: 0
 
+  # Per-rollout configs with distinct response_length budgets.
+  # motion: shorter budget for initial trajectory waypoints.
+  motion_rollout_config:
+    name: vllm
+    mode: async
+    temperature: 1.0
+    top_p: 0.95
+    prompt_length: 1680
+    response_length: 192
+    tensor_model_parallel_size: 1
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    engine_kwargs:
+      vllm:
+        max_model_len: 2048
+        max_num_seqs: 64
+        gpu_memory_utilization: 0.9
+        dtype: bfloat16
+        max_num_batched_tokens: 8192
+        swap_space: 0
+
+  # critic: longer budget for chain-of-thought critique output.
+  critic_rollout_config:
+    name: vllm
+    mode: async
+    temperature: 1.0
+    top_p: 0.95
+    prompt_length: 1680
+    response_length: 256
+    tensor_model_parallel_size: 1
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    engine_kwargs:
+      vllm:
+        max_model_len: 2048
+        max_num_seqs: 64
+        gpu_memory_utilization: 0.9
+        dtype: bfloat16
+        max_num_batched_tokens: 8192
+        swap_space: 0
+
   # Only the motion extra rollout is needed: the shared actor handles critic + refinement in-loop.
   # motion: sync_with_actor=true so the motion planner uses the trainable policy weights.
   extra_rollouts:
@@ -179,7 +223,7 @@ actor_rollout_ref:
       model:
         path: ${actor_rollout_ref.model.path}
         trust_remote_code: true
-      rollout: ${actor_rollout_ref.extra_rollout_rollout}
+      rollout: ${actor_rollout_ref.motion_rollout_config}
       sync_with_actor: true
       prompt_paths:
         critic: ${critic_prompt_path}

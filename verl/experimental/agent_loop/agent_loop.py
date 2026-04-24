@@ -1032,6 +1032,21 @@ class AgentLoopWorker:
                 )
 
             routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
+        # Save the attention_mask raw output to a .txt file
+        # with open("attention_mask_debug.txt", "w") as f:
+        #     flat = attention_mask[0].tolist()
+        #     if isinstance(flat[0], list):
+        #         for row in flat:
+        #             f.write(" ".join(map(str, row)) + "\n")
+        #     else:
+        #         f.write(" ".join(map(str, flat)) + "\n")
+        # with open("response_mask_debug.txt", "w") as f:
+        #     flat = response_mask[0].tolist()
+        #     if isinstance(flat[0], list):
+        #         for row in flat:
+        #             f.write(" ".join(map(str, row)) + "\n")
+        #     else:
+        #         f.write(" ".join(map(str, flat)) + "\n")
         # breakpoint()
         multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)

@@ -23,6 +23,12 @@ defaults:
   # Shared rollout config for all extra rollouts (motion, critic). Replaces deprecated motion_rollout.
   - rollout@actor_rollout_ref.extra_rollout_rollout: rollout
 
+  # Base config for motion extra rollout; self overrides in actor_rollout_ref.motion_rollout_config.
+  - rollout@actor_rollout_ref.motion_rollout_config: rollout
+
+  # Base config for critic extra rollout; self overrides in actor_rollout_ref.critic_rollout_config.
+  - rollout@actor_rollout_ref.critic_rollout_config: rollout
+
   # Model config.
   - model@actor_rollout_ref.model: hf_model
 
@@ -184,7 +190,48 @@ actor_rollout_ref:
       vllm:
         max_model_len: 2048
         max_num_seqs: 64
-        gpu_memory_utilization: 0.9           
+        gpu_memory_utilization: 0.9
+        dtype: bfloat16
+        max_num_batched_tokens: 8192
+        swap_space: 0
+
+  # Per-rollout configs with distinct response_length budgets.
+  # motion: shorter budget for initial trajectory waypoints.
+  motion_rollout_config:
+    name: vllm
+    mode: async
+    temperature: 1.0
+    top_p: 0.95
+    prompt_length: 1680
+    response_length: 192
+    tensor_model_parallel_size: 2
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    engine_kwargs:
+      vllm:
+        max_model_len: 2048
+        max_num_seqs: 64
+        gpu_memory_utilization: 0.9
+        dtype: bfloat16
+        max_num_batched_tokens: 8192
+        swap_space: 0
+
+  # critic: longer budget for chain-of-thought critique output.
+  critic_rollout_config:
+    name: vllm
+    mode: async
+    temperature: 1.0
+    top_p: 0.95
+    prompt_length: 1680
+    response_length: 256
+    tensor_model_parallel_size: 2
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+    engine_kwargs:
+      vllm:
+        max_model_len: 2048
+        max_num_seqs: 64
+        gpu_memory_utilization: 0.9
         dtype: bfloat16
         max_num_batched_tokens: 8192
         swap_space: 0
@@ -197,7 +244,7 @@ actor_rollout_ref:
       model:
         path: ${actor_rollout_ref.model.path}
         trust_remote_code: true
-      rollout: ${actor_rollout_ref.extra_rollout_rollout}
+      rollout: ${actor_rollout_ref.motion_rollout_config}
       sync_with_actor: true
       prompt_paths:
         critic: ${critic_prompt_path}
@@ -206,7 +253,7 @@ actor_rollout_ref:
       model:
         path: Qwen/Qwen3-VL-8B-Instruct
         trust_remote_code: true
-      rollout: ${actor_rollout_ref.extra_rollout_rollout}
+      rollout: ${actor_rollout_ref.critic_rollout_config}
       sync_with_actor: false
       prompt_paths:
         critic: ${critic_prompt_path}
