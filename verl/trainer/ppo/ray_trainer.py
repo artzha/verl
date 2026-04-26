@@ -68,6 +68,7 @@ from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 from cotnav.core.format import text_to_llava
+from cotnav.verl_adapters.rewards.format_penalty import apply_cotrain_format_penalty
 
 
 def find_raw_prompt_3d(batch: DataProto) -> list[int]:
@@ -251,14 +252,25 @@ def compute_advantage(
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
+        use_process_level_grpo = bool(config.get("use_process_credit", False)) if config is not None else False
 
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        )
+        if use_process_level_grpo:
+            advantages, returns = core_algos.compute_grpo_process_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                index=data.non_tensor_batch["uid"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=config,
+            )
+        else:
+            # Call compute_grpo_outcome_advantage with parameters matching its definition
+            advantages, returns = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                index=data.non_tensor_batch["uid"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=config,
+            )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     else:
@@ -794,6 +806,32 @@ class RayPPOTrainer:
                     extra_info[i][key] = normalized
                     extra_info[i]["critic_output_format"] = critic_output_format
 
+    def _apply_cotrain_format_penalty(self, batch: DataProto) -> None:
+        """Apply per-segment format penalties on top of already-computed rm_scores.
+
+        Reads ``critic_format_penalty`` and ``motion_format_penalty`` from
+        ``config.reward_model.reward_kwargs`` (both default to 0.0, making this a
+        no-op unless explicitly configured). When non-zero, the RM scalar at
+        ``motion_end`` is duplicated to ``critique_end`` and each position receives
+        an additional format bonus (0.0 if valid, -penalty if invalid).
+
+        Must be called *after* ``batch.union(rm_tensor)`` so that
+        ``batch.batch["rm_scores"]`` is present, and *before*
+        ``_compute_or_extract_reward`` reads it.
+        """
+        reward_kwargs = dict(self.config.reward_model.get("format_penalty", {}))
+        critic_penalty = float(reward_kwargs.get("critic_format_penalty", 0.0))
+        motion_penalty = float(reward_kwargs.get("motion_format_penalty", 0.0))
+        if critic_penalty == 0.0 and motion_penalty == 0.0:
+            return
+        apply_cotrain_format_penalty(
+            batch=batch,
+            tokenizer=self.tokenizer,
+            critic_output_format=self.config.actor_rollout_ref["critic_output_format"],
+            critic_format_penalty=critic_penalty,
+            motion_format_penalty=motion_penalty,
+        )
+
     def _run_rollout_generations(
         self,
         batch: DataProto,
@@ -882,7 +920,7 @@ class RayPPOTrainer:
             return []
         return list(steps) if hasattr(steps, "__iter__") and not isinstance(steps, str) else []
 
-    def _validate(self, merged: bool = False):
+    def _validate(self, merged: bool = False, log_tables: bool = False, step_tag: str | None = None):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -892,6 +930,7 @@ class RayPPOTrainer:
         sample_gts = []
         sample_scores = []
         sample_turns = []
+        val_panel_items: list = []  # collected when log_tables=True
         sample_uids = []
 
         for test_data in self.val_dataloader:
@@ -1005,6 +1044,7 @@ class RayPPOTrainer:
                     assert self.reward_loop_manager is not None, "RewardLoopManager is None"
                     rm_tensor = self.reward_loop_manager.compute_rm_score(test_batch)
                 test_batch = test_batch.union(rm_tensor)
+            self._apply_cotrain_format_penalty(test_batch)
 
             # evaluate using reward_function
             result = self._compute_or_extract_reward(test_batch, reward_fn=self.val_reward_fn, return_dict=True)
@@ -1027,6 +1067,15 @@ class RayPPOTrainer:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+            # Collect visual panels when table logging is requested.
+            if log_tables:
+                from verl.trainer.ppo.metric_utils import compute_validation_rollout_panels
+                reward_arr = reward_tensor.sum(-1).detach().cpu().float().numpy()
+                batch_panels = compute_validation_rollout_panels(
+                    test_batch, reward_arr, max_groups=32, config=self.config
+                )
+                val_panel_items.extend(batch_panels)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -1054,7 +1103,17 @@ class RayPPOTrainer:
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+
+        if log_tables and val_panel_items:
+            from verl.trainer.ppo.metric_utils import _panel_table_key
+            import wandb
+            val_table = wandb.Table(columns=["ride_name", "semantic_goal", "mean_reward", "panel"])
+            for ride_name, semantic_goal, panel_img, mean_reward in val_panel_items:
+                val_table.add_data(ride_name, semantic_goal, mean_reward, wandb.Image(panel_img))
+            metric_dict[_panel_table_key("visual/validation_rollout_panels", step_tag)] = val_table
+
+        return metric_dict
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
@@ -2096,7 +2155,7 @@ class RayPPOTrainer:
         # perform validation before training
         # currently, we only support validation using the reward_function.                               
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
+            val_metrics = self._validate(log_tables=True, step_tag="step_0000000")
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
@@ -2267,7 +2326,50 @@ class RayPPOTrainer:
                                 assert self.reward_loop_manager is not None, "RewardLoopManager is None"
                                 reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
+                        self._apply_cotrain_format_penalty(batch)
 
+                        # # Debug dump: save first 2 rollouts from each reward-relevant field.
+                        # import pathlib, json as _json
+                        # _dbg = pathlib.Path("debug_reward_dump.txt")
+                        # with _dbg.open("w") as _f:
+                        #     for _i in range(min(2, len(batch))):
+                        #         _f.write(f"\n{'='*60}\n ROLLOUT {_i}\n{'='*60}\n")
+
+                        #         _mr = batch.non_tensor_batch.get("motion_response")
+                        #         _f.write(f"\n--- motion_response ---\n")
+                        #         _f.write(repr(_mr[_i] if _mr is not None else "N/A") + "\n")
+
+                        #         _cr = batch.non_tensor_batch.get("critic_response")
+                        #         _f.write(f"\n--- critic_response ---\n")
+                        #         _f.write(repr(_cr[_i] if _cr is not None else "N/A") + "\n")
+
+                        #         _rp = batch.non_tensor_batch.get("rm_raw_prompt")
+                        #         _f.write(f"\n--- rm_raw_prompt (text turns only) ---\n")
+                        #         if _rp is not None:
+                        #             for _t in _rp[_i]:
+                        #                 _role = _t.get("role", "?")
+                        #                 _content = _t.get("content", [])
+                        #                 _texts = [c.get("text", "<non-text>") for c in (_content if isinstance(_content, list) else [{"text": str(_content)}])]
+                        #                 _f.write(f"  [{_role}] " + " | ".join(_texts) + "\n")
+                        #         else:
+                        #             _f.write("N/A\n")
+
+                        #         _scores = batch.batch["rm_scores"][_i].sum().item()
+                        #         _f.write(f"\n--- rm_scores (sum) ---\n{_scores}\n")
+
+                        #         _cfv = batch.non_tensor_batch.get("critic_fmt_valid")
+                        #         _mfv = batch.non_tensor_batch.get("motion_fmt_valid")
+                        #         _f.write(f"\n--- format validity ---\n")
+                        #         _f.write(f"  critic_fmt_valid: {_cfv[_i] if _cfv is not None else 'N/A'}\n")
+                        #         _f.write(f"  motion_fmt_valid: {_mfv[_i] if _mfv is not None else 'N/A'}\n")
+
+                        #         _ei = batch.non_tensor_batch.get("extra_info")
+                        #         if _ei is not None:
+                        #             _f.write(f"\n--- extra_info keys ---\n{list(_ei[_i].keys())}\n")
+                        # print(f"[debug] reward dump written to {_dbg.resolve()}")
+
+                        # breakpoint()
+                        # import pdb; pdb.set_trace()
                         # Compute or extract reward for training
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(

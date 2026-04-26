@@ -123,8 +123,10 @@ actor_rollout_ref:
     # Per-turn response length caps for the two shared-actor generations.
     critique_response_length: 256
     motion_response_length: 192
-    # If set to "critic" or "motion", the actor's generated response is stored in that key and merged into extra_info for reward.
-    response_role: motion
+    # Must be null for cotrain_refine: the agent loop builds motion_response/critic_response
+    # in extra_fields directly. Setting "motion" here would append the full combined response
+    # (critique + refine_prompt + motion) to motion_response and corrupt RM scoring.
+    response_role: null
 
     engine_kwargs:
       vllm:
@@ -251,6 +253,14 @@ reward_model:
     }
   use_dynamic_bsz: true
 
+  # Per-segment format penalty weights applied on top of learned RM scores in
+  # _apply_cotrain_format_penalty (ray_trainer.py). Set to 0.0 to disable.
+  # Kept under a separate key so load_reward_manager does not forward these to
+  # the NaiveRewardManager constructor via **reward_kwargs.
+  format_penalty:
+    critic_format_penalty: 0.5
+    motion_format_penalty: 0.5
+
 reward_manager:
   name: naive
 
@@ -285,6 +295,9 @@ algorithm:
 
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
+
+  # Whether to use process-level GRPO (token-level credit assignment)
+  use_process_credit: False
 
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False

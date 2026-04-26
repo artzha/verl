@@ -330,6 +330,69 @@ def compute_grpo_outcome_advantage(
     return scores, scores
 
 
+def compute_grpo_process_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute process-level GRPO advantages from token-level rewards.
+
+    For each prompt group and token position, normalize rewards across responses
+    in the same group while ignoring masked (non-response) positions.
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length)
+        index: `(np.ndarray)`
+            index array for grouping
+        epsilon: `(float)`
+            small value to avoid division by zero
+        norm_adv_by_std_in_grpo: `(bool)`
+            whether to scale the GRPO advantage
+        config: `(Optional[AlgoConfig])`
+            algorithm configuration object
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape is (bs, response_length)
+    """
+    del config  # reserved for future behavior switches
+
+    with torch.no_grad():
+        valid_mask = response_mask > 0
+        advantages = torch.zeros_like(token_level_rewards)
+        if not torch.any(valid_mask):
+            return advantages, advantages
+
+        bsz, response_length = token_level_rewards.shape
+        group_index = as_torch_index(index, device=token_level_rewards.device)
+        token_pos = torch.arange(response_length, device=token_level_rewards.device, dtype=torch.long)
+        token_pos = token_pos.unsqueeze(0).expand(bsz, response_length)
+        group_pos_index = group_index.unsqueeze(1) * response_length + token_pos
+
+        flat_rewards = token_level_rewards[valid_mask]
+        flat_group_pos = group_pos_index[valid_mask]
+        mean_gp, std_gp, _ = group_mean_std(flat_rewards, flat_group_pos, eps=epsilon)
+
+        if norm_adv_by_std_in_grpo:
+            normalized_rewards = (flat_rewards - mean_gp[flat_group_pos]) / (std_gp[flat_group_pos] + epsilon)
+        else:
+            normalized_rewards = flat_rewards - mean_gp[flat_group_pos]
+
+        advantages[valid_mask] = normalized_rewards
+        advantages = advantages * response_mask
+
+    return advantages, advantages
+
+
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
 def compute_grpo_vectorized_outcome_advantage(
     token_level_rewards: torch.Tensor,
