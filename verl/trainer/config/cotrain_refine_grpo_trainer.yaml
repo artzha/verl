@@ -46,9 +46,9 @@ defaults:
   - _self_
 
 # prompts
-motion_prompt_path: 'cotnav/prompts/datagen/plan_v3/motion_prompt_startgoal.txt'
-motion_refine_prompt_path: 'cotnav/prompts/datagen/plan_v3/motion_refine_prompt.txt'
-critic_prompt_path: 'cotnav/prompts/datagen/plan_v3/critic_prompt.txt'
+motion_prompt_path: 'cotnav/prompts/datagen/plan_v4/motion_prompt.txt'
+motion_refine_prompt_path: 'cotnav/prompts/datagen/plan_v4/motion_refine_prompt.txt'
+critic_prompt_path: 'cotnav/prompts/datagen/plan_v4/critic_prompt.txt'
 
 actor_rollout_ref:
   hybrid_engine: true
@@ -261,6 +261,12 @@ reward_model:
     critic_format_penalty: 0.5
     motion_format_penalty: 0.5
 
+  # Reward type controlling how the RM scalar is computed from motion_response history.
+  #   absolute -> score only the final refined motion (motion_response[-1])
+  #   relative -> score refined minus initial: r_T - r_0 (motion_response[-1] - motion_response[0])
+  # Kept under reward_model (not reward_kwargs) so it is not forwarded to the reward manager constructor.
+  reward_type: relative
+
 reward_manager:
   name: naive
 
@@ -345,7 +351,7 @@ trainer:
   # Project name for experiment tracking (e.g., wandb)
   project_name: autorefine-critic
   # Experiment name for run identification in tracking tools
-  experiment_name: qwen3_vl_2b_fsdp
+  experiment_name: qwen3_vl_2b_fsdp_${reward_model.reward_type}
   # Logging backends to use: "console", "wandb", etc.
   logger: ["console", "wandb"]
   # Number of generations to log during validation

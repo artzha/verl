@@ -248,12 +248,13 @@ def update_prompt_after_response(
 def build_rm_raw_prompt(
     non_tensor_dict: dict,
     critic_prompt_msg: dict,
+    motion_index: int = -1,
 ) -> np.ndarray:
     """Construct the 4-turn RM scoring chat per sample.
 
     Walks ``raw_prompt[i]`` up to (but not including) the first assistant turn
     to capture the initial ``system + motion_prompt+video`` context, then
-    appends the latest motion response (as an assistant turn) and a user turn
+    appends the selected motion response (as an assistant turn) and a user turn
     with a freshly drawn annotated image plus the critic_prompt template. This
     mirrors the chat structure the Qwen3-VL RM was trained on
     (see ``motion_reward_trainer.yaml``).
@@ -261,8 +262,14 @@ def build_rm_raw_prompt(
     Expects:
         non_tensor_dict["raw_prompt"]: list of chats (list of dicts)
         non_tensor_dict["motion_response"]: list of motion response histories
-            (list of lists of str); the last entry is scored
+            (list of lists of str); ``motion_index`` selects which entry to score
+            (-1 for the latest/refined motion, 0 for the initial motion)
         non_tensor_dict["multi_modal_data"][i]["image"][0]: original view image
+
+    Args:
+        motion_index: Index into each sample's motion_response history to score.
+            Defaults to -1 (final refined motion). Use 0 for the initial motion
+            when computing a relative reward (r_T - r_0).
 
     Returns:
         Object-dtype numpy array of length B, each element a list of chat dicts.
@@ -281,7 +288,7 @@ def build_rm_raw_prompt(
 
         resp_list = motion_responses[i]
         response_text = (
-            resp_list[-1]
+            resp_list[motion_index]
             if isinstance(resp_list, (list, tuple, np.ndarray))
             else resp_list
         )
@@ -295,7 +302,8 @@ def build_rm_raw_prompt(
             if hasattr(payload, "unified")
             else None
         )
-
+        breakpoint()
+        import pdb; pdb.set_trace()
         if "video" in mm_data[i]:
             video_entry = mm_data[i]["video"][0]
             video_tensor = video_entry[0] if isinstance(video_entry, tuple) else video_entry

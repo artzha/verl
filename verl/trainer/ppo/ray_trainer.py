@@ -806,6 +806,41 @@ class RayPPOTrainer:
                     extra_info[i][key] = normalized
                     extra_info[i]["critic_output_format"] = critic_output_format
 
+    def _compute_motion_rm_score(self, batch: DataProto) -> DataProto:
+        """Run the RM worker and optionally return a relative reward (r_T - r_0).
+
+        When ``reward_model.reward_type == "relative"``, the RM is called twice:
+        once on the final refined motion (``motion_index=-1``) and once on the
+        initial motion (``motion_index=0``). The returned ``rm_scores`` tensor
+        contains the element-wise difference so downstream code (format penalty,
+        reward extraction, advantage estimation) sees a single scalar per sample
+        at ``motion_end``, just as in the absolute case.
+
+        Falls back to absolute scoring when ``reward_type`` is absent or "absolute".
+        """
+        reward_type = self.config.reward_model.get("reward_type", "absolute")
+        rm_dp_size = self._get_dp_size(self.rm_wg, "reward")
+
+        if self._rm_critic_prompt_msg is not None:
+            batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
+                batch.non_tensor_batch, self._rm_critic_prompt_msg, motion_index=-1,
+            )
+        padded, pad = pad_dataproto_to_divisor(batch, rm_dp_size)
+        rm_T = unpad_dataproto(self.rm_wg.compute_rm_score(padded), pad)
+
+        if reward_type != "relative":
+            return rm_T
+
+        if self._rm_critic_prompt_msg is not None:
+            batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
+                batch.non_tensor_batch, self._rm_critic_prompt_msg, motion_index=0,
+            )
+        padded, pad = pad_dataproto_to_divisor(batch, rm_dp_size)
+        rm_0 = unpad_dataproto(self.rm_wg.compute_rm_score(padded), pad)
+
+        rm_T.batch["rm_scores"] = rm_T.batch["rm_scores"] - rm_0.batch["rm_scores"]
+        return rm_T
+
     def _apply_cotrain_format_penalty(self, batch: DataProto) -> None:
         """Apply per-segment format penalties on top of already-computed rm_scores.
 
@@ -1032,14 +1067,7 @@ class RayPPOTrainer:
             # _compute_or_extract_reward finds rm_scores and returns them directly.
             if use_rm_for_validation and self.use_rm and "rm_scores" not in test_batch.batch.keys():
                 if not self.use_reward_loop:
-                    if self._rm_critic_prompt_msg is not None:
-                        test_batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
-                            test_batch.non_tensor_batch, self._rm_critic_prompt_msg
-                        )
-                    rm_dp_size = self._get_dp_size(self.rm_wg, "reward")
-                    test_batch_padded, rm_pad_size = pad_dataproto_to_divisor(test_batch, rm_dp_size)
-                    rm_tensor_padded = self.rm_wg.compute_rm_score(test_batch_padded)
-                    rm_tensor = unpad_dataproto(rm_tensor_padded, rm_pad_size)
+                    rm_tensor = self._compute_motion_rm_score(test_batch)
                 else:
                     assert self.reward_loop_manager is not None, "RewardLoopManager is None"
                     rm_tensor = self.reward_loop_manager.compute_rm_score(test_batch)
@@ -2316,12 +2344,7 @@ class RayPPOTrainer:
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             if not self.use_reward_loop:
-                                if self._rm_critic_prompt_msg is not None:
-                                    batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
-                                        batch.non_tensor_batch, self._rm_critic_prompt_msg
-                                    )
-                                # breakpoint()
-                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                reward_tensor = self._compute_motion_rm_score(batch)
                             else:
                                 assert self.reward_loop_manager is not None, "RewardLoopManager is None"
                                 reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
