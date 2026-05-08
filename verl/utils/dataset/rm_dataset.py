@@ -489,7 +489,7 @@ class RMDataset(Dataset):
                 elif c.get("type") == "image" and "image" in c:
                     images.append(c["image"])
         multi_modal_data = {"video": videos} if videos else {"image": images}
-        breakpoint()
+
         def _branch_text(branch_key: str) -> str:
             branch = convert_nested_value_to_list_recursive(row_dict[branch_key])
             for msg in branch:

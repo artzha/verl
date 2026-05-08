@@ -149,11 +149,16 @@ def format_prompt(
     vgoal = np.array(vgoal, dtype=np.float64).flatten()
     vgoal_str = f"[{vgoal[0]:.3f}, {vgoal[1]:.3f}]" if len(vgoal) > 0 else "[N/A, N/A]"
 
+    sgoal = extra.get("sgoal", [])
+    sgoal = np.array(sgoal, dtype=np.float64).flatten()
+    motion_start = f"[{sgoal[0]:.3f}, {sgoal[1]:.3f}]" if sgoal.size >= 2 else None
+
     prompt_template = prompt_msg["content"][0]["text"]
     prompt = format_prompt_cotnav(
         prompt_template,
         visual_goal=vgoal_str,
         language_goal=semantic_goal,
+        motion_start=motion_start,
     )
 
     if prev_message is not None:
@@ -302,8 +307,7 @@ def build_rm_raw_prompt(
             if hasattr(payload, "unified")
             else None
         )
-        breakpoint()
-        import pdb; pdb.set_trace()
+
         if "video" in mm_data[i]:
             video_entry = mm_data[i]["video"][0]
             video_tensor = video_entry[0] if isinstance(video_entry, tuple) else video_entry

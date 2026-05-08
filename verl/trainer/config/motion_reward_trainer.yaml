@@ -70,7 +70,6 @@ model:
   trust_remote_code: True
   lora_rank: 32
   lora_alpha: 32
-  lora_dropout: 0.05
   target_modules: 'all-linear'
     # - linear_fc1
     # - linear_fc2

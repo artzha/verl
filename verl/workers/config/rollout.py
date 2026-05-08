@@ -141,6 +141,16 @@ class RolloutConfig(BaseConfig):
     # Falls back to response_length if not set.
     critique_response_length: Optional[int] = None
     motion_response_length: Optional[int] = None
+    # cotrain_refine_agent flags. When ``generate_initial_motion`` is True the
+    # shared-actor agent loop samples the initial motion span itself (three-step
+    # pipeline used by ``cotrain_refine3_grpo_trainer.yaml``). When False the
+    # initial motion is staged in the prompt by ``rollout_generations.before_actor``
+    # (two-step pipeline used by ``cotrain_refine_grpo_trainer.yaml``).
+    # ``train_initial_motion`` toggles whether the initial-motion span receives
+    # ``response_mask=1`` (and therefore contributes to the GRPO actor loss); only
+    # consulted when ``generate_initial_motion`` is True.
+    generate_initial_motion: bool = False
+    train_initial_motion: bool = True
     # If "critic" or "motion", actor output is stored in that key and merged into extra_info for reward.
     response_role: Optional[str] = None
 

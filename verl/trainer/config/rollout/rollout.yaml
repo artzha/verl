@@ -202,6 +202,17 @@ multi_turn:
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False
 
+# When true, agent loops that support it (e.g. cotrain_refine_agent) generate the initial motion
+# as a trainable step inside the loop rather than relying on rollout_generations.before_actor to
+# stage it in the prompt. The loop then self-injects the critic prompt + annotated image before
+# the critique step, and the motion_refine_prompt before the refined-motion step.
+generate_initial_motion: false
+
+# When true (default), the initial-motion span (generated inside the agent loop when
+# generate_initial_motion=true) is marked response_mask=1 and contributes to the GRPO loss.
+# Set to false to mask it out (response_mask=0) while still sampling it for critic context.
+train_initial_motion: true
+
 # [Experimental] agent loop based rollout configs
 agent:
 

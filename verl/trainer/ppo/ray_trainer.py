@@ -807,16 +807,21 @@ class RayPPOTrainer:
                     extra_info[i]["critic_output_format"] = critic_output_format
 
     def _compute_motion_rm_score(self, batch: DataProto) -> DataProto:
-        """Run the RM worker and optionally return a relative reward (r_T - r_0).
+        """Run the RM worker and combine final/initial scores into ``rm_scores``.
 
-        When ``reward_model.reward_type == "relative"``, the RM is called twice:
-        once on the final refined motion (``motion_index=-1``) and once on the
-        initial motion (``motion_index=0``). The returned ``rm_scores`` tensor
-        contains the element-wise difference so downstream code (format penalty,
-        reward extraction, advantage estimation) sees a single scalar per sample
-        at ``motion_end``, just as in the absolute case.
+        Three modes selected by ``reward_model.reward_type``:
 
-        Falls back to absolute scoring when ``reward_type`` is absent or "absolute".
+        - ``absolute`` (default): score only the final refined motion (``motion_index=-1``).
+        - ``relative``: score refined and initial motions, return ``r_T - r_0``.
+        - ``delta_initial``: score both, then return a per-batch std-normalized blend
+          ``w_d * (r_T - r_0) / std(delta) + w_i * r_0 / std(r_0)``.
+          Weights ``delta_weight`` and ``initial_weight`` (default 0.5/0.5) are read
+          from ``reward_model``; per-sample raw scalars (``rm_initial_raw``,
+          ``rm_delta_raw``) are stashed for wandb logging via ``reward_extra_keys``.
+
+        Across all modes the returned ``rm_scores`` tensor is row-sparse (a single
+        scalar per sample at ``motion_end``) so downstream code — format penalty,
+        reward extraction, advantage estimation — is unchanged.
         """
         reward_type = self.config.reward_model.get("reward_type", "absolute")
         rm_dp_size = self._get_dp_size(self.rm_wg, "reward")
@@ -828,7 +833,7 @@ class RayPPOTrainer:
         padded, pad = pad_dataproto_to_divisor(batch, rm_dp_size)
         rm_T = unpad_dataproto(self.rm_wg.compute_rm_score(padded), pad)
 
-        if reward_type != "relative":
+        if reward_type not in ("relative", "delta_initial"):
             return rm_T
 
         if self._rm_critic_prompt_msg is not None:
@@ -838,7 +843,47 @@ class RayPPOTrainer:
         padded, pad = pad_dataproto_to_divisor(batch, rm_dp_size)
         rm_0 = unpad_dataproto(self.rm_wg.compute_rm_score(padded), pad)
 
-        rm_T.batch["rm_scores"] = rm_T.batch["rm_scores"] - rm_0.batch["rm_scores"]
+        if reward_type == "relative":
+            rm_T.batch["rm_scores"] = rm_T.batch["rm_scores"] - rm_0.batch["rm_scores"]
+            return rm_T
+
+        # ``delta_initial``: blend std-normalized delta and initial rewards so
+        # neither term dominates. The RM head is unbounded, and empirically
+        # ``r_0`` has a wider distribution than ``r_T - r_0`` (the difference of
+        # two correlated samples from the same RM), so equal weighting without
+        # rescaling would let ``r_0`` swamp the refinement signal.
+        eps = 1e-4
+        w_delta = float(self.config.reward_model.get("delta_weight", 0.5))
+        w_init = float(self.config.reward_model.get("initial_weight", 0.5))
+
+        # Each row of rm_scores is zero except at motion_end (set by
+        # ``_expand_to_token_level``), so summing along the response axis
+        # recovers the per-sample scalar for std estimation.
+        r_T_scalar = rm_T.batch["rm_scores"].sum(dim=-1)
+        r_0_scalar = rm_0.batch["rm_scores"].sum(dim=-1)
+        delta_scalar = r_T_scalar - r_0_scalar
+
+        delta_std = delta_scalar.std(unbiased=False).clamp(min=eps)
+        r_0_std = r_0_scalar.std(unbiased=False).clamp(min=eps)
+
+        # Linear combination preserves the row-sparse layout: at each row's
+        # motion_end column the cell holds the combined scalar; all other
+        # columns stay zero because both inputs are zero there.
+        rm_T.batch["rm_scores"] = (
+            w_delta * (rm_T.batch["rm_scores"] - rm_0.batch["rm_scores"]) / delta_std
+            + w_init * rm_0.batch["rm_scores"] / r_0_std
+        )
+
+        # Surface raw component scalars to the trainer for monitoring.
+        # Cast to float32 first because bfloat16 has no direct numpy dtype.
+        rm_T.non_tensor_batch["rm_initial_raw"] = r_0_scalar.detach().float().cpu().numpy()
+        rm_T.non_tensor_batch["rm_delta_raw"] = delta_scalar.detach().float().cpu().numpy()
+        extra_keys = list(batch.meta_info.get("reward_extra_keys", []))
+        for key in ("rm_initial_raw", "rm_delta_raw"):
+            if key not in extra_keys:
+                extra_keys.append(key)
+        batch.meta_info["reward_extra_keys"] = extra_keys
+
         return rm_T
 
     def _apply_cotrain_format_penalty(self, batch: DataProto) -> None:
@@ -1136,9 +1181,23 @@ class RayPPOTrainer:
         if log_tables and val_panel_items:
             from verl.trainer.ppo.metric_utils import _panel_table_key
             import wandb
-            val_table = wandb.Table(columns=["ride_name", "semantic_goal", "mean_reward", "panel"])
-            for ride_name, semantic_goal, panel_img, mean_reward in val_panel_items:
-                val_table.add_data(ride_name, semantic_goal, mean_reward, wandb.Image(panel_img))
+            # When the ``delta_initial`` reward path is active, panels surface
+            # per-group means of the raw rm_initial / rm_delta components; add
+            # dedicated columns when at least one panel reports them.
+            has_rm_components = any(
+                item[4] is not None or item[5] is not None for item in val_panel_items
+            )
+            columns = ["ride_name", "semantic_goal", "mean_reward", "panel"]
+            if has_rm_components:
+                columns += ["rm_initial_mean", "rm_delta_mean"]
+            val_table = wandb.Table(columns=columns)
+            for (
+                ride_name, semantic_goal, panel_img, mean_reward, rm_initial_mean, rm_delta_mean,
+            ) in val_panel_items:
+                row = [ride_name, semantic_goal, mean_reward, wandb.Image(panel_img)]
+                if has_rm_components:
+                    row += [rm_initial_mean, rm_delta_mean]
+                val_table.add_data(*row)
             metric_dict[_panel_table_key("visual/validation_rollout_panels", step_tag)] = val_table
 
         return metric_dict
@@ -1991,7 +2050,6 @@ class RayPPOTrainer:
                         prompts_registry={},  # raw_prompt already formatted by dataset
                     )
                     gen_batch.meta_info["global_steps"] = self.global_steps
-                    breakpoint()
                     before_steps = self._get_rollout_generation_steps("before_actor")
                     assert before_steps, (
                         "DPO requires actor_rollout_ref.rollout_generations.before_actor "
@@ -2012,7 +2070,6 @@ class RayPPOTrainer:
                     critic_rows = critic_rows.tolist() if hasattr(critic_rows, "tolist") else critic_rows
                     motion_responses = [row[-1] if isinstance(row, list) and row else row for row in motion_rows]
                     critique_responses = [row[-1] if isinstance(row, list) and row else row for row in critic_rows]
-                breakpoint()
                 # ---- Splice: tokenize full DPO sequences ----
                 with marked_timer("dpo/splice", timing_raw, color="cyan"):
                     extra_infos = None

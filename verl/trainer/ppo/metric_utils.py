@@ -116,6 +116,22 @@ def _panel_score_keys(non_tensor_batch: dict[str, Any]) -> list[str]:
     return keys
 
 
+def score_value_at(non_tensor_batch: dict[str, Any], key: str, row_idx: int) -> float | None:
+    """Pull a scalar float from a non_tensor_batch field at row ``row_idx``.
+
+    Handles values stored as 0-d / 1-d arrays or python sequences by flattening
+    and taking the first element. Returns ``None`` when the key is missing so
+    callers can branch without separate ``in`` checks.
+    """
+    if key not in non_tensor_batch:
+        return None
+    row = non_tensor_batch[key][row_idx]
+    if isinstance(row, (list, tuple, np.ndarray)):
+        arr = np.asarray(row)
+        row = arr.reshape(-1)[0]
+    return float(row)
+
+
 def _compute_rollout_panels(batch: DataProto, max_images=32, config: Any = None) -> None:
     """
     Draw annotated images for motion paths in the batch.
@@ -153,15 +169,6 @@ def _compute_rollout_panels(batch: DataProto, max_images=32, config: Any = None)
     extra = batch.non_tensor_batch["extra_info"]
 
     score_keys = _panel_score_keys(batch.non_tensor_batch)
-
-    def score_value_at(key: str, row_idx: int) -> float | None:
-        if key not in batch.non_tensor_batch:
-            return None
-        row = batch.non_tensor_batch[key][row_idx]
-        if isinstance(row, (list, tuple, np.ndarray)):
-            arr = np.asarray(row)
-            row = arr.reshape(-1)[0]
-        return float(row)
 
     panel_row_list = []
     for idx in unique_indices:
@@ -229,7 +236,7 @@ def _compute_rollout_panels(batch: DataProto, max_images=32, config: Any = None)
                 "reason": q_reasons[i],
                 "hausdorff": q_hds[i],
                 "scores": {
-                    **{k: [score_value_at(k, idx)] for k in score_keys},
+                    **{k: [score_value_at(batch.non_tensor_batch, k, idx)] for k in score_keys},
                     "hd": [q_hds[i]],
                 },
             }
@@ -244,15 +251,16 @@ def _compute_rollout_panels(batch: DataProto, max_images=32, config: Any = None)
             }
         )
         panel_row_list.append((ride_name, semantic_goal, panel_img))
-        
-    return panel_row_list    
+
+    return panel_row_list
+
 
 
 def compute_motion_rollout_panels(
     batch: DataProto,
     max_groups: int = 32,
     config: Any = None,
-) -> list[tuple[str, str, np.ndarray]]:
+) -> list[tuple[str, str, np.ndarray, float | None, float | None]]:
     """
     Compute rollout panels that visualize variability within each uid group.
 
@@ -265,7 +273,10 @@ def compute_motion_rollout_panels(
     Only the first image (best) carries a critique; subsequent images have blank critiques.
 
     We sample up to `max_groups` random uid groups and return
-    (ride_name, semantic_goal, panel_image) triplets for logging.
+    (ride_name, semantic_goal, panel_image, rm_initial_mean, rm_delta_mean)
+    quintuples for logging. The last two fields are per-group means of the
+    ``rm_initial_raw`` / ``rm_delta_raw`` reward components published by the
+    ``delta_initial`` reward path; they are ``None`` for other reward types.
     """
     from cotnav.utils.draw import draw_polyline, make_query_panel
     from cotnav.prompts.interface import parse_and_unify, OutputFormat
@@ -290,15 +301,8 @@ def compute_motion_rollout_panels(
     raw_prompt = batch.non_tensor_batch["raw_prompt"]
     extra = batch.non_tensor_batch["extra_info"]
     score_keys = _panel_score_keys(batch.non_tensor_batch)
-
-    def score_value_at(key: str, row_idx: int) -> float | None:
-        if key not in batch.non_tensor_batch:
-            return None
-        row = batch.non_tensor_batch[key][row_idx]
-        if isinstance(row, (tuple, list, np.ndarray)):
-            arr = np.asarray(row)
-            row = arr.reshape(-1)[0]
-        return float(row)
+    has_rm_initial = "rm_initial_raw" in batch.non_tensor_batch
+    has_rm_delta = "rm_delta_raw" in batch.non_tensor_batch
 
     # Randomly select up to max_groups uid groups
     all_group_ids = np.unique(uids)
@@ -308,7 +312,7 @@ def compute_motion_rollout_panels(
     rng.shuffle(all_group_ids)
     selected_group_ids = all_group_ids[:max_groups]
 
-    panel_row_list: list[tuple[str, str, np.ndarray]] = []
+    panel_row_list: list[tuple[str, str, np.ndarray, float | None, float | None]] = []
 
     for gid in selected_group_ids:
         group_idx = np.where(uids == gid)[0]
@@ -405,7 +409,7 @@ def compute_motion_rollout_panels(
             q_reasons.append(reason)
 
             # Hausdorff distance per rollout (if available)
-            hd_val = score_value_at("score", idx)
+            hd_val = score_value_at(batch.non_tensor_batch, "score", idx)
             if hd_val is None:
                 hd_val = 0.0
             q_hds.append(hd_val)
@@ -421,7 +425,7 @@ def compute_motion_rollout_panels(
                 "reason": q_reasons[i],
                 "hausdorff": q_hds[i],
                 "scores": {
-                    **{k: [score_value_at(k, panel_indices[i])] for k in score_keys},
+                    **{k: [score_value_at(batch.non_tensor_batch, k, panel_indices[i])] for k in score_keys},
                     "vd": [q_hds[i]],
                 },
             }
@@ -435,10 +439,34 @@ def compute_motion_rollout_panels(
                 "samples": q_samples,
             }
         )
-        panel_row_list.append((ride_name, semantic_goal, panel_img))
-        # Image.fromarray(panel_row_list[0][2]).save("test.png")
-        # breakpoint()
-        # import pdb; pdb.set_trace()
+
+        # Per-group means of the delta_initial reward components, computed
+        # across every rollout in the uid group (not just best/worst/median)
+        # so the table value is a representative summary.
+        rm_initial_mean: float | None = None
+        rm_delta_mean: float | None = None
+        if has_rm_initial:
+            init_vals = [
+                v
+                for v in (
+                    score_value_at(batch.non_tensor_batch, "rm_initial_raw", int(i)) for i in group_idx
+                )
+                if v is not None
+            ]
+            if init_vals:
+                rm_initial_mean = float(np.mean(init_vals))
+        if has_rm_delta:
+            delta_vals = [
+                v
+                for v in (
+                    score_value_at(batch.non_tensor_batch, "rm_delta_raw", int(i)) for i in group_idx
+                )
+                if v is not None
+            ]
+            if delta_vals:
+                rm_delta_mean = float(np.mean(delta_vals))
+
+        panel_row_list.append((ride_name, semantic_goal, panel_img, rm_initial_mean, rm_delta_mean))
 
     return panel_row_list
 
@@ -447,7 +475,7 @@ def compute_validation_rollout_panels(
     reward_scores,
     max_groups: int = 32,
     config: Any = None,
-) -> list[tuple[str, str, np.ndarray]]:
+) -> list[tuple[str, str, np.ndarray, float, float | None, float | None]]:
     """
     Compute rollout panels for validation, showing every rollout in each uid group.
 
@@ -459,6 +487,11 @@ def compute_validation_rollout_panels(
           cyan  = ground-truth trace
       - Below each image (stacked vertically, left-to-right order):
           critique text + computed motion reward for that rollout
+
+    Returns six-tuples (ride_name, semantic_goal, panel_image, mean_reward,
+    rm_initial_mean, rm_delta_mean). The last two are per-group means of the
+    ``rm_initial_raw`` / ``rm_delta_raw`` components published by the
+    ``delta_initial`` reward path; they are ``None`` for other reward types.
     """
     from cotnav.utils.draw import draw_polyline, make_query_panel
     from cotnav.prompts.interface import parse_and_unify, OutputFormat
@@ -479,6 +512,8 @@ def compute_validation_rollout_panels(
 
     raw_prompt = batch.non_tensor_batch["raw_prompt"]
     extra = batch.non_tensor_batch["extra_info"]
+    has_rm_initial = "rm_initial_raw" in batch.non_tensor_batch
+    has_rm_delta = "rm_delta_raw" in batch.non_tensor_batch
 
     all_group_ids = np.unique(uids)
     if all_group_ids.size == 0:
@@ -487,7 +522,7 @@ def compute_validation_rollout_panels(
     rng.shuffle(all_group_ids)
     selected_group_ids = all_group_ids[:max_groups]
 
-    panel_row_list: list[tuple[str, str, np.ndarray]] = []
+    panel_row_list: list[tuple[str, str, np.ndarray, float, float | None, float | None]] = []
 
     for gid in selected_group_ids:
         group_idx = np.where(uids == gid)[0]
@@ -575,7 +610,33 @@ def compute_validation_rollout_panels(
             }
         )
         mean_reward = float(np.mean(q_rewards)) if q_rewards else 0.0
-        panel_row_list.append((ride_name, semantic_goal, panel_img, mean_reward))
+
+        # Per-group means of the delta_initial reward components, computed
+        # across every rollout in the uid group.
+        rm_initial_mean: float | None = None
+        rm_delta_mean: float | None = None
+        if has_rm_initial:
+            init_vals = [
+                v
+                for v in (
+                    score_value_at(batch.non_tensor_batch, "rm_initial_raw", int(i)) for i in group_idx
+                )
+                if v is not None
+            ]
+            if init_vals:
+                rm_initial_mean = float(np.mean(init_vals))
+        if has_rm_delta:
+            delta_vals = [
+                v
+                for v in (
+                    score_value_at(batch.non_tensor_batch, "rm_delta_raw", int(i)) for i in group_idx
+                )
+                if v is not None
+            ]
+            if delta_vals:
+                rm_delta_mean = float(np.mean(delta_vals))
+
+        panel_row_list.append((ride_name, semantic_goal, panel_img, mean_reward, rm_initial_mean, rm_delta_mean))
 
     return panel_row_list
 
@@ -764,13 +825,28 @@ def compute_data_metrics(
         metrics['critic/vdist_score/min'] = float(np.min(vdist_scores))
         metrics['critic/vdist_score/std'] = float(np.std(vdist_scores))
 
+    # When the ``delta_initial`` reward path is active, the panel functions
+    # surface per-group means of the raw ``rm_initial`` / ``rm_delta`` reward
+    # components alongside the panel image. Add dedicated table columns for
+    # them so the breakdown is auditable per uid group without overlaying it
+    # on the panel image itself.
+    has_rm_components = (
+        "rm_initial_raw" in batch.non_tensor_batch or "rm_delta_raw" in batch.non_tensor_batch
+    )
+
     score_keys = _panel_score_keys(batch.non_tensor_batch)
     if log_tables and len(score_keys) > 0:
         panel_items = compute_motion_rollout_panels(batch, max_groups=64, config=config)
         import wandb
-        table = wandb.Table(columns=["ride_name", "semantic_goal", "panel"])
-        for (ride_name, semantic_goal, panel_img) in panel_items:  # you can return tuples instead
-            table.add_data(ride_name, semantic_goal, wandb.Image(panel_img))
+        columns = ["ride_name", "semantic_goal", "panel"]
+        if has_rm_components:
+            columns += ["rm_initial_mean", "rm_delta_mean"]
+        table = wandb.Table(columns=columns)
+        for (ride_name, semantic_goal, panel_img, rm_initial_mean, rm_delta_mean) in panel_items:
+            row = [ride_name, semantic_goal, wandb.Image(panel_img)]
+            if has_rm_components:
+                row += [rm_initial_mean, rm_delta_mean]
+            table.add_data(*row)
         metrics[_panel_table_key("visual/rollout_panels", step_tag)] = table
 
     if log_tables and "uid" in batch.non_tensor_batch:
@@ -778,12 +854,31 @@ def compute_data_metrics(
         val_panel_items = compute_validation_rollout_panels(batch, reward_scores, max_groups=32, config=config)
         if val_panel_items:
             import wandb
-            val_table = wandb.Table(columns=["ride_name", "semantic_goal", "mean_reward", "panel"])
-            for (ride_name, semantic_goal, panel_img, mean_reward) in val_panel_items:
-                val_table.add_data(ride_name, semantic_goal, mean_reward, wandb.Image(panel_img))
+            val_columns = ["ride_name", "semantic_goal", "mean_reward", "panel"]
+            if has_rm_components:
+                val_columns += ["rm_initial_mean", "rm_delta_mean"]
+            val_table = wandb.Table(columns=val_columns)
+            for (
+                ride_name, semantic_goal, panel_img, mean_reward, rm_initial_mean, rm_delta_mean,
+            ) in val_panel_items:
+                row = [ride_name, semantic_goal, mean_reward, wandb.Image(panel_img)]
+                if has_rm_components:
+                    row += [rm_initial_mean, rm_delta_mean]
+                val_table.add_data(*row)
             metrics[_panel_table_key("visual/validation_rollout_panels", step_tag)] = val_table
 
-    for score_key in ['goal_align_score', 'start_align_score', 'improvement_score', 'smoothness_score']:
+    for score_key in [
+        'goal_align_score',
+        'start_align_score',
+        'improvement_score',
+        'smoothness_score',
+        # Components published by the ``delta_initial`` reward path. These let us
+        # inspect the raw magnitudes (mean / std / min / max) of the initial RM
+        # score and the refined-vs-initial delta independently of the blended
+        # reward that drives advantages.
+        'rm_initial_raw',
+        'rm_delta_raw',
+    ]:
         if score_key in batch.non_tensor_batch:
             scores = batch.non_tensor_batch[score_key]
             metrics[f'critic/{score_key}/mean'] = float(np.mean(scores))
