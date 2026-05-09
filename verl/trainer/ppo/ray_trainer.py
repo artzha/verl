@@ -819,17 +819,23 @@ class RayPPOTrainer:
 
         Both blocks share the same ``reward_type`` enum and 2-element weight vector:
 
-        - ``absolute``:      ``w[0] * absolute_scalar``
-        - ``relative``:      ``w[0] * relative_scalar``
-        - ``delta_initial``: ``w[0] * relative_scalar + w[1] * initial_scalar``
+        - ``absolute``:       ``w[0] * absolute_scalar``
+        - ``relative``:       ``w[0] * relative_scalar``
+        - ``delta_initial``:  ``w[0] * relative_scalar + w[1] * initial_scalar``
+        - ``delta_absolute``: ``w[0] * relative_scalar + w[1] * absolute_scalar``
 
         The per-block component mapping (see ``_select_blend_components``):
 
-        =================  =============================  ===============
-        block / kind       absolute                       relative                     initial
-        rm                 r_T                            r_T - r_0                    r_0
-        mdist              abs_final_score                rel_score                    abs_initial_score
-        =================  =============================  ===============
+        =================  =============================  =============================  ===============
+        block / kind       absolute                       relative                       initial
+        rm                 r_T                            r_T - r_0                      r_0
+        mdist              abs_final_score                rel_score                      abs_initial_score
+        =================  =============================  =============================  ===============
+
+        ``delta_absolute`` reuses the ``relative`` and ``absolute`` columns,
+        i.e. it weights the per-step improvement signal together with the
+        final (post-refinement) reward instead of the initial (pre-refinement)
+        reward used by ``delta_initial``.
 
         When 2+ weighted terms across both blocks survive (i.e., have non-zero
         weight), each is std-normalized per-batch (eps=1e-4 clamp) so the
@@ -873,7 +879,10 @@ class RayPPOTrainer:
         r_T_scalar = rm_scores_tensor.sum(dim=-1)
 
         rm_scalars: dict[str, torch.Tensor] = {"absolute": r_T_scalar}
-        if rm_reward_type in ("relative", "delta_initial"):
+        # ``delta_absolute`` also needs r_0 because its primary scalar is the
+        # relative (r_T - r_0) improvement; only ``absolute`` (r_T alone) can
+        # skip the second RM pass.
+        if rm_reward_type in ("relative", "delta_initial", "delta_absolute"):
             if self._rm_critic_prompt_msg is not None:
                 batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
                     batch.non_tensor_batch, self._rm_critic_prompt_msg, motion_index=0,
@@ -935,11 +944,16 @@ class RayPPOTrainer:
         """Pick (scalar, weight) pairs from ``scalars`` based on ``reward_type``.
 
         ``weights[0]`` always weights the primary scalar (``absolute`` for
-        ``reward_type=absolute``, ``relative`` for ``relative`` and
-        ``delta_initial``). ``weights[1]`` is only consulted for
-        ``delta_initial`` and weights the ``initial`` scalar; the ``rm_weight``
-        / ``mdist_weight`` config field is therefore a 2-element list whose
-        second slot is ignored outside ``delta_initial``.
+        ``reward_type=absolute``, ``relative`` for ``relative``, ``delta_initial``
+        and ``delta_absolute``). ``weights[1]`` is only consulted for the two
+        delta_* variants and weights the secondary scalar:
+
+        - ``delta_initial``  -> secondary = ``initial``  (r_0 / abs_initial_score)
+        - ``delta_absolute`` -> secondary = ``absolute`` (r_T / abs_final_score)
+
+        The ``rm_weight`` / ``mdist_weight`` config field is therefore a
+        2-element list whose second slot is ignored outside the delta_*
+        variants.
         """
         w = [float(x) for x in weights]
         if reward_type == "absolute":
@@ -948,6 +962,8 @@ class RayPPOTrainer:
             return [(scalars["relative"], w[0])]
         if reward_type == "delta_initial":
             return [(scalars["relative"], w[0]), (scalars["initial"], w[1])]
+        if reward_type == "delta_absolute":
+            return [(scalars["relative"], w[0]), (scalars["absolute"], w[1])]
         raise ValueError(f"Unknown reward_type: {reward_type!r}")
 
     @staticmethod

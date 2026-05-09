@@ -878,7 +878,8 @@ def compute_data_metrics(
         'smoothness_score',
         # Raw RM-branch scalars published by _compute_motion_rm_score.
         # rm_absolute_raw is always present; rm_relative_raw and rm_initial_raw
-        # are only present for reward_type in {relative, delta_initial}.
+        # are present for reward_type in {relative, delta_initial, delta_absolute}
+        # (the delta_absolute path still computes r_0 to derive the relative term).
         'rm_absolute_raw',
         'rm_relative_raw',
         'rm_initial_raw',

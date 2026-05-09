@@ -267,15 +267,19 @@ reward_model:
   # vs ground-truth trajectory) share the same reward_type / weight schema.
   #
   # reward_type values, with their per-block component mapping:
-  #   absolute      -> w[0] * absolute_scalar
+  #   absolute       -> w[0] * absolute_scalar
   #     rm.absolute    = r_T  (RM score on the final refined motion)
   #     mdist.absolute = abs_final_score  (final pred vs GT, in [0.5, 1.0])
-  #   relative      -> w[0] * relative_scalar
+  #   relative       -> w[0] * relative_scalar
   #     rm.relative    = r_T - r_0  (improvement)
   #     mdist.relative = rel_score  ((d_prev - d_curr)/sqrt(2) in [-1, 1])
-  #   delta_initial -> w[0] * relative_scalar + w[1] * initial_scalar
+  #   delta_initial  -> w[0] * relative_scalar + w[1] * initial_scalar
   #     rm.initial    = r_0
   #     mdist.initial = abs_initial_score  (initial pred vs GT, in [0.5, 1.0])
+  #   delta_absolute -> w[0] * relative_scalar + w[1] * absolute_scalar
+  #     same scalars as `relative` + `absolute` above; this variant rewards
+  #     the per-step improvement together with the final (post-refinement)
+  #     reward, instead of the initial reward used by delta_initial.
   #
   # When 2+ weighted components survive across both blocks, every term is
   # std-normalized per-batch (eps=1e-4 clamp) so the configured weights act
@@ -287,13 +291,15 @@ reward_model:
   # Learned reward-model branch.
   rm:
 
-    # absolute | relative | delta_initial.
+    # absolute | relative | delta_initial | delta_absolute.
     reward_type: relative
 
-    # 2-element weight vector. [0] applies to the absolute or relative scalar
-    # (depending on reward_type); [1] only kicks in for delta_initial and
-    # weights the initial scalar (r_0). Set the unused slot to anything; it
-    # is filtered out when its value is 0.0.
+    # 2-element weight vector. [0] applies to the primary scalar (absolute
+    # for reward_type=absolute, relative otherwise). [1] only kicks in for
+    # the delta_* variants and weights the secondary scalar:
+    #   delta_initial  -> [1] weights initial  (r_0)
+    #   delta_absolute -> [1] weights absolute (r_T)
+    # Set the unused slot to anything; it is filtered out when its value is 0.0.
     rm_weight: [1.0, 0.0]
 
   # Auxiliary ground-truth-conditioned motion-distance branch. Disabled by
@@ -301,7 +307,7 @@ reward_model:
   # happens and rm_scores reproduce the RM-only path bit-identically.
   mdist:
 
-    # absolute | relative | delta_initial.
+    # absolute | relative | delta_initial | delta_absolute.
     reward_type: absolute
 
     # Distance metric used to compute abs_final / rel / abs_initial against
