@@ -807,25 +807,56 @@ class RayPPOTrainer:
                     extra_info[i]["critic_output_format"] = critic_output_format
 
     def _compute_motion_rm_score(self, batch: DataProto) -> DataProto:
-        """Run the RM worker and combine final/initial scores into ``rm_scores``.
+        """Run the RM worker(s), gather all reward components, and blend them.
 
-        Three modes selected by ``reward_model.reward_type``:
+        Two parallel reward sources are wired through the same shape of config:
 
-        - ``absolute`` (default): score only the final refined motion (``motion_index=-1``).
-        - ``relative``: score refined and initial motions, return ``r_T - r_0``.
-        - ``delta_initial``: score both, then return a per-batch std-normalized blend
-          ``w_d * (r_T - r_0) / std(delta) + w_i * r_0 / std(r_0)``.
-          Weights ``delta_weight`` and ``initial_weight`` (default 0.5/0.5) are read
-          from ``reward_model``; per-sample raw scalars (``rm_initial_raw``,
-          ``rm_delta_raw``) are stashed for wandb logging via ``reward_extra_keys``.
+        - ``reward_model.rm.{reward_type, rm_weight}``: learned reward-model
+          scoring of the motion rollouts.
+        - ``reward_model.mdist.{reward_type, metric, mdist_weight}``: auxiliary
+          ground-truth-conditioned motion-distance reward computed in
+          ``cotnav/verl_adapters/rewards/motion_trace.py``.
 
-        Across all modes the returned ``rm_scores`` tensor is row-sparse (a single
-        scalar per sample at ``motion_end``) so downstream code — format penalty,
-        reward extraction, advantage estimation — is unchanged.
+        Both blocks share the same ``reward_type`` enum and 2-element weight vector:
+
+        - ``absolute``:      ``w[0] * absolute_scalar``
+        - ``relative``:      ``w[0] * relative_scalar``
+        - ``delta_initial``: ``w[0] * relative_scalar + w[1] * initial_scalar``
+
+        The per-block component mapping (see ``_select_blend_components``):
+
+        =================  =============================  ===============
+        block / kind       absolute                       relative                     initial
+        rm                 r_T                            r_T - r_0                    r_0
+        mdist              abs_final_score                rel_score                    abs_initial_score
+        =================  =============================  ===============
+
+        When 2+ weighted terms across both blocks survive (i.e., have non-zero
+        weight), each is std-normalized per-batch (eps=1e-4 clamp) so the
+        configured weights act on a comparable scale. A single-term blend
+        (e.g., ``rm.reward_type=absolute`` with mdist disabled) passes through
+        unscaled by std and is bit-identical to the previous behavior.
+
+        The blended scalar is written back to the row-sparse motion_end cell
+        produced by ``_expand_to_token_level`` so downstream code (format
+        penalty, reward extraction, advantage estimation) is unchanged. All raw
+        component scalars are surfaced via ``reward_extra_keys`` for wandb
+        logging when the corresponding components are computed:
+        ``rm_{absolute,relative,initial}_raw`` and
+        ``mdist_{absolute,relative,initial}_raw``.
         """
-        reward_type = self.config.reward_model.get("reward_type", "absolute")
-        rm_dp_size = self._get_dp_size(self.rm_wg, "reward")
+        eps = 1e-4
+        rm_cfg = self.config.reward_model.get("rm", None) or {}
+        rm_reward_type = str(rm_cfg.get("reward_type", "absolute"))
+        rm_weight = list(rm_cfg.get("rm_weight", [1.0, 0.0]))
 
+        mdist_cfg = self.config.reward_model.get("mdist", None) or {}
+        mdist_reward_type = str(mdist_cfg.get("reward_type", "absolute"))
+        mdist_weight = list(mdist_cfg.get("mdist_weight", [0.0, 0.0]))
+        mdist_enabled = any(float(w) != 0.0 for w in mdist_weight)
+
+        # ===== Compute RM scalars =====
+        rm_dp_size = self._get_dp_size(self.rm_wg, "reward")
         if self._rm_critic_prompt_msg is not None:
             batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
                 batch.non_tensor_batch, self._rm_critic_prompt_msg, motion_index=-1,
@@ -833,58 +864,165 @@ class RayPPOTrainer:
         padded, pad = pad_dataproto_to_divisor(batch, rm_dp_size)
         rm_T = unpad_dataproto(self.rm_wg.compute_rm_score(padded), pad)
 
-        if reward_type not in ("relative", "delta_initial"):
-            return rm_T
+        # rm_T.batch["rm_scores"] is a [B, response_len] tensor that is zero
+        # everywhere except at the motion_end column (one non-zero cell per row,
+        # written by ``_expand_to_token_level``). Capture that column index now
+        # so the final blended scalar lands at the same cell.
+        rm_scores_tensor = rm_T.batch["rm_scores"]
+        eos_idx = rm_scores_tensor.abs().argmax(dim=-1)
+        r_T_scalar = rm_scores_tensor.sum(dim=-1)
 
-        if self._rm_critic_prompt_msg is not None:
-            batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
-                batch.non_tensor_batch, self._rm_critic_prompt_msg, motion_index=0,
-            )
-        padded, pad = pad_dataproto_to_divisor(batch, rm_dp_size)
-        rm_0 = unpad_dataproto(self.rm_wg.compute_rm_score(padded), pad)
+        rm_scalars: dict[str, torch.Tensor] = {"absolute": r_T_scalar}
+        if rm_reward_type in ("relative", "delta_initial"):
+            if self._rm_critic_prompt_msg is not None:
+                batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
+                    batch.non_tensor_batch, self._rm_critic_prompt_msg, motion_index=0,
+                )
+            padded, pad = pad_dataproto_to_divisor(batch, rm_dp_size)
+            rm_0 = unpad_dataproto(self.rm_wg.compute_rm_score(padded), pad)
+            r_0_scalar = rm_0.batch["rm_scores"].sum(dim=-1)
+            rm_scalars["relative"] = r_T_scalar - r_0_scalar
+            rm_scalars["initial"] = r_0_scalar
 
-        if reward_type == "relative":
-            rm_T.batch["rm_scores"] = rm_T.batch["rm_scores"] - rm_0.batch["rm_scores"]
-            return rm_T
+        # ===== Compute mdist scalars (only when needed) =====
+        mdist_scalars: dict[str, torch.Tensor] | None = None
+        if mdist_enabled:
+            metric = str(mdist_cfg.get("metric", "directed_hdist"))
+            d = self._compute_motion_distance_scalars(batch, metric=metric)
+            mdist_scalars = {
+                "absolute": d["abs_final"].to(r_T_scalar),
+                "relative": d["rel"].to(r_T_scalar),
+                "initial": d["abs_initial"].to(r_T_scalar),
+            }
 
-        # ``delta_initial``: blend std-normalized delta and initial rewards so
-        # neither term dominates. The RM head is unbounded, and empirically
-        # ``r_0`` has a wider distribution than ``r_T - r_0`` (the difference of
-        # two correlated samples from the same RM), so equal weighting without
-        # rescaling would let ``r_0`` swamp the refinement signal.
-        eps = 1e-4
-        w_delta = float(self.config.reward_model.get("delta_weight", 0.5))
-        w_init = float(self.config.reward_model.get("initial_weight", 0.5))
+        # ===== Build component list and blend =====
+        pairs = self._select_blend_components(rm_scalars, rm_reward_type, rm_weight)
+        if mdist_scalars is not None:
+            pairs.extend(self._select_blend_components(mdist_scalars, mdist_reward_type, mdist_weight))
+        blended = self._blend_with_std_norm(pairs, eps=eps, like=r_T_scalar)
 
-        # Each row of rm_scores is zero except at motion_end (set by
-        # ``_expand_to_token_level``), so summing along the response axis
-        # recovers the per-sample scalar for std estimation.
-        r_T_scalar = rm_T.batch["rm_scores"].sum(dim=-1)
-        r_0_scalar = rm_0.batch["rm_scores"].sum(dim=-1)
-        delta_scalar = r_T_scalar - r_0_scalar
+        # ===== Write back to motion_end cell =====
+        new_rm = torch.zeros_like(rm_scores_tensor)
+        new_rm[torch.arange(new_rm.shape[0], device=new_rm.device), eos_idx] = blended.to(new_rm.dtype)
+        rm_T.batch["rm_scores"] = new_rm
 
-        delta_std = delta_scalar.std(unbiased=False).clamp(min=eps)
-        r_0_std = r_0_scalar.std(unbiased=False).clamp(min=eps)
-
-        # Linear combination preserves the row-sparse layout: at each row's
-        # motion_end column the cell holds the combined scalar; all other
-        # columns stay zero because both inputs are zero there.
-        rm_T.batch["rm_scores"] = (
-            w_delta * (rm_T.batch["rm_scores"] - rm_0.batch["rm_scores"]) / delta_std
-            + w_init * rm_0.batch["rm_scores"] / r_0_std
-        )
-
-        # Surface raw component scalars to the trainer for monitoring.
+        # ===== Surface raw component scalars for wandb monitoring =====
         # Cast to float32 first because bfloat16 has no direct numpy dtype.
-        rm_T.non_tensor_batch["rm_initial_raw"] = r_0_scalar.detach().float().cpu().numpy()
-        rm_T.non_tensor_batch["rm_delta_raw"] = delta_scalar.detach().float().cpu().numpy()
+        raw_keys: list[str] = []
+        for key, scalar in rm_scalars.items():
+            wandb_key = f"rm_{key}_raw"
+            rm_T.non_tensor_batch[wandb_key] = scalar.detach().float().cpu().numpy()
+            raw_keys.append(wandb_key)
+        if mdist_scalars is not None:
+            for key, scalar in mdist_scalars.items():
+                wandb_key = f"mdist_{key}_raw"
+                rm_T.non_tensor_batch[wandb_key] = scalar.detach().float().cpu().numpy()
+                raw_keys.append(wandb_key)
         extra_keys = list(batch.meta_info.get("reward_extra_keys", []))
-        for key in ("rm_initial_raw", "rm_delta_raw"):
+        for key in raw_keys:
             if key not in extra_keys:
                 extra_keys.append(key)
         batch.meta_info["reward_extra_keys"] = extra_keys
 
         return rm_T
+
+    @staticmethod
+    def _select_blend_components(
+        scalars: dict[str, torch.Tensor],
+        reward_type: str,
+        weights: list,
+    ) -> list[tuple[torch.Tensor, float]]:
+        """Pick (scalar, weight) pairs from ``scalars`` based on ``reward_type``.
+
+        ``weights[0]`` always weights the primary scalar (``absolute`` for
+        ``reward_type=absolute``, ``relative`` for ``relative`` and
+        ``delta_initial``). ``weights[1]`` is only consulted for
+        ``delta_initial`` and weights the ``initial`` scalar; the ``rm_weight``
+        / ``mdist_weight`` config field is therefore a 2-element list whose
+        second slot is ignored outside ``delta_initial``.
+        """
+        w = [float(x) for x in weights]
+        if reward_type == "absolute":
+            return [(scalars["absolute"], w[0])]
+        if reward_type == "relative":
+            return [(scalars["relative"], w[0])]
+        if reward_type == "delta_initial":
+            return [(scalars["relative"], w[0]), (scalars["initial"], w[1])]
+        raise ValueError(f"Unknown reward_type: {reward_type!r}")
+
+    @staticmethod
+    def _blend_with_std_norm(
+        pairs: list[tuple[torch.Tensor, float]],
+        *,
+        eps: float,
+        like: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sum ``weight * scalar`` pairs, std-normalizing each when 2+ remain.
+
+        Filters out zero-weight pairs first so a config like
+        ``reward_type=delta_initial`` with ``[1.0, 0.0]`` collapses cleanly to
+        the single-term path (no std-normalization, raw scale preserved).
+        """
+        active = [(x, w) for x, w in pairs if w != 0.0]
+        if not active:
+            return torch.zeros_like(like)
+        if len(active) == 1:
+            x, w = active[0]
+            return w * x
+        out = torch.zeros_like(active[0][0])
+        for x, w in active:
+            out = out + w * x / x.std(unbiased=False).clamp(min=eps)
+        return out
+
+    def _compute_motion_distance_scalars(
+        self, batch: DataProto, *, metric: str
+    ) -> dict[str, torch.Tensor]:
+        """Per-row rel / abs_initial / abs_final motion-distance reward scalars.
+
+        Reuses ``compute_motion_trace_reward`` (with ``reward_terms=['delta_score']``
+        so the critic-format component is dropped from the row average) to produce
+        three ``[B]`` cpu float32 tensors. All three live in ``[-1, 1]``. Rows with
+        malformed motion responses or missing ``trace_pts`` floor at -1.0 (the
+        worst-case value for every component).
+        """
+        from cotnav.verl_adapters.rewards.motion_trace import compute_motion_trace_reward
+
+        extra_info = batch.non_tensor_batch.get("extra_info")
+        if extra_info is None:
+            neg_ones = torch.full((len(batch),), -1.0, dtype=torch.float32)
+            return {"rel": neg_ones, "abs_initial": neg_ones.clone(), "abs_final": neg_ones.clone()}
+
+        extras = extra_info.tolist() if hasattr(extra_info, "tolist") else list(extra_info)
+        rel: list[float] = []
+        abs_init: list[float] = []
+        abs_fin: list[float] = []
+        for ei in extras:
+            ei_call = {
+                **ei,
+                # Drop the critic-format component from the row average so the
+                # blend is purely a distance signal; ``solution_str=""`` below
+                # makes the ignored critic-format check parse to ``None`` either way.
+                "reward_terms": ["delta_score"],
+                "reward_weights": [1.0],
+                "distance_strategy": metric,
+            }
+            try:
+                r = compute_motion_trace_reward(
+                    solution_str="",
+                    ground_truth=ei.get("trace_pts", []),
+                    extra_info=ei_call,
+                )
+                rel.append(float(r.get("delta_score", -1.0)))
+                abs_init.append(float(r.get("abs_initial_score", -1.0)))
+                abs_fin.append(float(r.get("abs_final_score", -1.0)))
+            except Exception:
+                # Floor invalid rows at the worst-case value for all components.
+                rel.append(-1.0)
+                abs_init.append(-1.0)
+                abs_fin.append(-1.0)
+
+        to_t = lambda xs: torch.tensor(xs, dtype=torch.float32)
+        return {"rel": to_t(rel), "abs_initial": to_t(abs_init), "abs_final": to_t(abs_fin)}
 
     def _apply_cotrain_format_penalty(self, batch: DataProto) -> None:
         """Apply per-segment format penalties on top of already-computed rm_scores.

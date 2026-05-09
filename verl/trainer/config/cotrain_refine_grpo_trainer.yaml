@@ -261,19 +261,55 @@ reward_model:
     critic_format_penalty: 0.5
     motion_format_penalty: 0.5
 
-  # Reward type controlling how the RM scalar is computed from motion_response history.
-  #   absolute      -> score only the final refined motion (motion_response[-1])
-  #   relative      -> score refined minus initial: r_T - r_0 (motion_response[-1] - motion_response[0])
-  #   delta_initial -> per-batch std-normalized blend of delta (r_T - r_0) and initial (r_0):
-  #                    delta_weight * (r_T - r_0) / std(delta) + initial_weight * r_0 / std(r_0)
-  # Kept under reward_model (not reward_kwargs) so it is not forwarded to the reward manager constructor.
-  reward_type: relative
+  # ------------------------------------------------------------------
+  # Reward components blended in RayPPOTrainer._compute_motion_rm_score.
+  # Two parallel blocks (rm = learned reward model, mdist = motion-distance
+  # vs ground-truth trajectory) share the same reward_type / weight schema.
+  #
+  # reward_type values, with their per-block component mapping:
+  #   absolute      -> w[0] * absolute_scalar
+  #     rm.absolute    = r_T  (RM score on the final refined motion)
+  #     mdist.absolute = abs_final_score  (final pred vs GT, in [0.5, 1.0])
+  #   relative      -> w[0] * relative_scalar
+  #     rm.relative    = r_T - r_0  (improvement)
+  #     mdist.relative = rel_score  ((d_prev - d_curr)/sqrt(2) in [-1, 1])
+  #   delta_initial -> w[0] * relative_scalar + w[1] * initial_scalar
+  #     rm.initial    = r_0
+  #     mdist.initial = abs_initial_score  (initial pred vs GT, in [0.5, 1.0])
+  #
+  # When 2+ weighted components survive across both blocks, every term is
+  # std-normalized per-batch (eps=1e-4 clamp) so the configured weights act
+  # on a comparable scale; a single-term blend passes through unscaled. With
+  # generate_initial_motion=true motion_response = [init_text, refined_text]
+  # so r_0 / abs_initial_score are well-defined for all reward_types.
+  # ------------------------------------------------------------------
 
-  # Mixing weights for ``reward_type: delta_initial``. Ignored otherwise.
-  # Keep them summing to 1.0 to preserve "average" semantics.
-  delta_weight: 0.5
+  # Learned reward-model branch.
+  rm:
 
-  initial_weight: 0.5
+    # absolute | relative | delta_initial.
+    reward_type: relative
+
+    # 2-element weight vector. [0] applies to the absolute or relative scalar
+    # (depending on reward_type); [1] only kicks in for delta_initial and
+    # weights the initial scalar (r_0). Set the unused slot to anything; it
+    # is filtered out when its value is 0.0.
+    rm_weight: [1.0, 0.0]
+
+  # Auxiliary ground-truth-conditioned motion-distance branch. Disabled by
+  # default (both mdist_weight slots at 0.0) so no extra compute / blending
+  # happens and rm_scores reproduce the RM-only path bit-identically.
+  mdist:
+
+    # absolute | relative | delta_initial.
+    reward_type: absolute
+
+    # Distance metric used to compute abs_final / rel / abs_initial against
+    # extra_info.trace_pts. One of: directed_hdist | sym_hdist | final_l2 | dtw.
+    metric: directed_hdist
+
+    # Same indexing convention as rm.rm_weight.
+    mdist_weight: [0.0, 0.0]
 
 reward_manager:
   name: naive
