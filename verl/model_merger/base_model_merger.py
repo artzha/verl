@@ -62,6 +62,15 @@ def parse_args():
         help="Whether to use CPU initialization for the model. This is useful for large models that cannot "
         "fit into GPU memory during initialization.",
     )
+    base_op_parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=None,
+        help="LoRA alpha used during training. Required for correct PEFT scaling (alpha / r) when the "
+        "checkpoint contains LoRA adapters; without this the merger would default to alpha == lora_rank "
+        "(scaling = 1.0). Pass the exact value used in training (e.g. matching "
+        "actor_rollout_ref.model.lora_alpha).",
+    )
 
     merge_parser = subparsers.add_parser("merge", parents=[base_op_parser], help="Merge model checkpoints and save.")
     merge_parser.add_argument(
@@ -107,6 +116,10 @@ class ModelMergerConfig:
         hf_model_config_path (Optional[str]): Path to HuggingFace model configuration files. Defaults to None.
         hf_upload (bool): Whether to upload to HuggingFace (computed automatically). Not for initialization.
         use_cpu_initialization (bool): Whether to use CPU initialization for large models. Defaults to False.
+        lora_alpha (Optional[int]): LoRA alpha used during training. Used when writing
+            ``lora_adapter/adapter_config.json`` so PEFT merge_and_unload applies the correct
+            ``alpha / r`` scaling. Defaults to None, in which case ``save_lora_adapter`` falls back
+            to ``lora_alpha == lora_rank`` (scaling = 1.0) and emits a warning.
     """
 
     operation: str  # 'merge' or 'test'
@@ -123,6 +136,7 @@ class ModelMergerConfig:
     hf_model_config_path: Optional[str] = None
     hf_upload: bool = field(init=False)
     use_cpu_initialization: bool = False
+    lora_alpha: Optional[int] = None
 
     def __post_init__(self):
         self.hf_upload = self.operation == "merge" and bool(self.hf_upload_path)
@@ -143,6 +157,7 @@ def generate_config_from_args(args: argparse.Namespace) -> ModelMergerConfig:
         "local_dir": args.local_dir,
         "hf_model_config_path": os.path.join(args.local_dir, "huggingface"),
         "use_cpu_initialization": args.use_cpu_initialization,
+        "lora_alpha": args.lora_alpha,
     }
 
     if args.operation == "merge":
@@ -295,9 +310,18 @@ class BaseModelMerger(ABC):
             lora_params[lora_key] = state_dict.pop(name)
 
         lora_rank = min(lora_params[lora_key].shape[0], lora_params[lora_key].shape[1])
+        lora_alpha = getattr(self.config, "lora_alpha", None)
+        if lora_alpha is None:
+            print(
+                f"[model_merger] WARNING: --lora_alpha was not provided. Falling back to "
+                f"lora_alpha == lora_rank ({lora_rank}), i.e. PEFT scaling = 1.0. If your "
+                f"training used a different alpha, pass --lora_alpha <N> to match it exactly; "
+                f"otherwise merge_and_unload will apply the wrong delta scale."
+            )
+            lora_alpha = lora_rank
         peft_dict = {
             "r": lora_rank,
-            "lora_alpha": 64,  # lora_alpha is not set. An error should be raised to inform the user to set it manually.
+            "lora_alpha": int(lora_alpha),
             "target_modules": list(target_modules),
         }
         peft_config = peft.LoraConfig(**peft_dict).to_dict()
