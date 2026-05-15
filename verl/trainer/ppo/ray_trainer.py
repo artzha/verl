@@ -68,7 +68,11 @@ from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 from cotnav.core.format import text_to_llava
-from cotnav.verl_adapters.rewards.format_penalty import apply_cotrain_format_penalty
+from cotnav.verl_adapters.rewards.format_penalty import (
+    apply_cotrain_format_penalty,
+    apply_verdict_gating,
+    parse_verdicts,
+)
 
 
 def find_raw_prompt_3d(batch: DataProto) -> list[int]:
@@ -881,8 +885,15 @@ class RayPPOTrainer:
         rm_scalars: dict[str, torch.Tensor] = {"absolute": r_T_scalar}
         # ``delta_absolute`` also needs r_0 because its primary scalar is the
         # relative (r_T - r_0) improvement; only ``absolute`` (r_T alone) can
-        # skip the second RM pass.
-        if rm_reward_type in ("relative", "delta_initial", "delta_absolute"):
+        # otherwise skip the second RM pass. Additionally, when verdict gating
+        # is on and reward_type=absolute, we also need r_0 to power the
+        # "verdict==1 ⇒ swap r_T -> r_0" fallback below (so the critique's
+        # gradient signal is anchored to initial-motion quality on rows where
+        # the model said "no refinement needed").
+        verdict_gating_enabled = bool(self.config.reward_model.get("verdict_gating", True))
+        need_r_0_for_blend = rm_reward_type in ("relative", "delta_initial", "delta_absolute")
+        need_r_0_for_gating = verdict_gating_enabled and rm_reward_type == "absolute"
+        if need_r_0_for_blend or need_r_0_for_gating:
             if self._rm_critic_prompt_msg is not None:
                 batch.non_tensor_batch["rm_raw_prompt"] = prompt_utils_ppo.build_rm_raw_prompt(
                     batch.non_tensor_batch, self._rm_critic_prompt_msg, motion_index=0,
@@ -890,7 +901,8 @@ class RayPPOTrainer:
             padded, pad = pad_dataproto_to_divisor(batch, rm_dp_size)
             rm_0 = unpad_dataproto(self.rm_wg.compute_rm_score(padded), pad)
             r_0_scalar = rm_0.batch["rm_scores"].sum(dim=-1)
-            rm_scalars["relative"] = r_T_scalar - r_0_scalar
+            if need_r_0_for_blend:
+                rm_scalars["relative"] = r_T_scalar - r_0_scalar
             rm_scalars["initial"] = r_0_scalar
 
         # ===== Compute mdist scalars (only when needed) =====
@@ -903,6 +915,61 @@ class RayPPOTrainer:
                 "relative": d["rel"].to(r_T_scalar),
                 "initial": d["abs_initial"].to(r_T_scalar),
             }
+
+        # ===== Verdict gating =====
+        # Two effects on verdict==1 rows, applied per-branch (rm and mdist):
+        #
+        # 1. Zero the per-row 'relative' scalar -> neutral signal for the
+        #    per-step improvement term in {relative, delta_initial,
+        #    delta_absolute} blends. Initial / absolute components pass through
+        #    unchanged so delta_* variants retain their anti-hacking anchor
+        #    (especially the GT-anchored mdist branch); pure 'relative' collapses
+        #    to 0 (no gradient).
+        #
+        # 2. For reward_type='absolute', swap the per-row 'absolute' scalar with
+        #    the 'initial' scalar (r_T -> r_0 for rm; abs_final -> abs_initial
+        #    for mdist). Rationale: when the critic asserts verdict==1, the
+        #    refined motion is supposed to equal the initial motion, so anchoring
+        #    the broadcast advantage to initial-motion quality (which is what
+        #    the model actually had control over before saying "no refine") is
+        #    the consistent signal. Without this swap, the full r_T advantage
+        #    still drives the critique gradient even though the refined-motion
+        #    span has been masked out of response_mask, biasing the critic to
+        #    say verdict==1 whenever r_T happens to be high.
+        #
+        # The corresponding response_mask zeroing is applied later in
+        # _apply_verdict_gating; the per-row verdict is cached on rm_T so that
+        # downstream pass reuses it without re-decoding.
+        verdicts = None
+        if verdict_gating_enabled:
+            critic_output_format = self.config.actor_rollout_ref["critic_output_format"]
+            verdicts = parse_verdicts(batch, critic_output_format)
+            is_verdict_1_bool = torch.tensor(
+                verdicts == 1, device=r_T_scalar.device, dtype=torch.bool
+            )
+            keep_relative = (~is_verdict_1_bool).to(r_T_scalar.dtype)
+            if "relative" in rm_scalars:
+                rm_scalars["relative"] = rm_scalars["relative"] * keep_relative
+            if mdist_scalars is not None and "relative" in mdist_scalars:
+                mdist_scalars["relative"] = mdist_scalars["relative"] * keep_relative
+
+            # Swap r_T -> r_0 for verdict==1 rows under reward_type=absolute.
+            # Requires the corresponding 'initial' scalar to be populated:
+            # always true for mdist when mdist_enabled; for rm requires
+            # need_r_0_for_gating above (which is set whenever this branch
+            # runs with rm_reward_type=='absolute').
+            if rm_reward_type == "absolute" and "initial" in rm_scalars:
+                rm_scalars["absolute"] = torch.where(
+                    is_verdict_1_bool, rm_scalars["initial"], rm_scalars["absolute"]
+                )
+            if (
+                mdist_reward_type == "absolute"
+                and mdist_scalars is not None
+                and "initial" in mdist_scalars
+            ):
+                mdist_scalars["absolute"] = torch.where(
+                    is_verdict_1_bool, mdist_scalars["initial"], mdist_scalars["absolute"]
+                )
 
         # ===== Build component list and blend =====
         pairs = self._select_blend_components(rm_scalars, rm_reward_type, rm_weight)
@@ -927,6 +994,9 @@ class RayPPOTrainer:
                 wandb_key = f"mdist_{key}_raw"
                 rm_T.non_tensor_batch[wandb_key] = scalar.detach().float().cpu().numpy()
                 raw_keys.append(wandb_key)
+        if verdicts is not None:
+            rm_T.non_tensor_batch["verdict"] = verdicts
+            raw_keys.append("verdict")
         extra_keys = list(batch.meta_info.get("reward_extra_keys", []))
         for key in raw_keys:
             if key not in extra_keys:
@@ -1064,6 +1134,26 @@ class RayPPOTrainer:
             critic_output_format=self.config.actor_rollout_ref["critic_output_format"],
             critic_format_penalty=critic_penalty,
             motion_format_penalty=motion_penalty,
+        )
+
+    def _apply_verdict_gating(self, batch: DataProto) -> None:
+        """Zero ``response_mask`` over the refined-motion span for verdict==1 rows.
+
+        Reward-side gating (zeroing the ``relative`` scalar) is handled inside
+        ``_compute_motion_rm_score`` and the per-row verdict is cached on
+        ``batch.non_tensor_batch['verdict']``; this hook reads that cache and
+        applies the corresponding loss-mask change so only the critique (and,
+        in refine3, the trainable initial motion) contribute to the GRPO loss.
+        Must be called *after* ``_apply_cotrain_format_penalty`` so the penalty
+        cells at ``critique_end`` / ``motion_end`` remain consistent with the
+        per-row reward written by ``_compute_motion_rm_score``.
+        """
+        if not self.config.reward_model.get("verdict_gating", True):
+            return
+        apply_verdict_gating(
+            batch=batch,
+            tokenizer=self.tokenizer,
+            critic_output_format=self.config.actor_rollout_ref["critic_output_format"],
         )
 
     def _run_rollout_generations(
@@ -1272,6 +1362,7 @@ class RayPPOTrainer:
                     rm_tensor = self.reward_loop_manager.compute_rm_score(test_batch)
                 test_batch = test_batch.union(rm_tensor)
             self._apply_cotrain_format_penalty(test_batch)
+            self._apply_verdict_gating(test_batch)
 
             # evaluate using reward_function
             result = self._compute_or_extract_reward(test_batch, reward_fn=self.val_reward_fn, return_dict=True)
@@ -2561,6 +2652,7 @@ class RayPPOTrainer:
                                 reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
                         self._apply_cotrain_format_penalty(batch)
+                        self._apply_verdict_gating(batch)
 
                         # # Debug dump: save first 2 rollouts from each reward-relevant field.
                         # import pathlib, json as _json

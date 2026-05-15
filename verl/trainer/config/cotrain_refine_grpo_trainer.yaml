@@ -261,6 +261,23 @@ reward_model:
     critic_format_penalty: 0.5
     motion_format_penalty: 0.5
 
+  # When true (default), gate reward + loss on the critic's verdict:
+  #   verdict==1 -> per-row 'relative' scalar zeroed in both rm and mdist
+  #                 branches (initial / absolute components unchanged), and
+  #                 response_mask=0 over the refined-motion span so only the
+  #                 critique (and, in refine3, the trainable initial motion)
+  #                 contribute to the GRPO loss.
+  #   verdict==0 -> existing behavior (full blend, full response_mask).
+  #
+  # Anti-hacking: because the 'initial' / 'absolute' components survive gating,
+  # delta_initial and delta_absolute retain a verdict-quality signal proportional
+  # to actual motion quality (in particular the GT-anchored mdist branch), so
+  # blanket verdict=1 does not escape low-quality penalties. Pure
+  # reward_type='relative' yields reward=0 (neutral) for verdict==1 rows --
+  # acceptable since the cotrain default is delta_initial. Disable via launcher
+  # --no_verdict_gating to recover pre-gating behavior.
+  verdict_gating: true
+
   # ------------------------------------------------------------------
   # Reward components blended in RayPPOTrainer._compute_motion_rm_score.
   # Two parallel blocks (rm = learned reward model, mdist = motion-distance
