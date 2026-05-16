@@ -917,14 +917,27 @@ class RayPPOTrainer:
             }
 
         # ===== Verdict gating =====
-        # Two effects on verdict==1 rows, applied per-branch (rm and mdist):
+        # Per-branch (rm and mdist) treatment of verdict==1 rows. Two effects:
         #
-        # 1. Zero the per-row 'relative' scalar -> neutral signal for the
-        #    per-step improvement term in {relative, delta_initial,
-        #    delta_absolute} blends. Initial / absolute components pass through
-        #    unchanged so delta_* variants retain their anti-hacking anchor
-        #    (especially the GT-anchored mdist branch); pure 'relative' collapses
-        #    to 0 (no gradient).
+        # 1. Per-row gating of the 'relative' scalar, branched on reward_type:
+        #
+        #    a) reward_type='delta_initial' -> swap 'relative' with 'initial'
+        #       on verdict==1 rows. The blend's two pairs (relative_pair +
+        #       initial_pair) then collapse to two copies of the initial
+        #       anchor, so the verdict==1 row's total effective weight on the
+        #       initial component is (w[0] + w[1]) instead of w[1] alone.
+        #       This routes the freed delta weight onto initial-motion
+        #       quality (which is what the model actually had control over
+        #       before saying "no refine") and keeps verdict==1 reward
+        #       magnitudes on par with verdict==0 rows -- otherwise GRPO
+        #       would systematically attenuate the gradient signal on the
+        #       very rows verdict gating is trying to focus on.
+        #
+        #    b) any other reward_type -> zero the per-row 'relative' scalar.
+        #       Neutral signal for the per-step improvement term in
+        #       {relative, delta_absolute} blends. Pure 'relative' collapses
+        #       to 0 (no gradient); 'delta_absolute' keeps its r_T anchor
+        #       unchanged.
         #
         # 2. For reward_type='absolute', swap the per-row 'absolute' scalar with
         #    the 'initial' scalar (r_T -> r_0 for rm; abs_final -> abs_initial
@@ -948,10 +961,20 @@ class RayPPOTrainer:
                 verdicts == 1, device=r_T_scalar.device, dtype=torch.bool
             )
             keep_relative = (~is_verdict_1_bool).to(r_T_scalar.dtype)
-            if "relative" in rm_scalars:
-                rm_scalars["relative"] = rm_scalars["relative"] * keep_relative
-            if mdist_scalars is not None and "relative" in mdist_scalars:
-                mdist_scalars["relative"] = mdist_scalars["relative"] * keep_relative
+
+            def _gate_relative(scalars: dict[str, torch.Tensor], reward_type: str) -> None:
+                if "relative" not in scalars:
+                    return
+                if reward_type == "delta_initial" and "initial" in scalars:
+                    scalars["relative"] = torch.where(
+                        is_verdict_1_bool, scalars["initial"], scalars["relative"]
+                    )
+                else:
+                    scalars["relative"] = scalars["relative"] * keep_relative
+
+            _gate_relative(rm_scalars, rm_reward_type)
+            if mdist_scalars is not None:
+                _gate_relative(mdist_scalars, mdist_reward_type)
 
             # Swap r_T -> r_0 for verdict==1 rows under reward_type=absolute.
             # Requires the corresponding 'initial' scalar to be populated:
