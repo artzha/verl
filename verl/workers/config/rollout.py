@@ -153,6 +153,14 @@ class RolloutConfig(BaseConfig):
     train_initial_motion: bool = True
     # If "critic" or "motion", actor output is stored in that key and merged into extra_info for reward.
     response_role: Optional[str] = None
+    # When > 1, refine2 cotrain training splits the actor stage into two trainable
+    # sub-stages: ``cotrain_critique_agent`` samples ``n_critique`` distinct critiques
+    # per (prompt, init motion), then ``cotrain_motion_agent`` samples
+    # ``n_motion = rollout.n / n_critique`` distinct refined motions per critique.
+    # Total rollouts/prompt = ``n = n_critique * n_motion``, all sharing the same uid
+    # for GRPO grouping. ``rollout.n`` must be divisible by ``n_critique``. Default 1
+    # reproduces the single-call ``cotrain_refine_agent`` path.
+    n_critique: int = 1
 
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5

@@ -720,6 +720,89 @@ class RayPPOTrainer:
 
         return out
 
+    def _generate_two_stage_actor_rollouts(
+        self,
+        gen_batch: DataProto,
+        *,
+        n_critique: int,
+        n_motion: int,
+        timing_raw: Optional[dict] = None,
+    ) -> tuple[DataProto, DataProto]:
+        """Run the split critique -> motion actor pipeline (refine2 only).
+
+        Stage 1 ``cotrain_critique_agent`` samples ``n_critique`` distinct
+        critiques per (prompt, init motion). Stage 2 ``cotrain_motion_agent``
+        receives Stage 1's critique tokens / logprobs through ``non_tensor_batch``
+        and samples ``n_motion`` distinct refined motions per critique. Stage 2's
+        output is a synthetic AgentLoopOutput whose response layout matches the
+        single-call ``cotrain_refine_agent``: ``[critique, refine_prompt_inject,
+        motion]`` with ``response_mask = [1...1, 0...0, 1...1]`` and spliced
+        ``response_logprobs``. Total rollouts/prompt = ``n_critique * n_motion =
+        rollout.n``, all sharing the same ``uid`` so GRPO normalizes over the
+        full group.
+
+        Returns:
+            ``(gen_batch_input, gen_batch_output)`` where ``gen_batch_input`` is
+            the post-repeat batch fed into Stage 2 (used downstream for
+            ``after_actor`` ``prev=`` alignment and ``batch.repeat`` shape
+            matching), and ``gen_batch_output`` is the synthetic combined output.
+        """
+        # Stage 1: critique generation (n_critique branches per prompt, init motion shared).
+        gen_batch_crit = gen_batch.repeat(repeat_times=n_critique, interleave=True)
+        gen_batch_crit.non_tensor_batch["agent_name"] = np.array(
+            ["cotrain_critique_agent"] * len(gen_batch_crit), dtype=object
+        )
+        with marked_timer("gen_critique", timing_raw, color="red"):
+            critique_output = self._generate_actor_rollouts(
+                gen_batch_crit, timing_raw=timing_raw
+            )
+
+        # Forward Stage 1 critique tokens / logprobs to Stage 2 via non_tensor_batch.
+        self._populate_critique_inputs_for_motion_stage(critique_output)
+
+        # Stage 2: refined motion generation (n_motion branches per critique).
+        gen_batch_motion = critique_output.repeat(repeat_times=n_motion, interleave=True)
+        gen_batch_motion.non_tensor_batch["agent_name"] = np.array(
+            ["cotrain_motion_agent"] * len(gen_batch_motion), dtype=object
+        )
+        with marked_timer("gen_motion", timing_raw, color="red"):
+            gen_batch_output = self._generate_actor_rollouts(
+                gen_batch_motion, timing_raw=timing_raw
+            )
+
+        return gen_batch_motion, gen_batch_output
+
+    def _populate_critique_inputs_for_motion_stage(self, critique_output: DataProto) -> None:
+        """Strip right-padding from Stage 1's critique tensors and write per-row
+        variable-length lists into ``critique_output.non_tensor_batch`` so the
+        per-sample dispatch in ``cotrain_motion_agent.run`` reads them as kwargs.
+
+        Writes:
+            * ``critique_response_ids``: ``np.ndarray[object]`` of ``list[int]``.
+            * ``critique_response_logprobs``: ``np.ndarray[object]`` of
+              ``list[float] | None`` (None when rollout_log_probs unavailable).
+        """
+        response_mask = critique_output.batch["response_mask"]
+        responses = critique_output.batch["responses"]
+        rollout_lp = critique_output.batch.get("rollout_log_probs", None)
+
+        crit_ids: list[list[int]] = []
+        crit_lp: list[Optional[list[float]]] = []
+        for i in range(len(critique_output)):
+            actual_len = int(response_mask[i].sum().item())
+            crit_ids.append(responses[i, :actual_len].tolist())
+            if rollout_lp is not None:
+                crit_lp.append(rollout_lp[i, :actual_len].tolist())
+            else:
+                crit_lp.append(None)
+
+        critique_output.non_tensor_batch["critique_response_ids"] = np.array(
+            crit_ids, dtype=object
+        )
+        critique_output.non_tensor_batch["critique_response_logprobs"] = np.array(
+            crit_lp, dtype=object
+        )
+
     def validate_rollout_responses_in_extra_info(
         self,
         batch: DataProto,
@@ -2566,20 +2649,44 @@ class RayPPOTrainer:
                         )
                         if gen_batch.meta_info.get("timing"):
                             timing_raw.update(gen_batch.meta_info["timing"])
-                # Now repeat the batch (with motion tokens already in prompts) n times
-                gen_batch_input = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
+
+                # Branching topology: when rollout.n_critique > 1, the actor stage is split
+                # into two trainable sub-stages (cotrain_critique_agent -> cotrain_motion_agent)
+                # with a gen_batch.repeat(n_motion) between them. n_critique distinct critiques
+                # per (prompt, init motion) and n_motion distinct refined motions per critique
+                # = n_critique * n_motion = rollout.n total rollouts/prompt, all sharing uid
+                # for GRPO grouping. Default n_critique=1 keeps the single-call agent path.
+                total_n = self.config.actor_rollout_ref.rollout.n
+                n_critique = int(self.config.actor_rollout_ref.rollout.get("n_critique", 1))
+                if total_n % n_critique != 0:
+                    raise ValueError(
+                        f"rollout.n ({total_n}) must be divisible by "
+                        f"rollout.n_critique ({n_critique})."
+                    )
+                n_motion = total_n // n_critique
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        # Generate actor responses using unified helper
-                        gen_batch_output = self._generate_actor_rollouts(
-                            gen_batch_input,
-                            timing_raw=timing_raw,
-                        )
+                        if n_critique > 1:
+                            gen_batch_input, gen_batch_output = (
+                                self._generate_two_stage_actor_rollouts(
+                                    gen_batch,
+                                    n_critique=n_critique,
+                                    n_motion=n_motion,
+                                    timing_raw=timing_raw,
+                                )
+                            )
+                        else:
+                            # Single-call path (existing refine2 behaviour).
+                            gen_batch_input = gen_batch.repeat(
+                                repeat_times=total_n, interleave=True
+                            )
+                            gen_batch_output = self._generate_actor_rollouts(
+                                gen_batch_input,
+                                timing_raw=timing_raw,
+                            )
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:

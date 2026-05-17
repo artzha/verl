@@ -128,6 +128,17 @@ actor_rollout_ref:
     # (critique + refine_prompt + motion) to motion_response and corrupt RM scoring.
     response_role: null
 
+    # Number of distinct critiques sampled per (prompt, initial-motion). When > 1, the
+    # trainer activates the two-stage critique -> motion path: it dispatches Stage 1 with
+    # `cotrain_critique_agent` to produce n_critique distinct critiques per prompt, then
+    # repeats by n_motion = rollout.n / n_critique and dispatches Stage 2 with
+    # `cotrain_motion_agent` to sample n_motion distinct refined motions per critique.
+    # Total rollouts per prompt = rollout.n = n_critique * n_motion (e.g. n_critique=G,
+    # rollout.n=G^2 -> G distinct critiques x G refined motions per critique = G^2 trajectories,
+    # all sharing the same uid for GRPO grouping). rollout.n must be divisible by n_critique.
+    # Default 1 reproduces the single-call `cotrain_refine_agent` path bit-identically.
+    n_critique: 1
+
     engine_kwargs:
       vllm:
         max_model_len: 2560
